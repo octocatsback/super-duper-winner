@@ -1,0 +1,15 @@
+# This is the configuration file for the GitHub Pages.
+# Do not confuse this file with the config.yaml file (without the '_' prefix), which configures GitGoat's behavior.  
+plugins:
+  - jekyll-relative-links
+
+relative_links:
+  enabled: true
+  collections: true
+
+include:
+  - README.md
+
+google_analytics: 'UA-210328150-4'
+
+theme: jekyll-theme-slate
