@@ -1,0 +1,17 @@
+{
+  "name": "Gareth",
+  "install": "if [ -f .cursor/install.sh ]; then bash .cursor/install.sh; elif [ -f Gareth/.cursor/install.sh ]; then bash Gareth/.cursor/install.sh; elif [ -f repos/Gareth/.cursor/install.sh ]; then bash repos/Gareth/.cursor/install.sh; elif [ -f /agent/repos/Gareth/.cursor/install.sh ]; then bash /agent/repos/Gareth/.cursor/install.sh; else echo 'Gareth .cursor/install.sh not found' >&2; exit 1; fi",
+  "terminals": [
+    {
+      "name": "Mona Astro",
+      "description": "Astro dev server for Mona's GitHub Info site at http://localhost:4321",
+      "command": "if [ -f .cursor/dev-server.sh ]; then bash .cursor/dev-server.sh; elif [ -f Gareth/.cursor/dev-server.sh ]; then bash Gareth/.cursor/dev-server.sh; elif [ -f repos/Gareth/.cursor/dev-server.sh ]; then bash repos/Gareth/.cursor/dev-server.sh; elif [ -f /agent/repos/Gareth/.cursor/dev-server.sh ]; then bash /agent/repos/Gareth/.cursor/dev-server.sh; else echo 'Gareth .cursor/dev-server.sh not found' >&2; exit 1; fi"
+    }
+  ],
+  "ports": [
+    {
+      "name": "Mona Astro site",
+      "port": 4321
+    }
+  ]
+}
