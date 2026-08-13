@@ -17,8 +17,10 @@ jobs:
       - name: Fail if live secret filenames are tracked
         run: |
           set -euo pipefail
-          if git ls-files | grep -E '(^|/)\.env$|(^|/)\.env\.[^/]+$|(^|/)id_rsa$|(^|/)id_ed25519$|(^|/)id_ecdsa$'; then
-            echo "Live secret filenames must not be tracked." >&2
+          tracked="$(git ls-files | grep -E '(^|/)\.env$|(^|/)\.env\.[^/]+$|(^|/)id_rsa$|(^|/)id_ed25519$|(^|/)id_ecdsa$' | grep -vE '\.example$' || true)"
+          if [ -n "$tracked" ]; then
+            echo "Live secret filenames must not be tracked:" >&2
+            echo "$tracked" >&2
             exit 1
           fi
           echo "No tracked live secret filenames."
