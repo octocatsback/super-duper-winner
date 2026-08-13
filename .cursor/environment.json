@@ -1,0 +1,14 @@
+{
+  "name": "super-duper-winner locked-down",
+  "install": "if [ -f Gareth/.cursor/install.sh ]; then bash Gareth/.cursor/install.sh; elif [ -f .cursor/install.sh ]; then bash .cursor/install.sh; else echo '[install] no project install script; skipping dependency bootstrap'; fi",
+  "repositoryDependencies": [
+    "github.com/octocatsback/Gareth",
+    "github.com/octocatsback/GitGoat",
+    "github.com/octocatsback/OriginTrials",
+    "github.com/octocatsback/docs",
+    "github.com/octocatsback/node",
+    "github.com/octocatsback/skills-agentic-workflows-that-read-the-room",
+    "github.com/octocatsback/super-duper-winner",
+    "github.com/octocatsback/tryhackme"
+  ]
+}

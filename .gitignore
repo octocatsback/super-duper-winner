@@ -27,6 +27,22 @@ render.experimental.xml
 *.jks
 *.keystore
 
+# Credentials — never commit real secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.p12
+*.pfx
+id_rsa
+id_ecdsa
+id_ed25519
+secrets.local.*
+credentials.json
+auth.json
+google-services.json
+
 # Google Services (e.g. APIs or Firebase)
 google-services.json
 
