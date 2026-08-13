@@ -13,7 +13,7 @@ jobs:
   no-tracked-live-secrets:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Fail if live secret filenames are tracked
         run: |
           set -euo pipefail
