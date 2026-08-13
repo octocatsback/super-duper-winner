@@ -1,0 +1,432 @@
+## Github Search Base URL.
+base_url:
+  https://api.github.com
+
+## GitHub headers without the Authorization Header
+base_headers:
+  Accept:
+    application/vnd.github.v3+json
+  User-Agent: 
+    arnica-github-mocker
+
+## Organization names to run GitGoat on.
+org_names:
+  - GitGoat-Demo
+  
+  
+## Repo names to generate
+repo_names:
+  - Echinacea
+  - Acai
+  - Peppermint
+  - Lavender     
+  - Chamomile
+  - Calendula
+  - Tarragon
+  - Ginger
+  - Wasabi
+  
+## Public repo name mapping to private repo names.
+## This setting is used to generate as much as realistic commits as in other repos based on the "days_since_last_commit" setting in the members section below.
+repo_names_mapping_to_public_repos:
+  Acai:
+    org: hardik05
+    repo: Damn_Vulnerable_C_Program
+  Echinacea:
+    org: arnica-ext
+    repo: GitGoat
+  Chamomile:
+    org: bridgecrewio
+    repo: terragoat
+  Calendula:
+    org: WebGoat
+    repo: WebGoat
+  Tarragon:
+    org: appsecco
+    repo: dvna
+  Ginger:
+    org: madhuakula
+    repo: kubernetes-goat
+  Wasabi:
+    org: cider-security-research
+    repo: cicd-goat
+  Peppermint:
+    org: deepfence
+    repo: SecretScanner
+  Lavender:
+    org: OWASP
+    repo: railsgoat
+
+## Specific configurations per repo (optional).
+### "branch_protection" means the policy is enabled in the main branch
+### "branch_protection_restirctions" define who can push to the protected branch. A team name is specified by the prefix, e.g. the team "Lavender-push" should be included as "push".
+### "codeowners" configure the codeowners file definitions. The possible paths are '' (root), '.github/' or 'docs/'. The patterns and users/teams associations are in the codeowners documentations on GitHub, but the name of the teams should include only the postfixes (as explained above).
+### "actions_enabled" means that the repo has GitHub Action enabled
+### "allowed_actions" defines the scope of the allowed actions. The options are "all", "selected" or "local_only". It is applicable only if "actions_enabled" is true.
+### "verified_allowed_actions" defined if verified actions (not neccesarily owned by GitHub) are allowed. It is applicable only if "actions_enabled" is true.
+repo_configs:
+  Wasabi:
+    branch_protection: True
+    actions_enabled: True
+    allowed_actions: all
+    verified_allowed_actions: False
+  Peppermint:
+    branch_protection: True
+    branch_protection_restirctions:
+      users: [] 
+      teams: []
+      enforce_admins: False
+      require_code_owner_reviews: False
+    actions_enabled: True
+    allowed_actions: all
+    verified_allowed_actions: False
+  Acai:
+    branch_protection: True
+    branch_protection_restirctions:
+      users: [] 
+      teams: []
+      enforce_admins: False
+      require_code_owner_reviews: False
+    actions_enabled: True
+    allowed_actions: all
+    verified_allowed_actions: True
+    codeowners:
+      path: docs/
+      owners:
+        - pattern: '*'
+          teams:
+            - push
+        - pattern: 'acai_backend/'
+          users:
+            - archiet-gg
+            - miker-gg
+  Echinacea:
+    branch_protection: False
+    actions_enabled: True
+    allowed_actions: all
+    codeowners:
+      path: ''
+      owners:
+        - pattern: '*'
+          users:
+            - miker-gg
+          teams:
+            - push
+  Lavender:
+    branch_protection: True
+    branch_protection_restirctions:
+      users: [] 
+      teams: 
+        - push
+      enforce_admins: False
+      require_code_owner_reviews: True
+    codeowners:
+      path: docs/
+      owners:
+        - pattern: '*'
+          teams:
+            - push
+        - pattern: 'abc/'
+          users:
+            - archiet-gg
+            - miker-gg
+    actions_enabled: True
+    allowed_actions: selected
+    verified_allowed_actions: False
+  Ginger:
+    branch_protection: True
+    branch_protection_restirctions:
+      users:
+        - miker-gg
+        - codeyf-gg 
+      teams: []
+      enforce_admins: False
+      require_code_owner_reviews: True
+    codeowners:
+      path: docs/
+      owners:
+        - pattern: '*'
+          teams:
+            - push
+        - pattern: 'abc/'
+          users:
+            - archiet-gg
+            - miker-gg
+    actions_enabled: True
+    allowed_actions: selected
+    verified_allowed_actions: False
+  Chamomile:
+    branch_protection: False
+    actions_enabled: True
+    allowed_actions: selected
+    verified_allowed_actions: True
+  Calendula:
+    branch_protection: True
+    branch_protection_restirctions:
+      users: [] 
+      teams:
+        - push
+      enforce_admins: True
+      require_code_owner_reviews: False
+    actions_enabled: False
+  Tarragon:
+    branch_protection: False
+    actions_enabled: False
+
+## Teams are constructed in the code as [repo]-[group_postfix]
+teams:
+  - repo: Wasabi
+    group_postfixes:
+      - admin
+      - push
+      - pull
+  - repo: Echinacea
+    group_postfixes:
+      - admin
+      - push
+      - pull
+  - repo: Lavender
+    group_postfixes:
+      - triage
+      - maintain
+      - push
+  - repo: Chamomile
+    group_postfixes:
+      - admin
+      - triage
+      - pull
+      - push
+  - repo: Calendula
+    group_postfixes:
+      - triage
+      - pull
+      - push
+  - repo: Tarragon
+    group_postfixes:
+      - pull
+      - push
+  - repo: Ginger
+    group_postfixes:
+      - pull
+      - push
+      - admin
+  - repo: Peppermint
+    group_postfixes:
+      - push
+      - admin
+  - repo: Acai
+    group_postfixes:
+      - push
+      - admin
+      - maintain
+
+## This configuration nests teams under other teams.
+parent_teams:
+  - team: Herbs-push
+    repo_permissions:
+      Tarragon: push
+    children:
+      - Lavender-push
+  - team: Flowers-push
+    repo_permissions:
+      Peppermint: admin
+    children:
+      - Peppermint-push
+  - team: Daisies-push
+    repo_permissions:
+      Ginger: push
+    children:
+      - Ginger-admin
+
+
+## Members detailed information.
+### The member_id can be retrieved by queriying https://api.github.com/users/[login]. It is required as a parameter to invite and accept the invitations to the organization.
+### The login is the username on GitHub.
+### Please DO NOT rant about the token here - it has limited scopes and it's here to simplify your "time to hello world".
+### To control group membership, add the list of groups under 'member_of_groups'
+### More granular details are in the 'days_since_last_commit' section, which represent how commits and pull requests will be executed. 
+members:
+  - member_id: 90474231
+    login: miker-gg
+    email: miker@@gitgoat.tools
+    token: xA6DOQRPkmo6wuP5GUfSJCl6u7H3si2a6AFc
+    member_of_groups:
+      - Lavender-push
+      - Calendula-triage
+      - Chamomile-push
+      - Echinacea-pull
+      - Echinacea-push
+      - Calendula-push
+      - Ginger-push
+      - Wasabi-push
+      - Peppermint-push
+      - Acai-maintain
+    days_since_last_commit: []
+  - member_id: 90470369
+    login: archiet-gg
+    email: archiet@gitgoat.tools
+    token: EbcLokhBwUKnN5WmJz6eOwiXN0sFC04UxDIs
+    member_of_groups:
+      - Echinacea-admin
+      - Echinacea-push
+      - Lavender-maintain
+      - Lavender-push
+      - Chamomile-admin
+      - Chamomile-triage
+      - Chamomile-pull
+      - Chamomile-push
+      - Tarragon-push
+      - Ginger-push
+      - Wasabi-push
+      - Peppermint-push
+      - Acai-admin
+    days_since_last_commit:
+      - repo: Echinacea
+        days: 91
+        branch: main
+        create_pr: False
+      - repo: Lavender
+        days: 14
+        branch: feature_L01
+        create_pr: False
+      - repo: Chamomile
+        days: 0
+        branch: feature_C01
+        create_pr: False
+      - repo: Tarragon
+        days: 102
+        branch: main
+        create_pr: False
+      - repo: Ginger
+        days: 100
+        branch: feature_G01
+        create_pr: False
+      - repo: Wasabi
+        days: 25
+        branch: feature_W01
+        create_pr: True
+      - repo: Acai
+        days: 20
+        branch: feature_A01
+        create_pr: True
+    commit_secrets_in_repositories:
+      - Wasabi
+      - Chamomile
+      - Echinacea
+      - Acai
+  - member_id: 90471042
+    login: billdp-gg
+    email: billdp@gitgoat.tools
+    token: Nk6u8zQjI5o1CX9QWNuY4VOpmGIo452GEq2T
+    member_of_groups:
+      - Echinacea-push
+      - Echinacea-pull
+      - Lavender-triage
+      - Lavender-push
+      - Lavender-pull
+      - Chamomile-triage
+      - Chamomile-pull
+      - Calendula-pull
+      - Tarragon-pull
+      - Ginger-push
+      - Wasabi-push
+      - Peppermint-push
+      - Acai-maintain
+    days_since_last_commit:
+      - repo: Echinacea
+        days: 120
+        branch: main
+        create_pr: False
+      - repo: Lavender
+        days: 5
+        branch: feature_L02a
+        create_pr: True
+      - repo: Lavender
+        days: 20
+        branch: feature_L02b
+        create_pr: True
+      - repo: Ginger
+        days: 29
+        branch: feature_G02
+        create_pr: True
+      - repo: Wasabi
+        days: 25
+        branch: feature_W02
+        create_pr: True
+      - repo: Peppermint
+        days: 2
+        branch: feature_P01
+        create_pr: True
+      - repo: Acai
+        days: 20
+        branch: main
+        create_pr: False
+    commit_secrets_in_repositories:
+      - Acai
+      - Lavender
+  - member_id: 90473779
+    login: codeyf-gg
+    email: codeyf@gitgoat.tools
+    token: B81U7smn2ScvPp7nfDXj7RNpTBZvk90tYwiN
+
+    member_of_groups:
+      - Echinacea-pull
+      - Lavender-push
+      - Chamomile-admin
+      - Chamomile-triage
+      - Chamomile-push
+      - Calendula-push
+      - Tarragon-push
+      - Ginger-push
+      - Wasabi-push
+      - Peppermint-push
+    days_since_last_commit:
+      - repo: Lavender
+        days: 10
+        branch: feature_L03
+        create_pr: True
+      - repo: Chamomile
+        days: 0
+        branch: feature_C03a
+        create_pr: True
+      - repo: Chamomile
+        days: 14
+        branch: feature_C03b
+        create_pr: True
+      - repo: Calendula
+        days: 95
+        branch: feature_C03
+        create_pr: False
+      - repo: Tarragon
+        days: 93
+        branch: main
+        create_pr: False
+      - repo: Ginger
+        days: 10
+        branch: feature_G03
+        create_pr: True
+      - repo: Wasabi
+        days: 25
+        branch: feature_W03
+        create_pr: True
+      - repo: Peppermint
+        days: 23
+        branch: feature_P02
+        create_pr: True
+    commit_secrets_in_repositories:
+      - Chamomile
+  - member_id: 90473997
+    login: debu-gg
+    email: debu@gitgoat.tools
+    token: NSWR5qmC4g9Cx8Y8yXzQE4kzUmBYWf16ZTsF
+    member_of_groups:
+      - Echinacea-pull
+      - Chamomile-pull
+      - Calendula-triage
+      - Tarragon-pull
+      - Acai-push
+    days_since_last_commit:
+      - repo: Acai
+        days: 100
+        branch: feature_A03
+        create_pr: False

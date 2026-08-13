@@ -1,0 +1,99 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "workspace: ready terminal",
+      "type": "shell",
+      "command": "while [ ! -f \"${TMPDIR:-/tmp}/mona-codespace-ready\" ]; do sleep 1; done; echo 'Codespace ready. CLI tools available: gh and copilot.' && exec bash -l",
+      "isBackground": true,
+      "problemMatcher": {
+        "owner": "custom",
+        "pattern": {
+          "regexp": "^(.*)$",
+          "message": 1
+        },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": ".",
+          "endsPattern": "^Codespace ready\\. CLI tools available: gh and copilot\\.$"
+        }
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "new",
+        "focus": true,
+        "clear": false
+      },
+      "runOptions": {
+        "runOn": "folderOpen"
+      }
+    },
+    {
+      "label": "site: install",
+      "type": "shell",
+      "command": "npm ci",
+      "options": {
+        "cwd": "${workspaceFolder}/site"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "site: dev",
+      "type": "shell",
+      "command": "npm run dev -- --host 0.0.0.0 --port 4321",
+      "options": {
+        "cwd": "${workspaceFolder}/site"
+      },
+      "dependsOn": ["site: install"],
+      "isBackground": true,
+      "problemMatcher": {
+        "owner": "custom",
+        "pattern": {
+          "regexp": ".",
+          "file": 1,
+          "location": 2,
+          "message": 3
+        },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": ".",
+          "endsPattern": "Local\\s+http://localhost:4321/|Local\\s+http://127\\.0\\.0\\.1:4321/"
+        }
+      }
+    },
+    {
+      "label": "site: build",
+      "type": "shell",
+      "command": "npm run build",
+      "options": {
+        "cwd": "${workspaceFolder}/site"
+      },
+      "dependsOn": ["site: install"],
+      "problemMatcher": []
+    },
+    {
+      "label": "site: preview",
+      "type": "shell",
+      "command": "npm run preview -- --host 0.0.0.0 --port 4321",
+      "options": {
+        "cwd": "${workspaceFolder}/site"
+      },
+      "dependsOn": ["site: install"],
+      "isBackground": true,
+      "problemMatcher": {
+        "owner": "custom",
+        "pattern": {
+          "regexp": ".",
+          "file": 1,
+          "location": 2,
+          "message": 3
+        },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": ".",
+          "endsPattern": "Local\\s+http://localhost:4321/|Local\\s+http://127\\.0\\.0\\.1:4321/"
+        }
+      }
+    }
+  ]
+}

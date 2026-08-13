@@ -1,0 +1,45 @@
+# This workflow will install Python dependencies, run tests and lint with a single version of Python
+# For more information see: https://help.github.com/actions/language-and-framework-guides/using-python-with-github-actions
+
+name: Python application smoke test
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "*.py"
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+    
+    - name: Set up Python 3.9
+      uses: actions/setup-python@v2
+      with:
+        python-version: 3.9
+    - 
+      name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+    -
+      name: Run unit tests
+      run: |
+        python -m unittest discover -s tests -v
+    - 
+      name: Test access with current PAT
+      # test.py checks org repo access; without an organization context it
+      # falls back to the config.yaml org names, which this token cannot see.
+      if: github.event.organization.login != ''
+      run: |
+        export github_token=${{ secrets.GITHUB_TOKEN }} 
+        echo "Org Name: $ORG_NAME"
+        python test.py --org $ORG_NAME
+      env:
+        ORG_NAME: ${{ github.event.organization.login }}
