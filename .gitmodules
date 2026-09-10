@@ -3,3 +3,8 @@
 	url = https://github.com/octocatsback/tryhackme.git
 	branch = main
 	shallow = true
+[submodule "docs"]
+	path = docs
+	url = https://github.com/octocatsback/docs.git
+	branch = main
+	shallow = true
