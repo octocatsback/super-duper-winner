@@ -8,3 +8,8 @@
 	url = https://github.com/octocatsback/docs.git
 	branch = main
 	shallow = true
+[submodule "node"]
+	path = node
+	url = https://github.com/octocatsback/node.git
+	branch = main
+	shallow = true
