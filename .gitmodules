@@ -1,0 +1,5 @@
+[submodule "tryhackme"]
+	path = tryhackme
+	url = https://github.com/octocatsback/tryhackme.git
+	branch = main
+	shallow = true
