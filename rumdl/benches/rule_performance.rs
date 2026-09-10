@@ -1,0 +1,196 @@
+use criterion::{Criterion, criterion_group, criterion_main};
+use rumdl_lib::config::MarkdownFlavor;
+use rumdl_lib::lint_context::LintContext;
+use rumdl_lib::rule::Rule;
+use rumdl_lib::rules::{
+    MD013LineLength, MD033NoInlineHtml, MD037NoSpaceInEmphasis, MD044ProperNames, MD051LinkFragments,
+    MD053LinkImageReferenceDefinitions,
+};
+use std::hint::black_box;
+
+fn make_ctx(content: &str) -> LintContext<'_> {
+    LintContext::new(content, MarkdownFlavor::Standard, None)
+}
+
+/// Benchmark MD013 rule on a large content with long lines
+fn bench_md013(c: &mut Criterion) {
+    let mut content = String::with_capacity(50_000);
+    // Generate 100 lines each with 120 characters (above default line length limit)
+    for i in 0..100 {
+        content.push_str(&format!("Line {:03} with a very long text that exceeds the default line length limit of 80 characters. This line is exactly 120 characters.{}\n", i, " ".repeat(5)));
+    }
+
+    let rule = MD013LineLength::default();
+    let ctx = make_ctx(&content);
+
+    c.bench_function("MD013 check 100 long lines", |b| b.iter(|| rule.check(black_box(&ctx))));
+
+    c.bench_function("MD013 fix 100 long lines", |b| b.iter(|| rule.fix(black_box(&ctx))));
+}
+
+/// Benchmark MD033 rule on a large content with HTML tags
+fn bench_md033(c: &mut Criterion) {
+    let mut content = String::with_capacity(50_000);
+    // Generate 500 lines with HTML tags
+    for i in 0..500 {
+        content.push_str(&format!(
+            "Line {i} with <span class=\"highlight\">HTML</span> and <div>nested <em>tags</em></div>\n"
+        ));
+    }
+
+    let rule = MD033NoInlineHtml::default();
+    let ctx = make_ctx(&content);
+
+    c.bench_function("MD033 check 500 HTML tags", |b| b.iter(|| rule.check(black_box(&ctx))));
+}
+
+/// Benchmark MD037 rule on a large content with emphasis
+fn bench_md037(c: &mut Criterion) {
+    let mut content = String::with_capacity(50_000);
+    // Add correct and incorrect emphasis usage (spaces around emphasis)
+    for i in 0..500 {
+        if i % 3 == 0 {
+            // Incorrect: no spaces around emphasis
+            content.push_str(&format!("Line {i} with*incorrect emphasis*markers\n"));
+        } else if i % 3 == 1 {
+            // Incorrect: spaces inside emphasis
+            content.push_str(&format!("Line {i} with *incorrect emphasis *markers\n"));
+        } else {
+            // Correct: proper spaces around emphasis
+            content.push_str(&format!("Line {i} with *correct emphasis* markers\n"));
+        }
+    }
+
+    let rule = MD037NoSpaceInEmphasis;
+    let ctx = make_ctx(&content);
+
+    c.bench_function("MD037 check 500 emphasis markers", |b| {
+        b.iter(|| rule.check(black_box(&ctx)))
+    });
+
+    c.bench_function("MD037 fix 500 emphasis markers", |b| {
+        b.iter(|| rule.fix(black_box(&ctx)))
+    });
+}
+
+/// Benchmark MD044 proper names rule (regex-intensive)
+fn bench_md044(c: &mut Criterion) {
+    let mut content = String::with_capacity(50_000);
+    // Generate content with names that should be consistently capitalized
+    let proper_names = vec![
+        "JavaScript".to_string(),
+        "TypeScript".to_string(),
+        "GitHub".to_string(),
+        "VS Code".to_string(),
+        "Docker".to_string(),
+        "Kubernetes".to_string(),
+    ];
+    let incorrect_names = ["javascript", "typescript", "github", "vs code", "docker", "kubernetes"];
+
+    for i in 0..500 {
+        if i % 2 == 0 {
+            let name_idx = i % proper_names.len();
+            content.push_str(&format!("Line {} mentions {} correctly\n", i, proper_names[name_idx]));
+        } else {
+            let name_idx = i % incorrect_names.len();
+            content.push_str(&format!(
+                "Line {} mentions {} incorrectly\n",
+                i, incorrect_names[name_idx]
+            ));
+        }
+    }
+
+    // Create a rule with the proper names to check
+    let rule = MD044ProperNames::new(proper_names, true); // true = exclude code blocks
+    let ctx = make_ctx(&content);
+
+    c.bench_function("MD044 check 500 proper name occurrences", |b| {
+        b.iter(|| rule.check(black_box(&ctx)))
+    });
+
+    c.bench_function("MD044 fix 500 proper name occurrences", |b| {
+        b.iter(|| rule.fix(black_box(&ctx)))
+    });
+}
+
+/// Benchmark MD051 link fragments rule
+fn bench_md051(c: &mut Criterion) {
+    let mut content = String::with_capacity(50_000);
+
+    // Add 100 headings
+    for i in 1..101 {
+        content.push_str(&format!("## Heading {i}\n\n"));
+    }
+
+    // Add 500 links, some with valid and some with invalid fragments
+    for i in 0..500 {
+        if i % 3 == 0 {
+            // Valid link
+            let heading_number = (i % 100) + 1;
+            content.push_str(&format!("This is a [valid link](#heading-{heading_number})\n"));
+        } else {
+            // Invalid link
+            content.push_str(&format!("This is an [invalid link](#non-existent-heading-{i})\n"));
+        }
+    }
+
+    let rule = MD051LinkFragments::new();
+    let ctx = make_ctx(&content);
+
+    c.bench_function("MD051 check 500 link fragments", |b| {
+        b.iter(|| rule.check(black_box(&ctx)))
+    });
+}
+
+/// Benchmark MD053 link image reference definitions with caching
+fn bench_md053(c: &mut Criterion) {
+    let mut content = String::with_capacity(50_000);
+
+    // Add reference definitions
+    content.push_str("## Reference Definitions\n\n");
+    for i in 0..200 {
+        if i < 100 {
+            // Used references
+            content.push_str(&format!("[ref{i}]: https://example.com/ref{i}\n"));
+        } else {
+            // Unused references
+            content.push_str(&format!("[unused{i}]: https://example.com/unused{i}\n"));
+        }
+    }
+
+    // Add reference usages
+    content.push_str("\n## Content with References\n\n");
+    for i in 0..100 {
+        content.push_str(&format!("This is a paragraph with a [link][ref{i}] reference.\n"));
+    }
+
+    let rule = MD053LinkImageReferenceDefinitions::default();
+    let ctx = make_ctx(&content);
+
+    // Cold cache: fresh rule instance each iteration, pre-built context
+    c.bench_function("MD053 check cold cache", |b| {
+        b.iter_with_setup(MD053LinkImageReferenceDefinitions::default, |r| {
+            r.check(black_box(&ctx))
+        })
+    });
+
+    // Warm cache: prime the rule's internal cache once, then measure
+    let primed_rule = rule.clone();
+    let _ = primed_rule.check(&ctx);
+    c.bench_function("MD053 check warm cache", |b| {
+        b.iter(|| primed_rule.check(black_box(&ctx)))
+    });
+
+    c.bench_function("MD053 fix unused references", |b| b.iter(|| rule.fix(black_box(&ctx))));
+}
+
+criterion_group!(
+    benches,
+    bench_md013,
+    bench_md033,
+    bench_md037,
+    bench_md044,
+    bench_md051,
+    bench_md053
+);
+criterion_main!(benches);

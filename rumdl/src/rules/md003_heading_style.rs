@@ -1,0 +1,593 @@
+//!
+//! Rule MD003: Heading style
+//!
+//! See [docs/md003.md](../../docs/md003.md) for full documentation, configuration, and examples.
+
+use crate::rule::{LintError, LintResult, LintWarning, Rule, RuleCategory, Severity};
+use crate::rule_config_serde::{FlavorOverrideNotice, option_is_explicit};
+use crate::rules::heading_utils::HeadingStyle;
+use crate::utils::range_utils::calculate_heading_range;
+use toml;
+
+mod md003_config;
+use md003_config::MD003Config;
+
+/// Reports an explicit MDG style override once per process.
+static MDG_STYLE_OVERRIDE: FlavorOverrideNotice = FlavorOverrideNotice::new();
+
+/// Rule MD003: Heading style
+#[derive(Clone, Default)]
+pub struct MD003HeadingStyle {
+    config: MD003Config,
+    /// Whether `style` was explicitly configured rather than defaulted.
+    style_explicit: bool,
+}
+
+impl MD003HeadingStyle {
+    pub fn new(style: HeadingStyle) -> Self {
+        Self {
+            config: MD003Config { style },
+            style_explicit: true,
+        }
+    }
+
+    pub fn from_config_struct(config: MD003Config) -> Self {
+        Self {
+            config,
+            style_explicit: false,
+        }
+    }
+
+    /// Check if we should use consistent mode (detect first style)
+    fn is_consistent_mode(&self) -> bool {
+        // Check for the Consistent variant explicitly
+        self.config.style == HeadingStyle::Consistent
+    }
+
+    /// Gets the target heading style based on configuration and document content
+    fn get_target_style(&self, ctx: &crate::lint_context::LintContext) -> HeadingStyle {
+        // MDG recognizes `#{1,6} ` headings only, so plain ATX is the single
+        // style a Gherkin document can be steered to.
+        if ctx.flavor == crate::config::MarkdownFlavor::MDG {
+            self.warn_once_about_overridden_style();
+            return HeadingStyle::Atx;
+        }
+
+        if !self.is_consistent_mode() {
+            return self.config.style;
+        }
+
+        // Count all heading styles to determine most prevalent (prevalence-based approach)
+        let mut style_counts = std::collections::HashMap::new();
+
+        for line_info in &ctx.lines {
+            if let Some(heading) = &line_info.heading {
+                // Skip invalid headings (e.g., `#NoSpace` which lacks required space after #)
+                if !heading.is_valid {
+                    continue;
+                }
+
+                // Map from LintContext heading style to rules heading style and count
+                let style = match heading.style {
+                    crate::lint_context::HeadingStyle::ATX => {
+                        if heading.has_closing_sequence {
+                            HeadingStyle::AtxClosed
+                        } else {
+                            HeadingStyle::Atx
+                        }
+                    }
+                    crate::lint_context::HeadingStyle::Setext1 => HeadingStyle::Setext1,
+                    crate::lint_context::HeadingStyle::Setext2 => HeadingStyle::Setext2,
+                };
+                *style_counts.entry(style).or_insert(0) += 1;
+            }
+        }
+
+        // Return most prevalent style
+        // In case of tie, prefer ATX as the default (deterministic tiebreaker)
+        style_counts
+            .into_iter()
+            .max_by(|(style_a, count_a), (style_b, count_b)| {
+                match count_a.cmp(count_b) {
+                    std::cmp::Ordering::Equal => {
+                        // Tiebreaker: prefer ATX (most common), then Setext1, then Setext2, then AtxClosed
+                        let priority = |s: &HeadingStyle| match s {
+                            HeadingStyle::Atx => 0,
+                            HeadingStyle::Setext1 => 1,
+                            HeadingStyle::Setext2 => 2,
+                            HeadingStyle::AtxClosed => 3,
+                            _ => 4,
+                        };
+                        priority(style_b).cmp(&priority(style_a)) // Reverse for min priority wins
+                    }
+                    other => other,
+                }
+            })
+            .map_or(HeadingStyle::Atx, |(style, _)| style)
+    }
+
+    /// Tell the user when an explicit fixed style cannot be honored by MDG.
+    /// `consistent` asks for no fixed spelling, and `atx` is already the form
+    /// the flavor enforces, so neither is an override worth reporting.
+    fn warn_once_about_overridden_style(&self) {
+        if !self.style_explicit || matches!(self.config.style, HeadingStyle::Atx | HeadingStyle::Consistent) {
+            return;
+        }
+
+        let configured = self.config.style.to_string();
+        MDG_STYLE_OVERRIDE.report(
+            "MD003",
+            "style",
+            &configured,
+            "atx",
+            "Markdown with Gherkin recognizes structure headings only in plain ATX form",
+        );
+    }
+}
+
+impl Rule for MD003HeadingStyle {
+    fn name(&self) -> &'static str {
+        "MD003"
+    }
+
+    fn description(&self) -> &'static str {
+        "Heading style"
+    }
+
+    fn check(&self, ctx: &crate::lint_context::LintContext) -> LintResult {
+        let mut result = Vec::new();
+
+        // Get the target style using cached heading information
+        let target_style = self.get_target_style(ctx);
+
+        // Process headings using cached heading information
+        for (line_num, line_info) in ctx.lines.iter().enumerate() {
+            if let Some(heading) = &line_info.heading {
+                // Skip invalid headings (e.g., `#NoSpace` which lacks required space after #)
+                if !heading.is_valid {
+                    continue;
+                }
+
+                let level = heading.level;
+
+                // Map the cached heading style to the rule's HeadingStyle
+                let current_style = match heading.style {
+                    crate::lint_context::HeadingStyle::ATX => {
+                        if heading.has_closing_sequence {
+                            HeadingStyle::AtxClosed
+                        } else {
+                            HeadingStyle::Atx
+                        }
+                    }
+                    crate::lint_context::HeadingStyle::Setext1 => HeadingStyle::Setext1,
+                    crate::lint_context::HeadingStyle::Setext2 => HeadingStyle::Setext2,
+                };
+
+                // Determine expected style based on level and target
+                let expected_style = match target_style {
+                    HeadingStyle::Setext1 | HeadingStyle::Setext2 => {
+                        if level > 2 {
+                            // Setext only supports levels 1-2. The heading cannot
+                            // comply at all, so keep the ATX flavor it already has
+                            // instead of restyling it to one the config never asked
+                            // for. That also keeps the fix idempotent under
+                            // `consistent`: rewriting only ever moves headings into
+                            // the target style, so it can never flip the prevalence
+                            // count that chose the target.
+                            current_style
+                        } else if level == 1 {
+                            HeadingStyle::Setext1
+                        } else {
+                            HeadingStyle::Setext2
+                        }
+                    }
+                    HeadingStyle::SetextWithAtx => {
+                        if level <= 2 {
+                            // Use Setext for h1/h2
+                            if level == 1 {
+                                HeadingStyle::Setext1
+                            } else {
+                                HeadingStyle::Setext2
+                            }
+                        } else {
+                            // Use ATX for h3-h6
+                            HeadingStyle::Atx
+                        }
+                    }
+                    HeadingStyle::SetextWithAtxClosed => {
+                        if level <= 2 {
+                            // Use Setext for h1/h2
+                            if level == 1 {
+                                HeadingStyle::Setext1
+                            } else {
+                                HeadingStyle::Setext2
+                            }
+                        } else {
+                            // Use ATX closed for h3-h6
+                            HeadingStyle::AtxClosed
+                        }
+                    }
+                    _ => target_style,
+                };
+
+                // MDG only recognizes plain ATX headings: a setext heading never
+                // becomes a Gherkin node and a closing sequence leaks into the
+                // node's name (`# Feature: F #` is named "F #"). Steering every
+                // heading to plain ATX keeps MD003 enforcing a style while never
+                // emitting a form Gherkin cannot parse.
+                let expected_style = if ctx.flavor == crate::config::MarkdownFlavor::MDG {
+                    HeadingStyle::Atx
+                } else {
+                    expected_style
+                };
+
+                if current_style != expected_style {
+                    // Generate fix for this heading
+                    let fix = {
+                        use crate::rules::heading_utils::HeadingUtils;
+
+                        // Convert heading to target style, preserving inline attribute lists
+                        let converted_heading =
+                            HeadingUtils::convert_heading_style(&heading.raw_text, level as u32, expected_style);
+
+                        // Preserve original indentation (including tabs)
+                        let line = line_info.content(ctx.content);
+                        let original_indent = &line[..line_info.indent];
+                        let final_heading = format!("{original_indent}{converted_heading}");
+
+                        // A setext heading spans two lines. When converting away
+                        // from it the underline has to be replaced too, otherwise
+                        // it survives as a thematic break.
+                        let converting_from_setext =
+                            matches!(
+                                heading.style,
+                                crate::lint_context::HeadingStyle::Setext1 | crate::lint_context::HeadingStyle::Setext2
+                            ) && !matches!(expected_style, HeadingStyle::Setext1 | HeadingStyle::Setext2);
+                        let last_line = if converting_from_setext {
+                            line_num + 2
+                        } else {
+                            line_num + 1
+                        };
+
+                        let start = ctx.line_content_byte_range(line_num + 1).start;
+                        let end = ctx.line_content_byte_range(last_line).end;
+
+                        Some(crate::rule::Fix::new(start..end, final_heading))
+                    };
+
+                    // Calculate precise character range for the heading marker
+                    let (start_line, start_col, end_line, end_col) =
+                        calculate_heading_range(line_num + 1, line_info.content(ctx.content));
+
+                    result.push(LintWarning {
+                        rule_name: Some(self.name().to_string()),
+                        line: start_line,
+                        column: start_col,
+                        end_line,
+                        end_column: end_col,
+                        message: format!(
+                            "Heading style should be {}, found {}",
+                            match expected_style {
+                                HeadingStyle::Atx => "# Heading",
+                                HeadingStyle::AtxClosed => "# Heading #",
+                                HeadingStyle::Setext1 => "Heading\n=======",
+                                HeadingStyle::Setext2 => "Heading\n-------",
+                                HeadingStyle::Consistent => "consistent with the first heading",
+                                HeadingStyle::SetextWithAtx => "setext-with-atx style",
+                                HeadingStyle::SetextWithAtxClosed => "setext-with-atx-closed style",
+                            },
+                            match current_style {
+                                HeadingStyle::Atx => "# Heading",
+                                HeadingStyle::AtxClosed => "# Heading #",
+                                HeadingStyle::Setext1 => "Heading (underlined with =)",
+                                HeadingStyle::Setext2 => "Heading (underlined with -)",
+                                HeadingStyle::Consistent => "consistent style",
+                                HeadingStyle::SetextWithAtx => "setext-with-atx style",
+                                HeadingStyle::SetextWithAtxClosed => "setext-with-atx-closed style",
+                            }
+                        ),
+                        severity: Severity::Warning,
+                        fix,
+                    });
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    fn fix(&self, ctx: &crate::lint_context::LintContext) -> Result<String, LintError> {
+        // Get all warnings with their fixes
+        let warnings = self.check(ctx)?;
+        let warnings =
+            crate::utils::fix_utils::filter_warnings_by_inline_config(warnings, ctx.inline_config(), self.name());
+
+        // If no warnings, return original content
+        if warnings.is_empty() {
+            return Ok(ctx.content.to_string());
+        }
+
+        // Collect all fixes and sort by range start (descending) to apply from end to beginning
+        let mut fixes: Vec<_> = warnings
+            .iter()
+            .filter_map(|w| w.fix.as_ref().map(|f| (f.range.start, f.range.end, &f.replacement)))
+            .collect();
+        fixes.sort_by_key(|f| std::cmp::Reverse(f.0));
+
+        // Apply fixes from end to beginning to preserve byte offsets
+        let mut result = ctx.content.to_string();
+        for (start, end, replacement) in fixes {
+            if start < result.len() && end <= result.len() && start <= end {
+                result.replace_range(start..end, replacement);
+            }
+        }
+
+        Ok(result)
+    }
+
+    fn category(&self) -> RuleCategory {
+        RuleCategory::Heading
+    }
+
+    fn should_skip(&self, ctx: &crate::lint_context::LintContext) -> bool {
+        // Fast path: check if document likely has headings using character frequency
+        if ctx.content.is_empty() || !ctx.likely_has_headings() {
+            return true;
+        }
+        // Verify headings actually exist (handles false positives from character frequency)
+        !ctx.lines.iter().any(|line| line.heading.is_some())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    crate::impl_rule_config_sections!(MD003Config);
+
+    fn from_config(config: &crate::config::Config) -> Box<dyn Rule>
+    where
+        Self: Sized,
+    {
+        let rule_config = crate::rule_config_serde::load_rule_config::<MD003Config>(config);
+        let style_explicit = option_is_explicit(config, "MD003", "style");
+
+        Box::new(Self {
+            config: rule_config,
+            style_explicit,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lint_context::LintContext;
+
+    #[test]
+    fn test_atx_heading_style() {
+        let rule = MD003HeadingStyle::default();
+        let content = "# Heading 1\n## Heading 2\n### Heading 3";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_setext_heading_style() {
+        let rule = MD003HeadingStyle::new(HeadingStyle::Setext1);
+        let content = "Heading 1\n=========\n\nHeading 2\n---------";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_front_matter() {
+        let rule = MD003HeadingStyle::default();
+        let content = "---\ntitle: Test\n---\n\n# Heading 1\n## Heading 2";
+
+        // Test should detect headings and apply consistent style
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "No warnings expected for content with front matter, found: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_consistent_heading_style() {
+        // Default rule uses Atx which serves as our "consistent" mode
+        let rule = MD003HeadingStyle::default();
+        let content = "# Heading 1\n## Heading 2\n### Heading 3";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_with_different_styles() {
+        // Test with consistent style (ATX)
+        let rule = MD003HeadingStyle::new(HeadingStyle::Consistent);
+        let content = "# Heading 1\n## Heading 2\n### Heading 3";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+
+        // Make test more resilient
+        assert!(
+            result.is_empty(),
+            "No warnings expected for consistent ATX style, found: {result:?}"
+        );
+
+        // Test with incorrect style
+        let rule = MD003HeadingStyle::new(HeadingStyle::Atx);
+        let content = "# Heading 1 #\nHeading 2\n-----\n### Heading 3";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            !result.is_empty(),
+            "Should have warnings for inconsistent heading styles"
+        );
+
+        // Test with setext style
+        let rule = MD003HeadingStyle::new(HeadingStyle::Setext1);
+        let content = "Heading 1\n=========\nHeading 2\n---------\n### Heading 3";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        // The level 3 heading can't be setext, so it's valid as ATX
+        assert!(
+            result.is_empty(),
+            "No warnings expected for setext style with ATX for level 3, found: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_setext_with_atx_style() {
+        let rule = MD003HeadingStyle::new(HeadingStyle::SetextWithAtx);
+        // Setext for h1/h2, ATX for h3-h6
+        let content = "Heading 1\n=========\n\nHeading 2\n---------\n\n### Heading 3\n\n#### Heading 4";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "SesetxtWithAtx style should accept setext for h1/h2 and ATX for h3+"
+        );
+
+        // Test incorrect usage - ATX for h1/h2
+        let content_wrong = "# Heading 1\n## Heading 2\n### Heading 3";
+        let ctx_wrong = LintContext::new(content_wrong, crate::config::MarkdownFlavor::Standard, None);
+        let result_wrong = rule.check(&ctx_wrong).unwrap();
+        assert_eq!(
+            result_wrong.len(),
+            2,
+            "Should flag ATX headings for h1/h2 with setext_with_atx style"
+        );
+    }
+
+    #[test]
+    fn test_fix_preserves_attribute_lists() {
+        // ATX closed heading with attribute list, converted to ATX
+        let rule = MD003HeadingStyle::new(HeadingStyle::Atx);
+        let content = "# Heading { #custom-id .class } #";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+
+        // Should flag: found ATX closed, expected ATX
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(warnings.len(), 1);
+        let fix = warnings[0].fix.as_ref().expect("Should have a fix");
+        assert!(
+            fix.replacement.contains("{ #custom-id .class }"),
+            "check() fix should preserve attribute list, got: {}",
+            fix.replacement
+        );
+
+        // Verify fix() also preserves attribute list
+        let fixed = rule.fix(&ctx).unwrap();
+        assert!(
+            fixed.contains("{ #custom-id .class }"),
+            "fix() should preserve attribute list, got: {fixed}"
+        );
+        assert!(
+            !fixed.contains(" #\n") && !fixed.ends_with(" #"),
+            "fix() should remove ATX closed trailing hashes, got: {fixed}"
+        );
+    }
+
+    #[test]
+    fn test_setext_with_atx_closed_style() {
+        let rule = MD003HeadingStyle::new(HeadingStyle::SetextWithAtxClosed);
+        // Setext for h1/h2, ATX closed for h3-h6
+        let content = "Heading 1\n=========\n\nHeading 2\n---------\n\n### Heading 3 ###\n\n#### Heading 4 ####";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "SetextWithAtxClosed style should accept setext for h1/h2 and ATX closed for h3+"
+        );
+
+        // Test incorrect usage - regular ATX for h3+
+        let content_wrong = "Heading 1\n=========\n\n### Heading 3\n\n#### Heading 4";
+        let ctx_wrong = LintContext::new(content_wrong, crate::config::MarkdownFlavor::Standard, None);
+        let result_wrong = rule.check(&ctx_wrong).unwrap();
+        assert_eq!(
+            result_wrong.len(),
+            2,
+            "Should flag non-closed ATX headings for h3+ with setext_with_atx_closed style"
+        );
+    }
+
+    #[test]
+    fn test_mdg_steers_every_heading_to_plain_atx() {
+        // MDG parses `#{1,6} ` headings only, so setext headings are corrected
+        // into ATX and closing sequences are dropped rather than preserved.
+        let cases = [
+            (
+                MD003HeadingStyle::new(HeadingStyle::Atx),
+                "Checkout\n========\n\n## Scenario: Buy an item\n",
+                "# Checkout\n\n## Scenario: Buy an item\n",
+            ),
+            (
+                MD003HeadingStyle::new(HeadingStyle::AtxClosed),
+                "# Feature: Checkout\n\n## Scenario: Buy an item ##\n",
+                "# Feature: Checkout\n\n## Scenario: Buy an item\n",
+            ),
+            (
+                MD003HeadingStyle::new(HeadingStyle::Setext1),
+                "# Feature: Checkout\n\nScenario: Documentation\n-----------------------\n",
+                "# Feature: Checkout\n\n## Scenario: Documentation\n",
+            ),
+            (
+                MD003HeadingStyle::default(),
+                "Checkout\n========\n\nGuide\n-----\n\n## Scenario: Buy an item\n",
+                "# Checkout\n\n## Guide\n\n## Scenario: Buy an item\n",
+            ),
+        ];
+
+        for (rule, content, expected) in cases {
+            let mdg_ctx = LintContext::new(content, crate::config::MarkdownFlavor::MDG, None);
+
+            assert!(!rule.should_skip(&mdg_ctx));
+            assert!(
+                !rule.check(&mdg_ctx).unwrap().is_empty(),
+                "MDG must still report non-ATX headings in {content:?}"
+            );
+            let fixed = rule.fix(&mdg_ctx).unwrap();
+            assert_eq!(fixed, expected, "MDG must steer {content:?} to plain ATX");
+
+            let fixed_ctx = LintContext::new(&fixed, crate::config::MarkdownFlavor::MDG, None);
+            assert!(rule.check(&fixed_ctx).unwrap().is_empty());
+            assert_eq!(rule.fix(&fixed_ctx).unwrap(), fixed, "MDG fix should be idempotent");
+        }
+    }
+
+    #[test]
+    fn test_mdg_tracks_only_an_explicit_style_for_override_notices() {
+        let direct = MD003HeadingStyle::new(HeadingStyle::Setext1);
+        assert!(direct.style_explicit);
+
+        let defaulted = MD003HeadingStyle::from_config_struct(MD003Config {
+            style: HeadingStyle::Setext1,
+        });
+        assert!(!defaulted.style_explicit);
+
+        let mut config = crate::config::Config::default();
+        let mut rule_config = crate::config::RuleConfig::default();
+        rule_config
+            .values
+            .insert("style".to_string(), toml::Value::String("setext".to_string()));
+        config.rules.insert("MD003".to_string(), rule_config);
+        let configured = MD003HeadingStyle::from_config(&config);
+        let configured = configured
+            .as_any()
+            .downcast_ref::<MD003HeadingStyle>()
+            .expect("MD003::from_config builds MD003HeadingStyle");
+        assert!(configured.style_explicit);
+
+        let default_configured = MD003HeadingStyle::from_config(&crate::config::Config::default());
+        let default_configured = default_configured
+            .as_any()
+            .downcast_ref::<MD003HeadingStyle>()
+            .expect("MD003::from_config builds MD003HeadingStyle");
+        assert!(!default_configured.style_explicit);
+    }
+}

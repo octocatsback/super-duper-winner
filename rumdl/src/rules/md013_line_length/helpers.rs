@@ -1,0 +1,1385 @@
+use crate::lint_context::LintContext;
+use crate::rules::md013_line_length::md013_config::{MD013Config, ReflowMode};
+use pulldown_cmark::LinkType;
+
+/// Mirror of markdownlint's `notWrappableRe = /^(?:[#>\s]*\s)?\S*$/`.
+///
+/// A line is "unwrappable" if, after an optional run of `#`, `>`, or
+/// whitespace characters terminated by whitespace, the rest of the line is
+/// a single solid non-whitespace token (or empty). Such lines cannot be
+/// shortened by wrapping and are exempt under stern mode.
+pub(crate) fn is_unwrappable_line(line: &str) -> bool {
+    // Walk the leading run of `#`, `>`, and whitespace characters. Track the
+    // byte offset just past the last whitespace character seen so we know
+    // where the trailing token starts.
+    let mut last_ws_end: Option<usize> = None;
+    for (idx, ch) in line.char_indices() {
+        if ch == '#' || ch == '>' {
+            // Heading/blockquote markers are valid in the prefix run but
+            // don't satisfy the trailing-whitespace requirement.
+        } else if ch.is_whitespace() {
+            last_ws_end = Some(idx + ch.len_utf8());
+        } else {
+            break;
+        }
+    }
+    // The non-capturing prefix group must end with whitespace; if there was
+    // no whitespace in the prefix run, the prefix didn't match and the
+    // entire line must be a single non-whitespace token.
+    let rest_start = last_ws_end.unwrap_or(0);
+    line[rest_start..].chars().all(|c| !c.is_whitespace())
+}
+
+/// Check if a line ends with a hard break (either two spaces or backslash)
+///
+/// CommonMark supports two formats for hard line breaks:
+/// 1. Two or more trailing spaces
+/// 2. A backslash at the end of the line
+pub(crate) fn has_hard_break(line: &str) -> bool {
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    line.ends_with("  ") || line.ends_with('\\')
+}
+
+/// Extract list marker and content from a list item
+/// Trim trailing whitespace while preserving hard breaks (two trailing spaces or backslash)
+///
+/// Hard breaks in Markdown can be indicated by:
+/// 1. Two trailing spaces before a newline (traditional)
+/// 2. A backslash at the end of the line (mdformat style)
+pub(crate) fn trim_preserving_hard_break(s: &str) -> String {
+    // Strip trailing \r from CRLF line endings first to handle Windows files
+    let s = s.strip_suffix('\r').unwrap_or(s);
+
+    // Check for backslash hard break (mdformat style)
+    if s.ends_with('\\') {
+        // Preserve the backslash exactly as-is
+        return s.to_string();
+    }
+
+    // Check if there are at least 2 trailing spaces (traditional hard break)
+    if s.ends_with("  ") {
+        // Find the position where non-space content ends
+        let content_end = s.trim_end().len();
+        if content_end == 0 {
+            // String is all whitespace
+            return String::new();
+        }
+        // Preserve exactly 2 trailing spaces for hard break
+        format!("{}  ", &s[..content_end])
+    } else {
+        // No hard break, just trim all trailing whitespace
+        s.trim_end().to_string()
+    }
+}
+
+/// Split paragraph lines into segments at hard break boundaries.
+/// Each segment is a group of lines that can be reflowed together.
+/// Lines with hard breaks (ending with 2+ spaces or backslash) form segment boundaries.
+///
+/// Example:
+///   Input:  ["Line 1", "Line 2  ", "Line 3", "Line 4"]
+///   Output: [["Line 1", "Line 2  "], ["Line 3", "Line 4"]]
+///
+/// The first segment includes "Line 2  " which has a hard break at the end.
+/// The second segment starts after the hard break.
+pub(crate) fn split_into_segments(para_lines: &[(String, usize)]) -> Vec<Vec<(String, usize)>> {
+    let mut segments: Vec<Vec<(String, usize)>> = Vec::new();
+    let mut current_segment: Vec<(String, usize)> = Vec::new();
+
+    for (line, line_num) in para_lines {
+        current_segment.push((line.clone(), *line_num));
+
+        // If this line has a hard break, end the current segment
+        if has_hard_break(line) {
+            segments.push(current_segment.clone());
+            current_segment.clear();
+        }
+    }
+
+    // Add any remaining lines as the final segment
+    if !current_segment.is_empty() {
+        segments.push(current_segment);
+    }
+
+    segments
+}
+
+/// GFM task list checkboxes, including the space that separates them from the item text.
+const TASK_CHECKBOXES: [&str; 3] = ["[ ] ", "[x] ", "[X] "];
+
+/// Whitespace that separates a list marker from the item text. CommonMark
+/// expands tabs, so a tab is marker padding rather than content, and rumdl's
+/// own parser accepts `-\tfoo` as a list item.
+const MARKER_PADDING: [char; 2] = [' ', '\t'];
+
+/// Strip a GFM task list checkbox from the text that follows a list marker.
+///
+/// Authors may pad between the marker and the checkbox (`-   [ ] task`). That
+/// padding belongs to the marker, so it is skipped before matching. Without
+/// this the checkbox reaches the reflow engine as prose, which normalizes the
+/// space inside it and rewrites `[ ]` as `[]`, silently turning a task item
+/// into plain text.
+///
+/// Returns the checkbox and the item text after it, or `None` when the item
+/// carries no checkbox.
+fn strip_task_checkbox(after_marker: &str) -> Option<(&'static str, &str)> {
+    let content = after_marker.trim_start_matches(MARKER_PADDING);
+    TASK_CHECKBOXES
+        .iter()
+        .find_map(|checkbox| content.strip_prefix(checkbox).map(|text| (*checkbox, text)))
+}
+
+/// Display width of `s`, expanding tabs to CommonMark's four-column tab stops.
+fn display_width(s: &str) -> usize {
+    s.chars()
+        .fold(0, |col, c| if c == '\t' { col + 4 - col % 4 } else { col + 1 })
+}
+
+/// The source marker of a list item: the text before the item's content, exactly as
+/// written, plus the column at which that content begins.
+///
+/// This is distinct from the marker that [`extract_list_marker_and_content`] returns.
+/// That one is *normalized* to a single space and is what gets re-emitted; this one
+/// describes the source and is what indentation arithmetic must measure against. A
+/// reflowed item's nested blocks move by `new_content_column - source.content_col`,
+/// so measuring the shift against the normalized marker silently corrupts any item
+/// whose author wrote more than one space after the marker.
+///
+/// `content_col` is a display column, so a tab in the padding counts as the columns
+/// it actually occupies rather than its single byte.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SourceMarker {
+    pub text: String,
+    pub content_col: usize,
+}
+
+/// Returns `None` when the line does not open a list item.
+pub(crate) fn source_list_marker(line: &str) -> Option<SourceMarker> {
+    let indent_len = line.len() - line.trim_start().len();
+    let trimmed = &line[indent_len..];
+
+    let after_marker = if let Some(rest) = trimmed.strip_prefix(['-', '*', '+']) {
+        rest
+    } else {
+        // Ordered marker: digits then '.'
+        let digits = trimmed.find('.')?;
+        if digits == 0 || !trimmed[..digits].chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        &trimmed[digits + 1..]
+    };
+
+    // A marker must be followed by padding.
+    if !after_marker.starts_with(MARKER_PADDING) {
+        return None;
+    }
+    let after_padding = after_marker.trim_start_matches(MARKER_PADDING);
+    // The checkbox is glued to the marker so reflow never rewrites it, matching the
+    // width that `extract_list_marker_and_content` reports for a task item.
+    let consumed = TASK_CHECKBOXES
+        .iter()
+        .find_map(|checkbox| after_padding.strip_prefix(checkbox).map(|_| checkbox.len()))
+        .unwrap_or(0);
+
+    let marker_end = line.len() - after_padding.len() + consumed;
+    let text = line[..marker_end].to_string();
+    Some(SourceMarker {
+        content_col: display_width(&text),
+        text,
+    })
+}
+
+pub(crate) fn extract_list_marker_and_content(line: &str) -> (String, String) {
+    // First, find the leading indentation
+    let indent_len = line.len() - line.trim_start().len();
+    let indent = &line[..indent_len];
+    let trimmed = &line[indent_len..];
+
+    // Handle bullet lists
+    // Trim trailing whitespace while preserving hard breaks
+    for bullet in ['-', '*', '+'] {
+        let Some(after_bullet) = trimmed.strip_prefix(bullet) else {
+            continue;
+        };
+        let mut padding = after_bullet.chars();
+        if !padding.next().is_some_and(|c| MARKER_PADDING.contains(&c)) {
+            continue;
+        }
+        // Include GFM task list checkboxes in the non-wrappable marker prefix
+        if let Some((checkbox, content)) = strip_task_checkbox(after_bullet) {
+            return (
+                format!("{indent}{bullet} {checkbox}"),
+                trim_preserving_hard_break(content),
+            );
+        }
+        // Only the first padding character belongs to the marker. Any further
+        // padding stays with the content, where reflow normalizes it away.
+        return (
+            format!("{indent}{bullet} "),
+            trim_preserving_hard_break(padding.as_str()),
+        );
+    }
+
+    // Handle numbered lists on trimmed content
+    let mut chars = trimmed.chars();
+    let mut marker_content = String::new();
+
+    while let Some(c) = chars.next() {
+        marker_content.push(c);
+        if c == '.' {
+            // Check if next char is marker padding
+            if let Some(next) = chars.next()
+                && MARKER_PADDING.contains(&next)
+            {
+                // Normalize the padding: a tab would otherwise land in the marker,
+                // where its byte length misreports the content column.
+                marker_content.push(' ');
+                let rest = chars.as_str();
+                // Check for GFM task list checkboxes
+                if let Some((checkbox, content)) = strip_task_checkbox(rest) {
+                    return (
+                        format!("{indent}{marker_content}{checkbox}"),
+                        trim_preserving_hard_break(content),
+                    );
+                }
+                let content = trim_preserving_hard_break(rest);
+                return (format!("{indent}{marker_content}"), content);
+            }
+            break;
+        }
+    }
+
+    // Fallback - shouldn't happen if is_list_item was correct
+    (String::new(), line.to_string())
+}
+
+/// Check if a line is a horizontal rule (thematic break).
+///
+/// Expects the raw, untrimmed line so the CommonMark indentation rule can be
+/// enforced: up to 3 spaces of leading indentation are allowed; 4 or more
+/// spaces mark an indented code block.
+pub(crate) fn is_horizontal_rule(line: &str) -> bool {
+    crate::utils::thematic_break::is_thematic_break(line)
+}
+
+/// True when the line at `line_num` (1-indexed) is the text line of a setext
+/// heading, i.e. the line a following `===`/`---` underline turns into a
+/// heading.
+///
+/// The answer comes from the parser, which stores the heading on the text line
+/// (`heading_detection.rs`) after applying every CommonMark disqualifier: the
+/// text line may not be a list item, an ordered item, an ATX heading, a
+/// blockquote, a fence, raw HTML, a table row or a `_` thematic break, and
+/// neither line may sit in a code block, front matter or an HTML comment.
+/// Asking the parser keeps reflow's view of the construct identical to the
+/// document's.
+///
+/// There is deliberately no companion predicate for the underline. It can only
+/// ever follow a text line, so a caller that stops at every text line - both by
+/// skipping one it starts on and by ending a paragraph that runs into one -
+/// never reaches an underline to begin with.
+pub(crate) fn is_setext_heading_text_line(ctx: &LintContext, line_num: usize) -> bool {
+    ctx.line_info(line_num).is_some_and(|info| {
+        info.heading.as_ref().is_some_and(|h| {
+            matches!(
+                h.style,
+                crate::lint_context::HeadingStyle::Setext1 | crate::lint_context::HeadingStyle::Setext2
+            )
+        })
+    })
+}
+
+/// The predicate the parser itself judges an underline by. Reflow needs it for
+/// blockquote content, where the parser cannot answer: `heading_detection.rs`
+/// skips any line starting with `>`, so a blockquoted setext heading carries no
+/// `HeadingInfo`. Callers pass the content with the `>` prefix already stripped.
+pub(crate) use crate::lint_context::is_setext_underline_content;
+
+pub(crate) fn is_numbered_list_item(line: &str) -> bool {
+    let mut chars = line.chars();
+    // Must start with a digit
+    if !chars.next().is_some_and(char::is_numeric) {
+        return false;
+    }
+    // Can have more digits
+    while let Some(c) = chars.next() {
+        if c == '.' {
+            // After period, must have marker padding (consistent with extract_list_marker_and_content)
+            // "2019." alone is NOT treated as a list item to avoid false positives
+            return chars.next().is_some_and(|c| MARKER_PADDING.contains(&c));
+        }
+        if !c.is_numeric() {
+            return false;
+        }
+    }
+    false
+}
+
+pub(crate) fn is_list_item(line: &str) -> bool {
+    // Bullet lists
+    if (line.starts_with('-') || line.starts_with('*') || line.starts_with('+'))
+        && line.chars().nth(1).is_some_and(|c| MARKER_PADDING.contains(&c))
+    {
+        return true;
+    }
+    // Numbered lists
+    is_numbered_list_item(line)
+}
+
+/// Returns true if the content looks like a GitHub Flavored Markdown alert marker.
+///
+/// GFM alert markers take the form `[!TYPE]` where TYPE is uppercase ASCII letters,
+/// optionally followed by content on the same line. They appear as the first line of
+/// a blockquote alert block and must not be merged with subsequent content lines.
+///
+/// Standard types: NOTE, TIP, IMPORTANT, WARNING, CAUTION.
+pub(crate) fn is_github_alert_marker(trimmed: &str) -> bool {
+    if !trimmed.starts_with("[!") {
+        return false;
+    }
+    let rest = &trimmed[2..];
+    let end = rest.find(|c: char| !c.is_ascii_uppercase()).unwrap_or(rest.len());
+    end > 0 && rest[end..].starts_with(']')
+}
+
+/// Strip the structural prefixes wrapping a line's content: indentation,
+/// blockquote markers, and list markers (including task checkboxes).
+///
+/// Both nestings occur in practice - a list inside a blockquote (`> - text`)
+/// and a blockquote inside a list item (`- > text`) - so the two kinds are
+/// stripped alternately until neither matches.
+///
+/// Returns the slice of the line after stripping prefixes, and its start offset.
+fn strip_structural_prefixes_slice(line: &str) -> (&str, usize) {
+    let mut s = line;
+    let mut offset = 0;
+
+    loop {
+        let prev_len = s.len();
+        let trimmed = s.trim_start();
+        let trim_len = s.len() - trimmed.len();
+
+        if let Some(rest) = trimmed.strip_prefix('>') {
+            s = rest;
+            offset += trim_len + 1;
+            continue;
+        }
+
+        if let Some(marker) = source_list_marker(trimmed) {
+            s = &trimmed[marker.text.len()..];
+            offset += trim_len + marker.text.len();
+            continue;
+        }
+
+        if s.len() == prev_len {
+            break;
+        }
+    }
+    (s, offset)
+}
+
+/// Check if a line contains only a link or image (after stripping structural
+/// prefixes like blockquote markers, list markers, and emphasis wrappers).
+///
+/// Lines matching this pattern are exempt from MD013 in non-strict mode because
+/// there is no way to shorten them without breaking the markdown structure.
+///
+/// Exempt patterns include:
+/// - `[text](url)` or `![alt](url)` (inline)
+/// - `[text][ref]` or `![alt][ref]` (reference-style)
+/// - `- [text](url)` (in list items)
+/// - `> [text](url)` (in blockquotes)
+/// - `**[text](url)**` (with emphasis)
+/// - Combinations of the above, nested in either order
+pub(crate) fn is_standalone_link_or_image_line(ctx: &LintContext, line_num: usize) -> bool {
+    let Some(line_info) = ctx.lines.get(line_num - 1) else {
+        return false;
+    };
+
+    let line = line_info.content(ctx.content);
+    let (stripped, offset) = strip_structural_prefixes_slice(line);
+    is_link_with_optional_emphasis(ctx, stripped, line_info.byte_offset + offset)
+}
+
+/// Whether a standalone link or image line ends the paragraph it follows.
+///
+/// The line is exempt from the width check because a link cannot be shortened,
+/// and in the width-driven reflow modes that exemption also has to leave the line
+/// where the author put it: joining it into the paragraph above would build a line
+/// the same rule then refuses to wrap. The sentence-driven modes shape a paragraph
+/// by its sentences instead, so there a link line following prose is a fragment of
+/// the sentence above it and belongs on that sentence's line.
+///
+/// A link line that is its own paragraph is unaffected in every mode: a blank line
+/// still ends a paragraph, and a lone link is one sentence that needs no reflow.
+pub(crate) fn standalone_link_ends_paragraph(ctx: &LintContext, line_num: usize, config: &MD013Config) -> bool {
+    !config.strict
+        && matches!(config.reflow_mode, ReflowMode::Default | ReflowMode::Normalize)
+        && is_standalone_link_or_image_line(ctx, line_num)
+}
+
+/// Check if a line consists entirely of HTML structure that cannot be
+/// meaningfully shortened. Used to exempt HTML-only lines from MD013 in
+/// non-strict mode.
+///
+/// After stripping blockquote and list markers, a line is exempt if either:
+///
+/// 1. All non-whitespace content is inside `<...>` tags (e.g., badges,
+///    self-closing images, nested tags with no text between them).
+/// 2. The line starts with `<` and ends with `>` AND contains URL-bearing
+///    attributes (`href=`, `src=`, `srcset=`, `poster=`). This handles
+///    `<a href="url">text</a>` — functionally identical to `[text](url)`
+///    which is already exempt as a standalone link.
+///
+/// Handles quoted attribute values that may contain `>` characters.
+///
+/// Examples that return true:
+/// - `<a href="..."><img alt="badge" src="..."/></a>` (all content in tags)
+/// - `<img src="..." alt="..." width="..." height="..."/>` (self-closing)
+/// - `<a href="...">link text</a>` (HTML link, consistent with markdown link exemption)
+/// - `<video src="..." poster="..." controls></video>` (media with URL attrs)
+///
+/// Examples that return false:
+/// - `Some text <a href="...">link</a>` (text before tags)
+/// - `<b>very long bold text</b>` (formatting tag without URL attributes)
+/// - `Plain text without any HTML`
+pub(crate) fn is_html_only_line(line: &str) -> bool {
+    let (stripped, _) = strip_structural_prefixes_slice(line);
+    is_html_only_content(stripped)
+}
+
+/// Combined check for HTML-only content.
+fn is_html_only_content(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() || !s.starts_with('<') {
+        return false;
+    }
+
+    // Check 1: All non-whitespace content is inside HTML tags.
+    // Covers badges, self-closing images, nested tags with no text between them.
+    if is_content_all_html_tags(s) {
+        return true;
+    }
+
+    // Check 2: Line is entirely wrapped in HTML (starts with <, ends with >)
+    // and contains URL-bearing attributes. This makes <a href="url">text</a>
+    // consistent with the existing [text](url) standalone link exemption.
+    if s.ends_with('>') && (s.contains("href=") || s.contains("src=") || s.contains("srcset=") || s.contains("poster="))
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Returns true if all non-whitespace content is inside `<...>` delimiters.
+fn is_content_all_html_tags(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() || !s.starts_with('<') {
+        return false;
+    }
+
+    let mut in_tag = false;
+    let mut quote_char: Option<char> = None;
+    let mut found_complete_tag = false;
+
+    for c in s.chars() {
+        if let Some(q) = quote_char {
+            if c == q {
+                quote_char = None;
+            }
+        } else if in_tag {
+            match c {
+                '"' | '\'' => quote_char = Some(c),
+                '>' => {
+                    in_tag = false;
+                    found_complete_tag = true;
+                }
+                _ => {}
+            }
+        } else if c == '<' {
+            in_tag = true;
+        } else if !c.is_whitespace() {
+            return false;
+        }
+    }
+
+    found_complete_tag
+}
+
+/// Check if content (after stripping list/blockquote markers) is a standalone link,
+/// optionally wrapped in emphasis.
+fn is_matching_wrapper(s: &str, first: char, last: char) -> bool {
+    match (first, last) {
+        (f, l) if f == l && (f == '*' || f == '_' || f == '"' || f == '\'') => true,
+        ('(', ')') => s.chars().filter(|&c| c == '(').count() == s.chars().filter(|&c| c == ')').count(),
+        ('[', ']') => s.chars().filter(|&c| c == '[').count() == s.chars().filter(|&c| c == ']').count(),
+        ('{', '}')
+        | ('\u{201C}', '\u{201D}') // “ and ”
+        | ('\u{2018}', '\u{2019}') // ‘ and ’
+        | ('（', '）')
+        | ('｛', '｝')
+        | ('【', '】')
+        | ('「', '」')
+        | ('『', '』') => true,
+        _ => false,
+    }
+}
+
+fn is_safe_leading(c: char) -> bool {
+    matches!(c, '(' | '{' | '（' | '｛' | '【' | '「' | '『' | '［' | '*' | '_')
+        || crate::utils::sentence_utils::is_opening_quote(c)
+}
+
+fn is_safe_trailing(c: char) -> bool {
+    matches!(
+        c,
+        '.' | ','
+            | ';'
+            | ':'
+            | '!'
+            | '?'
+            | '}'
+            | '）'
+            | '｝'
+            | '】'
+            | '』'
+            | '」'
+            | '］'
+            | '、'
+            | '，'
+            | '；'
+            | '：'
+            | '\\'
+    ) || crate::utils::sentence_utils::is_closing_quote(c)
+        || crate::utils::sentence_utils::is_cjk_sentence_ending(c)
+}
+
+fn has_matching_link_or_image(ctx: &LintContext, start: usize, end: usize) -> bool {
+    ctx.link_starting_at(start)
+        .is_some_and(|link| link.byte_end == end && !(link.link_type == LinkType::Shortcut && link.url.is_empty()))
+        || ctx.image_starting_at(start).is_some_and(|image| image.byte_end == end)
+}
+
+/// Check if content (after stripping list/blockquote markers) is a standalone link,
+/// optionally wrapped in emphasis.
+fn is_link_with_optional_emphasis(ctx: &LintContext, s: &str, s_offset: usize) -> bool {
+    let mut s = s;
+    let mut s_start = s_offset;
+
+    // Trim initial
+    let trimmed_start = s.len() - s.trim_start().len();
+    s_start += trimmed_start;
+    s = s.trim_start();
+    s = s.trim_end();
+    let mut s_end = s_start + s.len();
+
+    if s.is_empty() {
+        return false;
+    }
+
+    loop {
+        // 1. Check match first
+        if has_matching_link_or_image(ctx, s_start, s_end) {
+            return true;
+        }
+
+        // Fallback for links with spaces in destination (not parsed by pulldown-cmark as a single
+        // link). A destination holding a space leaves the link text parsed as an empty-url
+        // shortcut, and that is what marks the trailing group as the destination rather than
+        // prose following a complete link.
+        if let Some(l) = ctx.link_starting_at(s_start)
+            && l.byte_end < s_end
+            && l.link_type == LinkType::Shortcut
+            && l.url.is_empty()
+        {
+            let remaining = &s[l.byte_end - s_start..];
+            if is_destination_group(remaining) {
+                return true;
+            }
+        }
+
+        // Fallback for images with spaces in destination
+        if let Some(i) = ctx.image_starting_at(s_start)
+            && i.byte_end < s_end
+            && i.link_type == LinkType::Shortcut
+            && i.url.is_empty()
+        {
+            let remaining = &s[i.byte_end - s_start..];
+            if is_destination_group(remaining) {
+                return true;
+            }
+        }
+
+        let prev_len = s.len();
+        if prev_len < 2 {
+            break;
+        }
+
+        let first = s.chars().next().unwrap();
+        let last = s.chars().next_back().unwrap();
+
+        // 2. Try matching wrappers first (non-structural)
+        if is_matching_wrapper(s, first, last) {
+            s = &s[first.len_utf8()..s.len() - last.len_utf8()];
+            s_start += first.len_utf8();
+            s_end -= last.len_utf8();
+
+            let ts = s.len() - s.trim_start().len();
+            s_start += ts;
+            s = s.trim_start();
+            let te = s.len() - s.trim_end().len();
+            s_end -= te;
+            s = s.trim_end();
+            continue;
+        }
+
+        // 3. Peel safe leading
+        if is_safe_leading(first) {
+            s = &s[first.len_utf8()..];
+            s_start += first.len_utf8();
+
+            let ts = s.len() - s.trim_start().len();
+            s_start += ts;
+            s = s.trim_start();
+            continue;
+        }
+
+        // 4. Peel safe trailing
+        if is_safe_trailing(last) || last == '*' || last == '_' {
+            s = &s[..s.len() - last.len_utf8()];
+            s_end -= last.len_utf8();
+
+            let te = s.len() - s.trim_end().len();
+            s_end -= te;
+            s = s.trim_end();
+            continue;
+        }
+
+        // 5. Peel unsafe structural if they are extra (heuristic)
+        if first == '[' && s.chars().filter(|&c| c == '[').count() > s.chars().filter(|&c| c == ']').count() {
+            s = &s[first.len_utf8()..];
+            s_start += first.len_utf8();
+
+            let ts = s.len() - s.trim_start().len();
+            s_start += ts;
+            s = s.trim_start();
+            continue;
+        }
+
+        if last == ')' && s.chars().filter(|&c| c == ')').count() > s.chars().filter(|&c| c == '(').count() {
+            s = &s[..s.len() - last.len_utf8()];
+            s_end -= last.len_utf8();
+
+            let te = s.len() - s.trim_end().len();
+            s_end -= te;
+            s = s.trim_end();
+            continue;
+        }
+
+        if last == ']' && s.chars().filter(|&c| c == ']').count() > s.chars().filter(|&c| c == '[').count() {
+            s = &s[..s.len() - last.len_utf8()];
+            s_end -= last.len_utf8();
+
+            let te = s.len() - s.trim_end().len();
+            s_end -= te;
+            s = s.trim_end();
+            continue;
+        }
+
+        // If we couldn't peel anything, we are stuck
+        if s.len() == prev_len {
+            break;
+        }
+    }
+
+    false
+}
+
+/// Whether `s` is the destination of the link text immediately before it: a single balanced
+/// parenthesized group opening on the very next byte. CommonMark forbids whitespace between
+/// `]` and `(`, so only the trailing side is trimmed.
+fn is_destination_group(s: &str) -> bool {
+    let s = s.trim_end();
+    if !s.starts_with('(') || !s.ends_with(')') {
+        return false;
+    }
+    let mut balance = 0;
+    let mut char_iter = s.chars().peekable();
+
+    while let Some(c) = char_iter.next() {
+        if c == '(' {
+            balance += 1;
+        } else if c == ')' {
+            balance -= 1;
+            if balance == 0 {
+                return char_iter.peek().is_none();
+            }
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::MarkdownFlavor;
+
+    fn check_standalone(content: &str) -> bool {
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        is_standalone_link_or_image_line(&ctx, 1)
+    }
+
+    /// Test for issue #336: "2019." alone should NOT be treated as a list item
+    /// This prevents convergence failures when a year appears at the end of a sentence
+    #[test]
+    fn test_numbered_list_item_requires_space_after_period() {
+        // Valid list items (have space after period)
+        assert!(is_numbered_list_item("1. Item"));
+        assert!(is_numbered_list_item("10. Item"));
+        assert!(is_numbered_list_item("99. Long number"));
+        assert!(is_numbered_list_item("123. Triple digits"));
+
+        // Invalid: number+period without space (like years at end of sentences)
+        // These should NOT be treated as list items to avoid reflow issues
+        assert!(!is_numbered_list_item("2019."));
+        assert!(!is_numbered_list_item("1999."));
+        assert!(!is_numbered_list_item("2023."));
+        assert!(!is_numbered_list_item("1.")); // Even single digit without space
+
+        // Invalid: not starting with digit
+        assert!(!is_numbered_list_item("a. Item"));
+        assert!(!is_numbered_list_item(". Item"));
+        assert!(!is_numbered_list_item("Item"));
+
+        // Invalid: no period
+        assert!(!is_numbered_list_item("1 Item"));
+        assert!(!is_numbered_list_item("123"));
+    }
+
+    #[test]
+    fn test_extract_list_marker_task_checkboxes() {
+        // Unchecked task item: checkbox becomes part of the marker prefix
+        assert_eq!(
+            extract_list_marker_and_content("- [ ] some content"),
+            ("- [ ] ".to_string(), "some content".to_string())
+        );
+        // Checked task item (lowercase x)
+        assert_eq!(
+            extract_list_marker_and_content("- [x] done item"),
+            ("- [x] ".to_string(), "done item".to_string())
+        );
+        // Checked task item (uppercase X)
+        assert_eq!(
+            extract_list_marker_and_content("- [X] also done"),
+            ("- [X] ".to_string(), "also done".to_string())
+        );
+        // Other bullet markers preserve checkbox
+        assert_eq!(
+            extract_list_marker_and_content("* [ ] star task"),
+            ("* [ ] ".to_string(), "star task".to_string())
+        );
+        assert_eq!(
+            extract_list_marker_and_content("+ [ ] plus task"),
+            ("+ [ ] ".to_string(), "plus task".to_string())
+        );
+        // Indented task item
+        assert_eq!(
+            extract_list_marker_and_content("  - [ ] indented task"),
+            ("  - [ ] ".to_string(), "indented task".to_string())
+        );
+        // Regular bullet (no checkbox) is unchanged
+        assert_eq!(
+            extract_list_marker_and_content("- regular item"),
+            ("- ".to_string(), "regular item".to_string())
+        );
+        // Ordered list with task checkboxes
+        assert_eq!(
+            extract_list_marker_and_content("1. [ ] unchecked ordered"),
+            ("1. [ ] ".to_string(), "unchecked ordered".to_string())
+        );
+        assert_eq!(
+            extract_list_marker_and_content("1. [x] checked ordered"),
+            ("1. [x] ".to_string(), "checked ordered".to_string())
+        );
+        assert_eq!(
+            extract_list_marker_and_content("1. [X] checked upper ordered"),
+            ("1. [X] ".to_string(), "checked upper ordered".to_string())
+        );
+        assert_eq!(
+            extract_list_marker_and_content("99. [x] multi-digit ordered"),
+            ("99. [x] ".to_string(), "multi-digit ordered".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_list_marker_task_checkbox_with_wide_marker_spacing() {
+        // Extra spaces between the marker and the checkbox are marker padding.
+        // The checkbox must still be recognized, otherwise it is handed to the
+        // reflow engine as prose and "[ ]" collapses to "[]", silently turning
+        // a task item into plain text.
+        assert_eq!(
+            extract_list_marker_and_content("-   [ ] wide unchecked"),
+            ("- [ ] ".to_string(), "wide unchecked".to_string())
+        );
+        assert_eq!(
+            extract_list_marker_and_content("*  [x] wide checked"),
+            ("* [x] ".to_string(), "wide checked".to_string())
+        );
+        assert_eq!(
+            extract_list_marker_and_content("+    [X] wide checked upper"),
+            ("+ [X] ".to_string(), "wide checked upper".to_string())
+        );
+        assert_eq!(
+            extract_list_marker_and_content("  -  [ ] indented and wide"),
+            ("  - [ ] ".to_string(), "indented and wide".to_string())
+        );
+        // Ordered markers pad after the period.
+        assert_eq!(
+            extract_list_marker_and_content("1.   [ ] wide ordered"),
+            ("1. [ ] ".to_string(), "wide ordered".to_string())
+        );
+        assert_eq!(
+            extract_list_marker_and_content("99.  [x] wide multi-digit"),
+            ("99. [x] ".to_string(), "wide multi-digit".to_string())
+        );
+        // A tab is padding too: CommonMark expands it, rumdl's parser accepts
+        // it, and leaving it in place mangles the checkbox as extra spaces did.
+        assert_eq!(
+            extract_list_marker_and_content("- \t[ ] tab padded"),
+            ("- [ ] ".to_string(), "tab padded".to_string())
+        );
+        assert_eq!(
+            extract_list_marker_and_content("-\t[ ] tab only"),
+            ("- [ ] ".to_string(), "tab only".to_string())
+        );
+        assert_eq!(
+            extract_list_marker_and_content("1.\t[x] ordered tab only"),
+            ("1. [x] ".to_string(), "ordered tab only".to_string())
+        );
+        // A tab-padded item without a checkbox normalizes the marker too.
+        assert_eq!(
+            extract_list_marker_and_content("-\tplain tab item"),
+            ("- ".to_string(), "plain tab item".to_string())
+        );
+        assert_eq!(
+            extract_list_marker_and_content("1.\tplain ordered tab item"),
+            ("1. ".to_string(), "plain ordered tab item".to_string())
+        );
+        // Padding without a checkbox keeps the existing shape: the marker is
+        // normalized to one space and the padding stays with the content.
+        assert_eq!(
+            extract_list_marker_and_content("-   plain wide item"),
+            ("- ".to_string(), "  plain wide item".to_string())
+        );
+        // A bracket pair that is not a checkbox is content, not a marker.
+        assert_eq!(
+            extract_list_marker_and_content("-   [link] text"),
+            ("- ".to_string(), "  [link] text".to_string())
+        );
+    }
+
+    #[test]
+    fn test_is_horizontal_rule_commonmark_indent() {
+        // Up to 3 spaces of leading indent is allowed (CommonMark thematic break).
+        assert!(is_horizontal_rule("---"));
+        assert!(is_horizontal_rule(" ---"));
+        assert!(is_horizontal_rule("  ---"));
+        assert!(is_horizontal_rule("   ---"));
+        assert!(is_horizontal_rule("   ***"));
+        assert!(is_horizontal_rule("   - - -"));
+
+        // 4+ spaces of leading indent is an indented code block, not a thematic break.
+        assert!(!is_horizontal_rule("    ---"));
+        assert!(!is_horizontal_rule("     ---"));
+        assert!(!is_horizontal_rule("        ***"));
+        assert!(!is_horizontal_rule("    - - -"));
+
+        // Trailing whitespace is still allowed.
+        assert!(is_horizontal_rule("---   "));
+        assert!(is_horizontal_rule("  ---  "));
+
+        // Basic shapes still match.
+        assert!(is_horizontal_rule("----"));
+        assert!(is_horizontal_rule("***"));
+        assert!(is_horizontal_rule("___"));
+        assert!(is_horizontal_rule("- - -"));
+        assert!(!is_horizontal_rule("--"));
+        assert!(!is_horizontal_rule("text"));
+        assert!(!is_horizontal_rule(""));
+    }
+
+    #[test]
+    fn test_is_list_item_bullet_and_numbered() {
+        // Bullet list items
+        assert!(is_list_item("- Item"));
+        assert!(is_list_item("* Item"));
+        assert!(is_list_item("+ Item"));
+
+        // Bullet without space = not a list item
+        assert!(!is_list_item("-Item"));
+        assert!(!is_list_item("*Item"));
+
+        // Numbered list items
+        assert!(is_list_item("1. Item"));
+        assert!(is_list_item("99. Item"));
+
+        // Year at end of sentence = not a list item
+        assert!(!is_list_item("2019."));
+    }
+
+    #[test]
+    fn test_is_github_alert_marker() {
+        // Standard GFM alert types
+        assert!(is_github_alert_marker("[!NOTE]"));
+        assert!(is_github_alert_marker("[!TIP]"));
+        assert!(is_github_alert_marker("[!WARNING]"));
+        assert!(is_github_alert_marker("[!CAUTION]"));
+        assert!(is_github_alert_marker("[!IMPORTANT]"));
+
+        // Alert with trailing content on the same line
+        assert!(is_github_alert_marker("[!NOTE] Some inline content here"));
+        assert!(is_github_alert_marker("[!WARNING] Do not do this"));
+
+        // Custom uppercase type (not standard but structurally valid)
+        assert!(is_github_alert_marker("[!CUSTOM]"));
+
+        // Not an alert marker
+        assert!(!is_github_alert_marker("[!note]")); // lowercase
+        assert!(!is_github_alert_marker("[Note]")); // missing !
+        assert!(!is_github_alert_marker("[!]")); // empty type
+        assert!(!is_github_alert_marker("[!NOTE")); // missing closing bracket
+        assert!(!is_github_alert_marker("NOTE")); // no brackets
+        assert!(!is_github_alert_marker("[link]: url")); // link definition
+        assert!(!is_github_alert_marker("Some text [!NOTE]")); // not at start
+    }
+
+    #[test]
+    fn test_standalone_link_bare() {
+        // Bare inline link
+        assert!(check_standalone("[text](https://example.com)"));
+        assert!(check_standalone("[long title here](https://example.com/path)"));
+        // With leading whitespace
+        assert!(check_standalone("  [text](https://example.com)"));
+        // URL with balanced parentheses (Wikipedia-style)
+        assert!(check_standalone(
+            "[Rust](https://en.wikipedia.org/wiki/Rust_(programming_language))"
+        ));
+        assert!(check_standalone("[A](https://example.com/A_(B)_C)"));
+    }
+
+    #[test]
+    fn test_emphasis_only_line_is_not_a_standalone_link() {
+        // A line that reduces to only emphasis markers (matched leading/trailing
+        // runs that overlap) must not panic while stripping the wrappers, and is
+        // not a standalone link.
+        for s in ["*", "**", "***", "_", "__", "___", "*_*", "**_", "_**"] {
+            assert!(!check_standalone(s), "{s:?} is not a standalone link");
+        }
+        // Emphasis-wrapped real links still detected.
+        assert!(check_standalone("*[text](https://example.com)*"));
+        assert!(check_standalone("**[text](https://example.com)**"));
+    }
+
+    #[test]
+    fn test_standalone_image() {
+        assert!(check_standalone("![alt text](https://example.com/img.png)"));
+        assert!(check_standalone("  ![alt](url)"));
+        // Image with space in destination (Jekyll/Liquid templated path)
+        assert!(check_standalone("![Placeholder](images/1_<release number>/x.png)"));
+    }
+
+    #[test]
+    fn test_standalone_link_in_list() {
+        // Bullet list items
+        assert!(check_standalone("- [text](url)"));
+        assert!(check_standalone("* [text](url)"));
+        assert!(check_standalone("+ [text](url)"));
+        // Ordered list
+        assert!(check_standalone("1. [text](url)"));
+        assert!(check_standalone("99. [text](url)"));
+        // Indented list item
+        assert!(check_standalone("  - [text](url)"));
+        // Task list with link (bullet and ordered)
+        assert!(check_standalone("- [ ] [text](url)"));
+        assert!(check_standalone("- [x] [text](url)"));
+        assert!(check_standalone("1. [x] [text](url)"));
+        assert!(check_standalone("1. [ ] [text](url)"));
+        // Link with space in destination (Jekyll/Liquid templated path)
+        assert!(check_standalone(
+            "* [Front Matter Defaults]({{ '...' | relative_url }})"
+        ));
+    }
+
+    #[test]
+    fn test_standalone_link_in_blockquote() {
+        assert!(check_standalone("> [text](url)"));
+        assert!(check_standalone(">> [text](url)"));
+        assert!(check_standalone("> > [text](url)"));
+    }
+
+    #[test]
+    fn test_standalone_link_with_emphasis() {
+        assert!(check_standalone("**[text](url)**"));
+        assert!(check_standalone("*[text](url)*"));
+        assert!(check_standalone("__[text](url)__"));
+        assert!(check_standalone("_[text](url)_"));
+        assert!(check_standalone("***[text](url)***"));
+        // List + emphasis
+        assert!(check_standalone("- **[text](url)**"));
+    }
+
+    #[test]
+    fn test_standalone_link_reference_style() {
+        assert!(check_standalone("[text][]\n\n[text]: url"));
+        assert!(check_standalone("[text][ref]"));
+        assert!(check_standalone("![alt][ref]"));
+        assert!(check_standalone("- [text][ref]"));
+        assert!(check_standalone("> [text][ref]"));
+        // Collapsed reference link
+        assert!(check_standalone("[text][]"));
+        assert!(check_standalone("- [text][]"));
+    }
+
+    #[test]
+    fn test_standalone_link_with_trailing_punctuation() {
+        // Trailing punctuation on bare links
+        assert!(check_standalone("[text](url),"));
+        assert!(check_standalone("[text](url)."));
+        assert!(check_standalone("[text](url);"));
+        assert!(check_standalone("[text](url):"));
+        assert!(check_standalone("[text](url)?"));
+        assert!(check_standalone("[text](url)!"));
+
+        // Trailing quotes (can be unbalanced)
+        assert!(check_standalone("[text](url)\""));
+        assert!(check_standalone("[text](url)'"));
+        assert!(check_standalone("[text](url)”"));
+        assert!(check_standalone("[text](url)’"));
+
+        // Balanced wrappers (parentheses, braces, quotes)
+        assert!(check_standalone("([text](url))"));
+        assert!(check_standalone("{[text](url)}"));
+        assert!(check_standalone("\"[text](url)\""));
+        assert!(check_standalone("'[text](url)'"));
+        assert!(check_standalone("“[text](url)”"));
+        assert!(check_standalone("‘[text](url)’"));
+
+        // CJK balanced wrappers
+        assert!(check_standalone("（[text](url)）"));
+        assert!(check_standalone("｛[text](url)｝"));
+        assert!(check_standalone("【[text](url)】"));
+        assert!(check_standalone("「[text](url)」"));
+        assert!(check_standalone("『[text](url)』"));
+
+        // CJK trailing punctuation
+        assert!(check_standalone("[text](url)。"));
+        assert!(check_standalone("[text](url)，"));
+        assert!(check_standalone("[text](url)；"));
+        assert!(check_standalone("[text](url)："));
+        assert!(check_standalone("[text](url)！"));
+        assert!(check_standalone("[text](url)？"));
+        assert!(check_standalone("[text](url)、"));
+
+        // Multiple trailing punctuations
+        assert!(check_standalone("[text](url)..."));
+        assert!(check_standalone("[text](url)?!"));
+
+        // With emphasis and trailing punctuation
+        assert!(check_standalone("**[text](url)**,"));
+        assert!(check_standalone("*[text](url)*."));
+        assert!(check_standalone("***[text](url)***!"));
+
+        // Punctuation inside emphasis
+        assert!(check_standalone("**[text](url),**"));
+        assert!(check_standalone("*[text](url).*"));
+        assert!(check_standalone("***[text](url)!***"));
+
+        // In lists and blockquotes
+        assert!(check_standalone("- [text](url),"));
+        assert!(check_standalone("> [text](url)."));
+        assert!(check_standalone("  - **[text](url)**;"));
+
+        // Reference style
+        assert!(check_standalone("[text][ref],"));
+        assert!(check_standalone("![alt][ref]."));
+        assert!(check_standalone("- ***[text][ref]***!"));
+
+        // Standalone image with trailing punctuation
+        assert!(check_standalone("![alt](url),"));
+
+        // Complex nested emphasis and punctuation (Issue regression)
+        assert!(check_standalone("**_***[text](url).***._.**"));
+    }
+
+    #[test]
+    fn test_not_standalone_link() {
+        // Has text before the link
+        assert!(!check_standalone("Some text [link](url)"));
+        assert!(!check_standalone("See [link](url) for details"));
+        // Plain text (no link)
+        assert!(!check_standalone("Just some long text"));
+        // Unresolved shortcut link (should not be exempt)
+        assert!(!check_standalone("[text]"));
+        // Empty
+        assert!(!check_standalone(""));
+        assert!(!check_standalone("   "));
+        // Multiple links
+        assert!(!check_standalone("[link1](url1) [link2](url2)"));
+        // Link followed by text
+        assert!(!check_standalone("[link](url) extra text"));
+    }
+
+    #[test]
+    fn test_link_followed_by_parenthetical_is_not_standalone() {
+        // A complete link followed by a parenthesized aside is prose, not a destination.
+        // The whole line can be wrapped, so it is not exempt.
+        assert!(!check_standalone(
+            "- [ripgrep](https://github.com/BurntSushi/ripgrep) (a line-oriented search tool)"
+        ));
+        assert!(!check_standalone(
+            "[the docs](https://example.com/d) (updated for 2026, including the new guide)"
+        ));
+        assert!(!check_standalone(
+            "![screenshot](img/s.png) (captured on a retina display with the sidebar hidden)"
+        ));
+        // An unresolved shortcut whose aside is separated by a space: the space rules out a
+        // destination, since CommonMark forbids one between `]` and `(`.
+        assert!(!check_standalone(
+            "[NOTE] (this applies only when the feature flag is enabled)"
+        ));
+        // Attached, so no space rules it out. Here the link parsed with its own destination,
+        // which is what says the trailing group belongs to the prose.
+        assert!(!check_standalone(
+            "[the docs](https://example.com/d)(a parenthetical stuck onto the link)"
+        ));
+
+        // The exemptions the fallback exists for still hold: a destination holding a space
+        // leaves the link text parsed as an empty-url shortcut.
+        assert!(check_standalone(
+            "![Placeholder Screenshot](images/1_<release number>/screenshot-main-window.png)"
+        ));
+        assert!(check_standalone(
+            "* [Front Matter Defaults]({{ '/assets/img/very-long-image-name.png' | relative_url }})"
+        ));
+    }
+
+    // --- is_html_only_line tests ---
+
+    #[test]
+    fn test_html_only_badge_line() {
+        // The reported case: badge with nested <a> and <img>
+        assert!(is_html_only_line(
+            r#"<a href="https://dotfyle.com/plugins/chrisgrieser/nvim-rulebook"><img alt="badge" src="https://dotfyle.com/plugins/chrisgrieser/nvim-rulebook/shield"/></a>"#
+        ));
+    }
+
+    #[test]
+    fn test_html_only_self_closing_tags() {
+        assert!(is_html_only_line(
+            r#"<img src="https://example.com/image.png" alt="screenshot" width="800" height="600"/>"#
+        ));
+        assert!(is_html_only_line(r#"<br/>"#));
+        assert!(is_html_only_line(r#"<hr />"#));
+    }
+
+    #[test]
+    fn test_html_only_multiple_tags() {
+        // Multiple adjacent tags with no text between them
+        assert!(is_html_only_line(r#"<img src="a.png"/><img src="b.png"/>"#));
+        assert!(is_html_only_line(r#"<br/><br/><br/>"#));
+    }
+
+    #[test]
+    fn test_html_only_empty_element() {
+        // Tags with no content between opening and closing
+        assert!(is_html_only_line(r#"<video src="long-url.mp4" controls></video>"#));
+        assert!(is_html_only_line(r#"<div></div>"#));
+    }
+
+    #[test]
+    fn test_html_only_with_whitespace_between_tags() {
+        assert!(is_html_only_line(r#"<img src="a.png"/> <img src="b.png"/>"#));
+    }
+
+    #[test]
+    fn test_html_only_quoted_angle_brackets() {
+        // Attribute value containing > should not break parsing
+        assert!(is_html_only_line(r#"<img alt="a > b" src="test.png"/>"#));
+        assert!(is_html_only_line(r#"<img alt='a > b' src="test.png"/>"#));
+    }
+
+    #[test]
+    fn test_html_only_in_blockquote() {
+        assert!(is_html_only_line(r#"> <img src="long-url.png" alt="screenshot"/>"#));
+        assert!(is_html_only_line(r#">> <a href="url"><img src="img"/></a>"#));
+    }
+
+    #[test]
+    fn test_html_only_in_list() {
+        assert!(is_html_only_line(r#"- <img src="long-url.png" alt="screenshot"/>"#));
+        assert!(is_html_only_line(r#"1. <a href="url"><img src="img"/></a>"#));
+        assert!(is_html_only_line(r#"  - <img src="long-url.png"/>"#));
+    }
+
+    #[test]
+    fn test_html_only_link_with_text_and_url() {
+        // <a href="url">text</a> is functionally identical to [text](url)
+        // which is already exempt — so this should also be exempt
+        assert!(is_html_only_line(
+            r#"<a href="https://example.com/very-long-path">Click here for details</a>"#
+        ));
+        // With target attribute (reason to use HTML over markdown)
+        assert!(is_html_only_line(
+            r#"<a href="https://example.com/very-long-path" target="_blank">Click here for details</a>"#
+        ));
+        // Multiple URL attributes
+        assert!(is_html_only_line(
+            r#"<a href="https://example.com/path"><img src="https://example.com/badge.svg" alt="status"/></a>"#
+        ));
+    }
+
+    #[test]
+    fn test_not_html_only_text_before_tags() {
+        assert!(!is_html_only_line(r#"Click here: <a href="url">link</a>"#));
+        assert!(!is_html_only_line(r#"See <img src="url"/> for details"#));
+    }
+
+    #[test]
+    fn test_not_html_only_text_after_tags() {
+        assert!(!is_html_only_line(r#"<a href="url">link</a> - click above"#));
+        assert!(!is_html_only_line(r#"<img src="url"/> is an image"#));
+    }
+
+    #[test]
+    fn test_not_html_only_formatting_tags_without_urls() {
+        // Formatting tags without URL attributes should NOT be exempt —
+        // the line is long because of text content, not URLs
+        assert!(!is_html_only_line(
+            r#"<b>This is very long bold text that exceeds the line length limit</b>"#
+        ));
+        assert!(!is_html_only_line(
+            r#"<p>This is a very long paragraph written in HTML tags for some reason</p>"#
+        ));
+        assert!(!is_html_only_line(
+            r#"<span style="color:red">Some styled text that is quite long</span>"#
+        ));
+        assert!(!is_html_only_line(
+            r#"<em>Emphasized text that goes on and on and on</em>"#
+        ));
+        // Multiple formatting tags with text between them
+        assert!(!is_html_only_line(r#"<b>bold</b> and <i>italic</i>"#));
+    }
+
+    #[test]
+    fn test_not_html_only_plain_text() {
+        assert!(!is_html_only_line("Just some long text without any HTML"));
+        assert!(!is_html_only_line(""));
+        assert!(!is_html_only_line("   "));
+    }
+
+    #[test]
+    fn test_not_html_only_incomplete_tag() {
+        // Unclosed tag with no complete tag
+        assert!(!is_html_only_line("<unclosed"));
+        // Doesn't end with > (unclosed outer element)
+        assert!(!is_html_only_line(r#"<a href="url">text"#));
+    }
+
+    #[test]
+    fn test_html_only_comment() {
+        // Simple HTML comments (no > inside) are detected as all-inside-tags
+        assert!(is_html_only_line(
+            "<!-- this is a long HTML comment that spans many characters -->"
+        ));
+    }
+
+    #[test]
+    fn test_html_only_media_elements() {
+        assert!(is_html_only_line(
+            r#"<video src="https://example.com/very-long-path/video.mp4" poster="https://example.com/thumb.jpg" controls></video>"#
+        ));
+        assert!(is_html_only_line(
+            r#"<audio src="https://example.com/very-long-path/audio.mp3" controls></audio>"#
+        ));
+        assert!(is_html_only_line(
+            r#"<source srcset="https://example.com/image-large.webp" media="(min-width: 800px)"/>"#
+        ));
+        assert!(is_html_only_line(
+            r#"<picture><source srcset="large.webp"/><img src="fallback.png"/></picture>"#
+        ));
+    }
+
+    #[test]
+    fn test_html_only_in_list_with_url_text() {
+        // List item containing an HTML link with text — should be exempt
+        assert!(is_html_only_line(
+            r#"- <a href="https://example.com/very-long-path">documentation link</a>"#
+        ));
+    }
+
+    #[test]
+    fn test_html_only_in_blockquote_with_url_text() {
+        assert!(is_html_only_line(
+            r#"> <a href="https://example.com/very-long-path">documentation link</a>"#
+        ));
+    }
+
+    #[test]
+    fn setext_underline_content_accepts_either_marker_at_any_width() {
+        for content in ["=", "===", "-", "--", "---", "  ===  ", "\t---\t"] {
+            assert!(
+                is_setext_underline_content(content),
+                "{content:?} is a setext underline"
+            );
+        }
+    }
+
+    #[test]
+    fn setext_underline_content_rejects_internal_spaces_and_mixed_markers() {
+        // The parser's regex is `^(\s*)(=+|-+)\s*$`: no internal spaces, no
+        // mixing. `= = =` and `- - -` are paragraph text (a spaced `- - -` is a
+        // thematic break, which `is_horizontal_rule` already handles).
+        for content in ["= = =", "- - -", "=-=", "--=", "= x", "", "   ", "prose", "-> arrow"] {
+            assert!(
+                !is_setext_underline_content(content),
+                "{content:?} is not a setext underline"
+            );
+        }
+    }
+
+    #[test]
+    fn setext_heading_lookup_follows_the_parser() {
+        let ctx = LintContext::new("Setup\n=====\n\nSubhead\n---\n", MarkdownFlavor::Standard, None);
+
+        // The parser stores the heading on the text line, never on the underline.
+        // That asymmetry is what lets reflow protect the pair with one lookup:
+        // stopping at the text line puts the underline out of reach.
+        assert!(is_setext_heading_text_line(&ctx, 1));
+        assert!(!is_setext_heading_text_line(&ctx, 2));
+        assert!(is_setext_heading_text_line(&ctx, 4));
+        assert!(!is_setext_heading_text_line(&ctx, 5));
+
+        // A blank line is not a heading, and line 0 does not exist.
+        assert!(!is_setext_heading_text_line(&ctx, 3));
+        assert!(!is_setext_heading_text_line(&ctx, 0));
+    }
+
+    #[test]
+    fn setext_heading_lookup_inherits_the_parsers_disqualifiers() {
+        // A `---` under a list item is a thematic break, not a setext heading,
+        // and the parser knows it. Asking the parser is what keeps reflow's view
+        // of the construct identical to the document's.
+        let ctx = LintContext::new("- item\n---\n", MarkdownFlavor::Standard, None);
+        assert!(!is_setext_heading_text_line(&ctx, 1));
+
+        // Inside a fenced code block nothing is a heading.
+        let ctx = LintContext::new("```\nSetup\n=====\n```\n", MarkdownFlavor::Standard, None);
+        assert!(!is_setext_heading_text_line(&ctx, 2));
+
+        // Nor is a blockquoted one, which is why the blockquote path needs
+        // `is_setext_underline_content` instead of this lookup.
+        let ctx = LintContext::new("> Setup\n> =====\n", MarkdownFlavor::Standard, None);
+        assert!(!is_setext_heading_text_line(&ctx, 1));
+    }
+}

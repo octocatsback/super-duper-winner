@@ -1,0 +1,272 @@
+use crate::rule_config_serde::RuleConfig;
+use crate::types::LineLength;
+use serde::ser::Serializer;
+use serde::{Deserialize, Serialize};
+/// Controls how cell text is aligned within padded columns.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum ColumnAlign {
+    /// Use alignment indicators from delimiter row (`:---`, `:---:`, `---:`)
+    #[default]
+    Auto,
+    /// Force all columns to left-align text
+    Left,
+    /// Force all columns to center text
+    Center,
+    /// Force all columns to right-align text
+    Right,
+}
+
+impl Serialize for ColumnAlign {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            ColumnAlign::Auto => serializer.serialize_str("auto"),
+            ColumnAlign::Left => serializer.serialize_str("left"),
+            ColumnAlign::Center => serializer.serialize_str("center"),
+            ColumnAlign::Right => serializer.serialize_str("right"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ColumnAlign {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().as_str() {
+            "auto" => Ok(ColumnAlign::Auto),
+            "left" => Ok(ColumnAlign::Left),
+            "center" => Ok(ColumnAlign::Center),
+            "right" => Ok(ColumnAlign::Right),
+            _ => Err(serde::de::Error::custom(format!(
+                "Invalid column-align value: {s}. Valid options: auto, left, center, right"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MD060Config {
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+
+    #[serde(
+        default = "default_style",
+        serialize_with = "serialize_style",
+        deserialize_with = "deserialize_style"
+    )]
+    pub style: String,
+
+    /// Maximum table width before auto-switching to compact mode.
+    ///
+    /// - `0` (default): Inherit from MD013's `line-length` setting
+    /// - Non-zero: Explicit max width threshold
+    ///
+    /// When a table's aligned width would exceed this limit, MD060 automatically
+    /// uses compact formatting instead (minimal padding) to prevent excessively
+    /// long lines. This matches the behavior of Prettier's table formatting.
+    ///
+    /// # Examples
+    ///
+    /// ```toml
+    /// [MD013]
+    /// line-length = 100
+    ///
+    /// [MD060]
+    /// style = "aligned"
+    /// max-width = 0  # Uses MD013's line-length (100)
+    /// ```
+    ///
+    /// ```toml
+    /// [MD060]
+    /// style = "aligned"
+    /// max-width = 120  # Explicit threshold, independent of MD013
+    /// ```
+    #[serde(default = "default_max_width", rename = "max-width")]
+    pub max_width: LineLength,
+
+    /// Controls how cell text is aligned within the padded column width.
+    ///
+    /// - `auto` (default): Use alignment indicators from delimiter row (`:---`, `:---:`, `---:`)
+    /// - `left`: Force all columns to left-align text
+    /// - `center`: Force all columns to center text
+    /// - `right`: Force all columns to right-align text
+    ///
+    /// Only applies when `style = "aligned"` or `style = "aligned-no-space"`.
+    ///
+    /// # Examples
+    ///
+    /// ```toml
+    /// [MD060]
+    /// style = "aligned"
+    /// column-align = "center"  # Center all cell text
+    /// ```
+    #[serde(default, rename = "column-align")]
+    pub column_align: ColumnAlign,
+
+    /// Controls alignment specifically for the header row.
+    ///
+    /// When set, overrides `column-align` for the header row only.
+    /// If not set, falls back to `column-align`.
+    ///
+    /// # Examples
+    ///
+    /// ```toml
+    /// [MD060]
+    /// style = "aligned"
+    /// column-align-header = "center"  # Center header text
+    /// column-align-body = "left"      # Left-align body text
+    /// ```
+    #[serde(default, rename = "column-align-header")]
+    pub column_align_header: Option<ColumnAlign>,
+
+    /// Controls alignment specifically for body rows (non-header, non-delimiter).
+    ///
+    /// When set, overrides `column-align` for body rows only.
+    /// If not set, falls back to `column-align`.
+    ///
+    /// # Examples
+    ///
+    /// ```toml
+    /// [MD060]
+    /// style = "aligned"
+    /// column-align-header = "center"  # Center header text
+    /// column-align-body = "left"      # Left-align body text
+    /// ```
+    #[serde(default, rename = "column-align-body")]
+    pub column_align_body: Option<ColumnAlign>,
+
+    /// Controls whether the last column in body rows is loosely formatted.
+    ///
+    /// - `false` (default): All columns padded to equal width across all rows.
+    /// - `true`: The last column width is capped at the header text width.
+    ///   Body cells shorter than the header are padded to the header width.
+    ///   Body cells longer than the header extend beyond without padding.
+    ///
+    /// Only applies when `style = "aligned"` or `style = "aligned-no-space"`.
+    ///
+    /// # Examples
+    ///
+    /// ```toml
+    /// [MD060]
+    /// style = "aligned"
+    /// loose-last-column = true
+    /// ```
+    #[serde(default, rename = "loose-last-column")]
+    pub loose_last_column: bool,
+
+    /// Pads the delimiter row's dashes to match header column widths under
+    /// `compact` and `tight` styles.
+    ///
+    /// - `false` (default): delimiter cells use the minimum dash count.
+    /// - `true`: delimiter pipe positions align with header pipe positions;
+    ///   body rows remain compact/tight and are not padded.
+    ///
+    /// No effect under `aligned` / `aligned-no-space` (those styles already
+    /// align the delimiter row by construction), except when a table exceeds
+    /// `max-width` and auto-compacts: the effective output style is then
+    /// `compact`, so the delimiter row is aligned to the header column widths.
+    ///
+    /// Mirrors markdownlint MD060's `aligned_delimiter` option; the snake_case
+    /// alias is accepted for cross-tool compatibility.
+    #[serde(default, rename = "aligned-delimiter", alias = "aligned_delimiter")]
+    pub aligned_delimiter: bool,
+}
+
+impl Default for MD060Config {
+    fn default() -> Self {
+        Self {
+            enabled: default_enabled(),
+            style: default_style(),
+            max_width: default_max_width(),
+            column_align: ColumnAlign::Auto,
+            column_align_header: None,
+            column_align_body: None,
+            loose_last_column: false,
+            aligned_delimiter: false,
+        }
+    }
+}
+
+fn default_enabled() -> bool {
+    false
+}
+
+fn default_style() -> String {
+    "any".to_string()
+}
+
+fn default_max_width() -> LineLength {
+    LineLength::from_const(0) // 0 = inherit from MD013
+}
+
+fn serialize_style<S>(style: &str, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(style)
+}
+
+fn deserialize_style<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    let normalized = s.trim().to_ascii_lowercase().replace('_', "-");
+
+    let valid_styles = ["aligned", "aligned-no-space", "compact", "tight", "any"];
+
+    if valid_styles.contains(&normalized.as_str()) {
+        Ok(normalized)
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "Invalid table format style: {s}. Valid options: aligned, aligned-no-space, compact, tight, any"
+        )))
+    }
+}
+
+impl RuleConfig for MD060Config {
+    const RULE_NAME: &'static str = "MD060";
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_style_accepts_hyphen_and_underscore_variants() {
+        let kebab_case: MD060Config = toml::from_str("style = \"aligned-no-space\"").unwrap();
+        assert_eq!(kebab_case.style, "aligned-no-space");
+
+        let snake_case: MD060Config = toml::from_str("style = \"aligned_no_space\"").unwrap();
+        assert_eq!(snake_case.style, "aligned-no-space");
+    }
+
+    #[test]
+    fn test_style_normalizes_case_for_compatibility() {
+        let uppercase: MD060Config = toml::from_str("style = \"ALIGNED_NO_SPACE\"").unwrap();
+        assert_eq!(uppercase.style, "aligned-no-space");
+    }
+
+    #[test]
+    fn test_aligned_delimiter_default_is_false() {
+        let cfg: MD060Config = toml::from_str("").unwrap();
+        assert!(!cfg.aligned_delimiter, "aligned-delimiter defaults to false");
+    }
+
+    #[test]
+    fn test_aligned_delimiter_kebab_case_key() {
+        let cfg: MD060Config = toml::from_str("aligned-delimiter = true").unwrap();
+        assert!(cfg.aligned_delimiter, "kebab-case aligned-delimiter is accepted");
+    }
+
+    #[test]
+    fn test_aligned_delimiter_snake_case_alias_for_markdownlint_parity() {
+        // markdownlint uses `aligned_delimiter` (snake_case). rumdl accepts both for compatibility.
+        let cfg: MD060Config = toml::from_str("aligned_delimiter = true").unwrap();
+        assert!(cfg.aligned_delimiter, "snake_case aligned_delimiter alias is accepted");
+    }
+}

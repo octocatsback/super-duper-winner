@@ -1,0 +1,149 @@
+name: Documentation
+
+on:
+  push:
+    branches: [main]
+    # Every input the build and its checks read: the sources, the
+    # generator config, the checker scripts and the Makefile targets that
+    # invoke them. A gap here does not fail the job, it skips it, so a
+    # broken checker merges green.
+    paths:
+      - 'docs/**'
+      - 'assets/benchmark.svg'
+      - 'web/playground/**'
+      - 'functions/**'
+      - 'overrides/**'
+      - 'zensical.toml'
+      - 'scripts/docs_smoke_test.py'
+      - 'scripts/docs_descriptions_test.py'
+      - 'scripts/benchmark_docs_test.py'
+      - 'scripts/generate_benchmark_chart.py'
+      - 'scripts/docs_discoverability_test.py'
+      - 'scripts/complete_docs_sitemap.py'
+      - 'scripts/complete_docs_sitemap_test.py'
+      - 'scripts/sanitize_docs_site.py'
+      - 'scripts/sanitize_docs_site_test.py'
+      - 'scripts/docs_analytics_test.mjs'
+      - 'wrangler.toml'
+      - 'Makefile'
+      - '.github/workflows/docs.yml'
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'assets/benchmark.svg'
+      - 'web/playground/**'
+      - 'functions/**'
+      - 'overrides/**'
+      - 'zensical.toml'
+      - 'scripts/docs_smoke_test.py'
+      - 'scripts/docs_descriptions_test.py'
+      - 'scripts/benchmark_docs_test.py'
+      - 'scripts/generate_benchmark_chart.py'
+      - 'scripts/docs_discoverability_test.py'
+      - 'scripts/complete_docs_sitemap.py'
+      - 'scripts/complete_docs_sitemap_test.py'
+      - 'scripts/sanitize_docs_site.py'
+      - 'scripts/sanitize_docs_site_test.py'
+      - 'scripts/docs_analytics_test.mjs'
+      - 'wrangler.toml'
+      - 'Makefile'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/playground/package-lock.json
+
+      - name: Install Playground dependencies
+        run: npm ci
+        working-directory: web/playground
+
+      - name: Verify generated Playground assets
+        run: npm run check-generated
+        working-directory: web/playground
+
+      - name: Install Zensical
+        run: pip install zensical
+
+      - name: Test documentation publication boundary
+        run: make docs-sanitize-test
+
+      - name: Test documentation sitemap completion
+        run: make docs-sitemap-test
+
+      - name: Verify benchmark publication consistency
+        run: make docs-benchmark-test
+
+      - name: Test privacy-preserving analytics endpoint
+        run: make docs-analytics
+
+      - name: Build documentation
+        run: zensical build --clean
+
+      - name: Enforce public documentation boundary
+        run: make docs-sanitize
+
+      - name: Complete public documentation sitemap
+        run: make docs-sitemap
+
+      - name: Stage Playground WASM
+        run: npm run stage-wasm
+        working-directory: web/playground
+
+      - name: Smoke-test built site
+        run: make docs-smoke
+
+      - name: Check per-page descriptions
+        run: make docs-descriptions
+
+      - name: Check documentation discoverability
+        run: make docs-discoverability
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: docs-site
+          path: |
+            site/
+            functions/
+            wrangler.toml
+
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      deployments: write
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: docs-site
+          path: .
+
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy --branch=main

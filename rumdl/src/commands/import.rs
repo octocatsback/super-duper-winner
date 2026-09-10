@@ -1,0 +1,422 @@
+//! Handler for the `import` command.
+
+use colored::*;
+use std::fs;
+use std::path::Path;
+
+use clap::ValueEnum;
+
+use rumdl_lib::exit_codes::exit;
+
+#[derive(Clone, Default, ValueEnum)]
+pub enum Format {
+    #[default]
+    Toml,
+    Json,
+}
+
+/// Handle the import command: convert markdownlint config to rumdl format.
+pub fn handle_import(file: String, output: Option<String>, format: Format, dry_run: bool) {
+    use rumdl_lib::markdownlint_config;
+
+    // Load the markdownlint config file
+    let ml_config = match markdownlint_config::load_markdownlint_config(&file) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("{}: {}", "Import error".red().bold(), e);
+            exit::tool_error();
+        }
+    };
+
+    // Convert to rumdl config format
+    let fragment = ml_config.map_to_sourced_rumdl_config_fragment(Some(&file));
+
+    // Determine if we're outputting to pyproject.toml
+    let is_pyproject = output
+        .as_ref()
+        .is_some_and(|p| p.ends_with("pyproject.toml") || p == "pyproject.toml");
+
+    // Generate the output
+    let output_content = match format {
+        Format::Toml => generate_toml_output(&fragment, is_pyproject),
+        Format::Json => generate_json_output(&fragment),
+    };
+
+    if dry_run {
+        // Content already ends with a single newline; use print! to avoid adding another
+        print!("{output_content}");
+    } else {
+        // Write to output file
+        let output_path = output.as_deref().unwrap_or(match format {
+            Format::Json => "rumdl-config.json",
+            Format::Toml => ".rumdl.toml",
+        });
+
+        if Path::new(output_path).exists() {
+            eprintln!("{}: Output file '{}' already exists", "Error".red().bold(), output_path);
+            exit::tool_error();
+        }
+
+        match fs::write(output_path, output_content) {
+            Ok(()) => {
+                println!("Converted markdownlint config from '{file}' to '{output_path}'");
+                println!("You can now use: rumdl check --config {output_path} .");
+            }
+            Err(e) => {
+                eprintln!("{}: Failed to write to '{}': {}", "Error".red().bold(), output_path, e);
+                exit::tool_error();
+            }
+        }
+    }
+}
+
+pub(crate) fn generate_toml_output(fragment: &rumdl_lib::config::SourcedConfigFragment, is_pyproject: bool) -> String {
+    let mut output = String::new();
+
+    // For pyproject.toml, wrap everything in [tool.rumdl]
+    let section_prefix = if is_pyproject { "tool.rumdl." } else { "" };
+
+    // Add global settings if any
+    if !fragment.global.enable.value.is_empty()
+        || !fragment.global.disable.value.is_empty()
+        || !fragment.global.exclude.value.is_empty()
+        || !fragment.global.include.value.is_empty()
+        || fragment.global.line_length.value.get() != 80
+    {
+        output.push_str(&format!("[{section_prefix}global]\n"));
+        if !fragment.global.enable.value.is_empty() {
+            output.push_str(&format!("enable = {:?}\n", fragment.global.enable.value));
+        }
+        if !fragment.global.disable.value.is_empty() {
+            output.push_str(&format!("disable = {:?}\n", fragment.global.disable.value));
+        }
+        if !fragment.global.exclude.value.is_empty() {
+            output.push_str(&format!("exclude = {:?}\n", fragment.global.exclude.value));
+        }
+        if !fragment.global.include.value.is_empty() {
+            output.push_str(&format!("include = {:?}\n", fragment.global.include.value));
+        }
+        if fragment.global.line_length.value.get() != 80 {
+            output.push_str(&format!("line_length = {}\n", fragment.global.line_length.value.get()));
+        }
+        output.push('\n');
+    }
+
+    // Add rule-specific settings
+    for (rule_name, rule_config) in &fragment.rules {
+        if !rule_config.values.is_empty() {
+            let display = fragment
+                .rule_display_names
+                .get(rule_name)
+                .map(String::as_str)
+                .unwrap_or(rule_name);
+            output.push_str(&format!("[{section_prefix}{display}]\n"));
+            for (key, sourced_value) in &rule_config.values {
+                // Skip the generic "value" key if we have more specific keys
+                if key == "value" && rule_config.values.len() > 1 {
+                    continue;
+                }
+
+                format_toml_value_line(&mut output, key, &sourced_value.value);
+            }
+            output.push('\n');
+        }
+    }
+
+    // Remove trailing blank line, keep exactly one trailing newline
+    let trimmed = output.trim_end_matches('\n');
+    let mut result = trimmed.to_string();
+    result.push('\n');
+    result
+}
+
+fn format_toml_value_line(output: &mut String, key: &str, value: &toml::Value) {
+    match value {
+        toml::Value::String(s) => output.push_str(&format!("{key} = \"{s}\"\n")),
+        toml::Value::Integer(i) => output.push_str(&format!("{key} = {i}\n")),
+        toml::Value::Float(f) => output.push_str(&format!("{key} = {f}\n")),
+        toml::Value::Boolean(b) => output.push_str(&format!("{key} = {b}\n")),
+        toml::Value::Array(arr) => {
+            // Format arrays properly for TOML
+            let arr_str = arr
+                .iter()
+                .map(|v| match v {
+                    toml::Value::String(s) => format!("\"{s}\""),
+                    _ => format!("{v}"),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            output.push_str(&format!("{key} = [{arr_str}]\n"));
+        }
+        _ => {
+            // Use proper TOML serialization for complex values
+            if let Ok(toml_str) = toml::to_string_pretty(value) {
+                let clean_value = toml_str.trim();
+                if !clean_value.starts_with('[') {
+                    output.push_str(&format!("{key} = {clean_value}"));
+                } else {
+                    output.push_str(&format!("{key} = {value:?}\n"));
+                }
+            } else {
+                output.push_str(&format!("{key} = {value:?}\n"));
+            }
+        }
+    }
+}
+
+pub(crate) fn generate_json_output(fragment: &rumdl_lib::config::SourcedConfigFragment) -> String {
+    let mut json_config = serde_json::Map::new();
+
+    // Add global settings
+    if !fragment.global.enable.value.is_empty()
+        || !fragment.global.disable.value.is_empty()
+        || !fragment.global.exclude.value.is_empty()
+        || !fragment.global.include.value.is_empty()
+        || fragment.global.line_length.value.get() != 80
+    {
+        let mut global = serde_json::Map::new();
+        if !fragment.global.enable.value.is_empty() {
+            global.insert(
+                "enable".to_string(),
+                serde_json::Value::Array(
+                    fragment
+                        .global
+                        .enable
+                        .value
+                        .iter()
+                        .map(|s| serde_json::Value::String(s.clone()))
+                        .collect(),
+                ),
+            );
+        }
+        if !fragment.global.disable.value.is_empty() {
+            global.insert(
+                "disable".to_string(),
+                serde_json::Value::Array(
+                    fragment
+                        .global
+                        .disable
+                        .value
+                        .iter()
+                        .map(|s| serde_json::Value::String(s.clone()))
+                        .collect(),
+                ),
+            );
+        }
+        if !fragment.global.exclude.value.is_empty() {
+            global.insert(
+                "exclude".to_string(),
+                serde_json::Value::Array(
+                    fragment
+                        .global
+                        .exclude
+                        .value
+                        .iter()
+                        .map(|s| serde_json::Value::String(s.clone()))
+                        .collect(),
+                ),
+            );
+        }
+        if !fragment.global.include.value.is_empty() {
+            global.insert(
+                "include".to_string(),
+                serde_json::Value::Array(
+                    fragment
+                        .global
+                        .include
+                        .value
+                        .iter()
+                        .map(|s| serde_json::Value::String(s.clone()))
+                        .collect(),
+                ),
+            );
+        }
+        if fragment.global.line_length.value.get() != 80 {
+            global.insert(
+                "line_length".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(fragment.global.line_length.value.get())),
+            );
+        }
+        json_config.insert("global".to_string(), serde_json::Value::Object(global));
+    }
+
+    // Add rule-specific settings
+    for (rule_name, rule_config) in &fragment.rules {
+        if !rule_config.values.is_empty() {
+            let mut rule_obj = serde_json::Map::new();
+            for (key, sourced_value) in &rule_config.values {
+                if let Ok(json_value) = serde_json::to_value(&sourced_value.value) {
+                    rule_obj.insert(key.clone(), json_value);
+                }
+            }
+            let display = fragment
+                .rule_display_names
+                .get(rule_name)
+                .map(String::as_str)
+                .unwrap_or(rule_name);
+            json_config.insert(display.to_string(), serde_json::Value::Object(rule_obj));
+        }
+    }
+
+    let mut json = serde_json::to_string_pretty(&json_config).unwrap_or_else(|e| {
+        eprintln!("{}: Failed to serialize to JSON: {}", "Error".red().bold(), e);
+        exit::tool_error();
+    });
+    json.push('\n');
+    json
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rumdl_lib::markdownlint_config::MarkdownlintConfig;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_generate_toml_output_with_display_names() {
+        let mut config_map = HashMap::new();
+        config_map.insert(
+            "line-length".to_string(),
+            serde_yaml::Value::Mapping({
+                let mut map = serde_yaml::Mapping::new();
+                map.insert(
+                    serde_yaml::Value::String("line_length".to_string()),
+                    serde_yaml::Value::Number(serde_yaml::Number::from(120)),
+                );
+                map
+            }),
+        );
+
+        let mdl_config = MarkdownlintConfig(config_map);
+        let fragment = mdl_config.map_to_sourced_rumdl_config_fragment(Some("test.json"));
+
+        let toml_output = generate_toml_output(&fragment, false);
+        assert!(
+            toml_output.contains("[line-length]"),
+            "TOML output should use alias 'line-length', got:\n{toml_output}"
+        );
+        assert!(
+            !toml_output.contains("[MD013]"),
+            "TOML output should NOT contain canonical ID 'MD013', got:\n{toml_output}"
+        );
+    }
+
+    #[test]
+    fn test_generate_toml_output_with_canonical_ids() {
+        let mut config_map = HashMap::new();
+        config_map.insert(
+            "MD013".to_string(),
+            serde_yaml::Value::Mapping({
+                let mut map = serde_yaml::Mapping::new();
+                map.insert(
+                    serde_yaml::Value::String("line_length".to_string()),
+                    serde_yaml::Value::Number(serde_yaml::Number::from(120)),
+                );
+                map
+            }),
+        );
+
+        let mdl_config = MarkdownlintConfig(config_map);
+        let fragment = mdl_config.map_to_sourced_rumdl_config_fragment(Some("test.json"));
+
+        let toml_output = generate_toml_output(&fragment, false);
+        assert!(
+            toml_output.contains("[MD013]"),
+            "TOML output should use canonical ID 'MD013', got:\n{toml_output}"
+        );
+    }
+
+    #[test]
+    fn test_generate_toml_output_pyproject_with_display_names() {
+        let mut config_map = HashMap::new();
+        config_map.insert(
+            "line-length".to_string(),
+            serde_yaml::Value::Mapping({
+                let mut map = serde_yaml::Mapping::new();
+                map.insert(
+                    serde_yaml::Value::String("line_length".to_string()),
+                    serde_yaml::Value::Number(serde_yaml::Number::from(120)),
+                );
+                map
+            }),
+        );
+
+        let mdl_config = MarkdownlintConfig(config_map);
+        let fragment = mdl_config.map_to_sourced_rumdl_config_fragment(Some("test.json"));
+
+        let toml_output = generate_toml_output(&fragment, true);
+        assert!(
+            toml_output.contains("[tool.rumdl.line-length]"),
+            "pyproject TOML output should use alias with prefix, got:\n{toml_output}"
+        );
+    }
+
+    #[test]
+    fn test_generate_json_output_with_display_names() {
+        let mut config_map = HashMap::new();
+        config_map.insert(
+            "line-length".to_string(),
+            serde_yaml::Value::Mapping({
+                let mut map = serde_yaml::Mapping::new();
+                map.insert(
+                    serde_yaml::Value::String("line_length".to_string()),
+                    serde_yaml::Value::Number(serde_yaml::Number::from(120)),
+                );
+                map
+            }),
+        );
+
+        let mdl_config = MarkdownlintConfig(config_map);
+        let fragment = mdl_config.map_to_sourced_rumdl_config_fragment(Some("test.json"));
+
+        let json_output = generate_json_output(&fragment);
+        assert!(
+            json_output.contains("\"line-length\""),
+            "JSON output should use alias 'line-length', got:\n{json_output}"
+        );
+        assert!(
+            !json_output.contains("\"MD013\""),
+            "JSON output should NOT contain canonical ID 'MD013', got:\n{json_output}"
+        );
+    }
+
+    #[test]
+    fn test_generate_toml_output_disable_list_with_aliases() {
+        let mut config_map = HashMap::new();
+        config_map.insert("line-length".to_string(), serde_yaml::Value::Bool(false));
+        config_map.insert("no-bare-urls".to_string(), serde_yaml::Value::Bool(false));
+
+        let mdl_config = MarkdownlintConfig(config_map);
+        let fragment = mdl_config.map_to_sourced_rumdl_config_fragment(Some("test.json"));
+
+        let toml_output = generate_toml_output(&fragment, false);
+        assert!(
+            toml_output.contains("line-length") && toml_output.contains("no-bare-urls"),
+            "TOML disable list should use aliases, got:\n{toml_output}"
+        );
+        assert!(
+            !toml_output.contains("MD013") && !toml_output.contains("MD034"),
+            "TOML disable list should NOT contain canonical IDs, got:\n{toml_output}"
+        );
+    }
+
+    #[test]
+    fn test_generate_json_output_disable_list_with_aliases() {
+        let mut config_map = HashMap::new();
+        config_map.insert("line-length".to_string(), serde_yaml::Value::Bool(false));
+        config_map.insert("no-bare-urls".to_string(), serde_yaml::Value::Bool(false));
+
+        let mdl_config = MarkdownlintConfig(config_map);
+        let fragment = mdl_config.map_to_sourced_rumdl_config_fragment(Some("test.json"));
+
+        let json_output = generate_json_output(&fragment);
+        assert!(
+            json_output.contains("line-length") && json_output.contains("no-bare-urls"),
+            "JSON disable list should use aliases, got:\n{json_output}"
+        );
+        assert!(
+            !json_output.contains("MD013") && !json_output.contains("MD034"),
+            "JSON disable list should NOT contain canonical IDs, got:\n{json_output}"
+        );
+    }
+}

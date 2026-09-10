@@ -1,0 +1,164 @@
+/// Rule MD019: No multiple spaces after ATX heading marker
+///
+/// See [docs/md019.md](../../docs/md019.md) for full documentation, configuration, and examples.
+use crate::rule::{Fix, LintError, LintResult, LintWarning, Rule, RuleCategory, Severity};
+use crate::utils::range_utils::calculate_single_line_range;
+
+#[derive(Clone)]
+pub struct MD019NoMultipleSpaceAtx;
+
+impl Default for MD019NoMultipleSpaceAtx {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MD019NoMultipleSpaceAtx {
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Count spaces after the ATX marker
+    fn count_spaces_after_marker(&self, line: &str, marker_len: usize) -> usize {
+        let after_marker = &line[marker_len..];
+        after_marker.chars().take_while(|c| *c == ' ' || *c == '\t').count()
+    }
+}
+
+impl Rule for MD019NoMultipleSpaceAtx {
+    fn name(&self) -> &'static str {
+        "MD019"
+    }
+
+    fn description(&self) -> &'static str {
+        "Multiple spaces after hash in heading"
+    }
+
+    fn check(&self, ctx: &crate::lint_context::LintContext) -> LintResult {
+        let mut warnings = Vec::new();
+
+        // Check all ATX headings from cached info
+        for (line_num, line_info) in ctx.lines.iter().enumerate() {
+            if let Some(heading) = &line_info.heading {
+                // Only check ATX headings
+                if matches!(heading.style, crate::lint_context::HeadingStyle::ATX) {
+                    let line = line_info.content(ctx.content);
+                    let trimmed = line.trim_start();
+                    let marker_pos = line_info.indent + heading.marker.len();
+
+                    // Count spaces after marker
+                    if trimmed.len() > heading.marker.len() {
+                        let space_count = self.count_spaces_after_marker(trimmed, heading.marker.len());
+
+                        if space_count > 1 {
+                            // Calculate range for the extra spaces
+                            let (start_line, start_col, end_line, end_col) = calculate_single_line_range(
+                                line_num + 1,   // Convert to 1-indexed
+                                marker_pos + 1, // Start after marker (1-indexed)
+                                space_count,    // Length of all spaces (not just extra)
+                            );
+
+                            // Calculate byte range for just the extra spaces
+                            let line_start_byte = ctx.line_start_byte(line_num + 1).unwrap_or(0);
+
+                            // We need to work with the original line, not trimmed
+                            let original_line = line_info.content(ctx.content);
+                            let marker_byte_pos = line_start_byte + line_info.indent + heading.marker.len();
+
+                            // Get the actual byte length of the spaces/tabs after the marker
+                            let after_marker_start = line_info.indent + heading.marker.len();
+                            let after_marker = &original_line[after_marker_start..];
+                            let space_bytes = after_marker
+                                .as_bytes()
+                                .iter()
+                                .take_while(|&&b| b == b' ' || b == b'\t')
+                                .count();
+
+                            let extra_spaces_start = marker_byte_pos;
+                            let extra_spaces_end = marker_byte_pos + space_bytes;
+
+                            warnings.push(LintWarning {
+                                rule_name: Some(self.name().to_string()),
+                                message: format!(
+                                    "Multiple spaces ({}) after {} in heading",
+                                    space_count,
+                                    "#".repeat(heading.level as usize)
+                                ),
+                                line: start_line,
+                                column: start_col,
+                                end_line,
+                                end_column: end_col,
+                                severity: Severity::Warning,
+                                fix: Some(Fix::new(extra_spaces_start..extra_spaces_end, " ".to_string())),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(warnings)
+    }
+
+    fn fix(&self, ctx: &crate::lint_context::LintContext) -> Result<String, LintError> {
+        if self.should_skip(ctx) {
+            return Ok(ctx.content.to_string());
+        }
+        let warnings = self.check(ctx)?;
+        if warnings.is_empty() {
+            return Ok(ctx.content.to_string());
+        }
+        let warnings =
+            crate::utils::fix_utils::filter_warnings_by_inline_config(warnings, ctx.inline_config(), self.name());
+        crate::utils::fix_utils::apply_warning_fixes(ctx.content, &warnings)
+            .map_err(crate::rule::LintError::InvalidInput)
+    }
+
+    /// Get the category of this rule for selective processing
+    fn category(&self) -> RuleCategory {
+        RuleCategory::Heading
+    }
+
+    /// Check if this rule should be skipped
+    fn should_skip(&self, ctx: &crate::lint_context::LintContext) -> bool {
+        ctx.content.is_empty() || !ctx.likely_has_headings()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn from_config(_config: &crate::config::Config) -> Box<dyn Rule>
+    where
+        Self: Sized,
+    {
+        Box::new(MD019NoMultipleSpaceAtx::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_basic_functionality() {
+        let rule = MD019NoMultipleSpaceAtx::new();
+
+        // Test with heading that has multiple spaces
+        let content = "#  Multiple Spaces\n\nRegular content\n\n##   More Spaces";
+        let ctx = crate::lint_context::LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 2); // Should flag both headings
+        assert_eq!(result[0].line, 1);
+        assert_eq!(result[1].line, 5);
+
+        // Test with proper headings
+        let content = "# Single Space\n\n## Also correct";
+        let ctx = crate::lint_context::LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Properly formatted headings should not generate warnings"
+        );
+    }
+}

@@ -1,0 +1,885 @@
+//!
+//! Cached Regex Patterns and Fast Content Checks for Markdown Linting
+//!
+//! This module provides a centralized collection of pre-compiled, cached regex patterns
+//! for all major Markdown constructs (headings, lists, code blocks, links, images, etc.).
+//! It also includes fast-path utility functions for quickly checking if content
+//! potentially contains certain Markdown elements, allowing rules to skip expensive
+//! processing when unnecessary.
+//!
+//! # Performance
+//!
+//! All regexes are compiled once at startup using `lazy_static`, avoiding repeated
+//! compilation and improving performance across the linter. Use these shared patterns
+//! in rules instead of compiling new regexes.
+//!
+//! # Usage
+//!
+//! - Use the provided statics for common Markdown patterns.
+//! - Use the `regex_lazy!` macro for ad-hoc regexes that are not predefined.
+//! - Use the utility functions for fast content checks before running regexes.
+
+use fancy_regex::Regex as FancyRegex;
+use regex::Regex;
+use std::collections::HashMap;
+use std::sync::LazyLock;
+use std::sync::{Arc, Mutex};
+
+/// Global regex cache for dynamic patterns
+#[derive(Debug)]
+pub struct RegexCache {
+    cache: HashMap<String, Arc<Regex>>,
+    usage_stats: HashMap<String, u64>,
+}
+
+impl Default for RegexCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RegexCache {
+    pub fn new() -> Self {
+        Self {
+            cache: HashMap::new(),
+            usage_stats: HashMap::new(),
+        }
+    }
+
+    /// Get or compile a regex pattern
+    pub fn get_regex(&mut self, pattern: &str) -> Result<Arc<Regex>, regex::Error> {
+        if let Some(regex) = self.cache.get(pattern) {
+            *self.usage_stats.entry(pattern.to_string()).or_insert(0) += 1;
+            return Ok(regex.clone());
+        }
+
+        let regex = Arc::new(Regex::new(pattern)?);
+        self.cache.insert(pattern.to_string(), regex.clone());
+        *self.usage_stats.entry(pattern.to_string()).or_insert(0) += 1;
+        Ok(regex)
+    }
+
+    /// Get cache statistics
+    pub fn get_stats(&self) -> HashMap<String, u64> {
+        self.usage_stats.clone()
+    }
+
+    /// Clear cache (useful for testing)
+    pub fn clear(&mut self) {
+        self.cache.clear();
+        self.usage_stats.clear();
+    }
+}
+
+/// Global regex cache instance
+static GLOBAL_REGEX_CACHE: LazyLock<Arc<Mutex<RegexCache>>> = LazyLock::new(|| Arc::new(Mutex::new(RegexCache::new())));
+
+/// Get a regex from the global cache
+///
+/// If the mutex is poisoned (another thread panicked while holding the lock),
+/// this function recovers by clearing the cache and continuing. This ensures
+/// the library never panics due to mutex poisoning.
+pub fn get_cached_regex(pattern: &str) -> Result<Arc<Regex>, regex::Error> {
+    let mut cache = GLOBAL_REGEX_CACHE.lock().unwrap_or_else(|poisoned| {
+        // Recover from poisoned mutex by clearing the cache
+        let mut guard = poisoned.into_inner();
+        guard.clear();
+        guard
+    });
+    cache.get_regex(pattern)
+}
+
+/// Get cache usage statistics
+///
+/// If the mutex is poisoned, returns an empty HashMap rather than panicking.
+pub fn get_cache_stats() -> HashMap<String, u64> {
+    match GLOBAL_REGEX_CACHE.lock() {
+        Ok(cache) => cache.get_stats(),
+        Err(_) => HashMap::new(),
+    }
+}
+
+/// Macro for defining a lazily-initialized, cached regex pattern.
+///
+/// Use this for ad-hoc regexes that are not already defined in this module.
+///
+/// # Panics
+///
+/// This macro will panic at initialization if the regex pattern is invalid.
+/// This is intentional for compile-time constant patterns - we want to catch
+/// invalid patterns during development, not at runtime.
+///
+/// # Example
+///
+/// ```
+/// use std::sync::LazyLock;
+/// use rumdl_lib::regex_lazy;
+/// let my_re = regex_lazy!(r"^foo.*bar$");
+/// assert!(my_re.is_match("foobar"));
+/// ```
+#[macro_export]
+macro_rules! regex_lazy {
+    ($pattern:expr) => {{
+        static REGEX: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new($pattern).unwrap());
+        &*REGEX
+    }};
+}
+
+/// Macro for getting regex from global cache.
+///
+/// # Panics
+///
+/// Panics if the regex pattern is invalid. This is acceptable for static patterns
+/// where we want to fail fast during development.
+#[macro_export]
+macro_rules! regex_cached {
+    ($pattern:expr) => {{ $crate::utils::regex_cache::get_cached_regex($pattern).expect("Failed to compile regex") }};
+}
+
+// Also make the macro available directly from this module
+pub use crate::regex_lazy;
+
+// =============================================================================
+// URL REGEX PATTERNS - Centralized URL Detection
+// =============================================================================
+//
+// ## Pattern Hierarchy (use the most specific pattern for your needs):
+//
+// | Pattern              | Use Case                                    | Parens | Trailing Punct |
+// |----------------------|---------------------------------------------|--------|----------------|
+// | URL_STANDARD_REGEX   | MD034 bare URL detection with auto-fix      | Yes    | Captured*      |
+// | URL_WWW_REGEX        | www.domain URLs without protocol            | Yes    | Captured*      |
+// | URL_IPV6_REGEX       | IPv6 URLs like https://[::1]/path           | Yes    | Captured*      |
+// | URL_QUICK_CHECK_REGEX| Fast early-exit check (contains URL?)       | N/A    | N/A            |
+// | URL_SIMPLE_REGEX     | Content detection, line length exemption    | No     | Excluded       |
+//
+// *Trailing punctuation is captured by the regex; use trim_trailing_punctuation() to clean.
+//
+// ## Design Principles:
+// 1. Parentheses in paths are allowed for Wikipedia-style URLs (Issue #240)
+// 2. Host portion excludes / so path is captured separately
+// 3. Unbalanced trailing parens are handled by trim_trailing_punctuation()
+// 4. All patterns exclude angle brackets <> to avoid matching autolinks
+//
+// ## URL Structure: protocol://host[:port][/path][?query][#fragment]
+
+/// Pattern for standard HTTP(S)/FTP(S) URLs with full path support.
+///
+/// Use this for bare URL detection where you need the complete URL including
+/// Wikipedia-style parentheses in paths. Trailing punctuation like `,;.!?` may
+/// be captured and should be trimmed by the caller.
+///
+/// # Examples
+/// - `https://example.com/path_(with_parens)?query#fragment`
+/// - `https://en.wikipedia.org/wiki/Rust_(programming_language)`
+pub const URL_STANDARD_STR: &str = concat!(
+    r#"(?:https?|ftps?|ftp)://"#, // Protocol
+    r#"(?:"#,
+    r#"\[[0-9a-fA-F:%.\-a-zA-Z]+\]"#, // IPv6 host OR
+    r#"|"#,
+    r#"[^\s<>\[\]()\\'\"`/]+"#, // Standard host (no parens, no /)
+    r#")"#,
+    r#"(?::\d+)?"#,                 // Optional port
+    r#"(?:/[^\s<>\[\]\\'\"`]*)?"#,  // Optional path (allows parens)
+    r#"(?:\?[^\s<>\[\]\\'\"`]*)?"#, // Optional query (allows parens)
+    r#"(?:#[^\s<>\[\]\\'\"`]*)?"#,  // Optional fragment (allows parens)
+);
+
+/// Pattern for www URLs without protocol.
+///
+/// Matches URLs starting with `www.` that lack a protocol prefix.
+/// These should be converted to proper URLs or flagged as bare URLs.
+/// Supports port, path, query string, and fragment like URL_STANDARD_STR.
+///
+/// # Examples
+/// - `www.example.com`
+/// - `www.example.com:8080`
+/// - `www.example.com/path`
+/// - `www.example.com?query=value`
+/// - `www.example.com#section`
+pub const URL_WWW_STR: &str = concat!(
+    r#"www\.(?:[a-zA-Z0-9][-a-zA-Z0-9]*\.)+[a-zA-Z]{2,}"#, // www.domain.tld
+    r#"(?::\d+)?"#,                                        // Optional port
+    r#"(?:/[^\s<>\[\]\\'\"`]*)?"#,                         // Optional path (allows parens)
+    r#"(?:\?[^\s<>\[\]\\'\"`]*)?"#,                        // Optional query (allows parens)
+    r#"(?:#[^\s<>\[\]\\'\"`]*)?"#,                         // Optional fragment (allows parens)
+);
+
+/// Pattern for IPv6 URLs specifically.
+///
+/// Matches URLs with IPv6 addresses in brackets, including zone identifiers.
+/// Examples: `https://[::1]/path`, `https://[fe80::1%eth0]:8080/`
+pub const URL_IPV6_STR: &str = concat!(
+    r#"(?:https?|ftps?|ftp)://"#,
+    r#"\[[0-9a-fA-F:%.\-a-zA-Z]+\]"#, // IPv6 host in brackets
+    r#"(?::\d+)?"#,                   // Optional port
+    r#"(?:/[^\s<>\[\]\\'\"`]*)?"#,    // Optional path
+    r#"(?:\?[^\s<>\[\]\\'\"`]*)?"#,   // Optional query
+    r#"(?:#[^\s<>\[\]\\'\"`]*)?"#,    // Optional fragment
+);
+
+/// Pattern for XMPP URIs per GFM extended autolinks specification.
+///
+/// XMPP URIs use the format `xmpp:user@domain/resource` (without `://`).
+/// Reference: <https://github.github.com/gfm/#autolinks-extension->
+///
+/// # Examples
+/// - `xmpp:foo@bar.baz`
+/// - `xmpp:foo@bar.baz/txt`
+pub const XMPP_URI_STR: &str = r#"xmpp:[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?:/[^\s<>\[\]\\'\"`]*)?"#;
+
+/// Quick check pattern for early exits.
+///
+/// Use this for fast pre-filtering before running more expensive patterns.
+/// Matches if the text likely contains a URL or email address.
+/// Includes `xmpp:` for GFM extended autolinks.
+pub const URL_QUICK_CHECK_STR: &str = r#"(?:https?|ftps?|ftp|xmpp)://|xmpp:|@|www\."#;
+
+/// Simple URL pattern for content detection.
+///
+/// Less strict pattern that excludes trailing sentence punctuation (.,).
+/// Use for line length exemption checks or content characteristic detection
+/// where you just need to know if a URL exists, not extract it precisely.
+pub const URL_SIMPLE_STR: &str = r#"(?:https?|ftps?|ftp)://[^\s<>]+[^\s<>.,]"#;
+
+// Pre-compiled static patterns for performance
+
+/// Standard URL regex - primary pattern for bare URL detection (MD034).
+/// See [`URL_STANDARD_STR`] for documentation.
+pub static URL_STANDARD_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(URL_STANDARD_STR).unwrap());
+
+/// WWW URL regex - for URLs starting with www. without protocol.
+/// See [`URL_WWW_STR`] for documentation.
+pub static URL_WWW_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(URL_WWW_STR).unwrap());
+
+/// IPv6 URL regex - for URLs with IPv6 addresses.
+/// See [`URL_IPV6_STR`] for documentation.
+pub static URL_IPV6_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(URL_IPV6_STR).unwrap());
+
+/// Quick check regex - fast early-exit test.
+/// See [`URL_QUICK_CHECK_STR`] for documentation.
+pub static URL_QUICK_CHECK_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(URL_QUICK_CHECK_STR).unwrap());
+
+/// Simple URL regex - for content detection and line length exemption.
+/// See [`URL_SIMPLE_STR`] for documentation.
+pub static URL_SIMPLE_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(URL_SIMPLE_STR).unwrap());
+
+/// Alias for `URL_SIMPLE_REGEX`. Used by MD013 for line length exemption.
+pub static URL_PATTERN: LazyLock<Regex> = LazyLock::new(|| URL_SIMPLE_REGEX.clone());
+
+/// XMPP URI regex - for GFM extended autolinks.
+/// See [`XMPP_URI_STR`] for documentation.
+pub static XMPP_URI_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(XMPP_URI_STR).unwrap());
+
+// Heading patterns
+pub static ATX_HEADING_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(\s*)(#{1,6})(\s+|$)").unwrap());
+
+// List patterns
+pub static UNORDERED_LIST_MARKER_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(\s*)([*+-])(\s+)").unwrap());
+pub static ORDERED_LIST_MARKER_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(\s*)(\d+)([.)])(\s+)").unwrap());
+
+// Emphasis patterns
+
+// MD037 specific emphasis patterns - improved to avoid false positives
+// Only match emphasis with spaces that are actually complete emphasis blocks
+// Use word boundaries and negative lookbehind/lookahead to avoid matching across emphasis boundaries
+pub static ASTERISK_EMPHASIS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:^|[^*])\*(\s+[^*]+\s*|\s*[^*]+\s+)\*(?:[^*]|$)").unwrap());
+pub static UNDERSCORE_EMPHASIS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:^|[^_])_(\s+[^_]+\s*|\s*[^_]+\s+)_(?:[^_]|$)").unwrap());
+pub static DOUBLE_UNDERSCORE_EMPHASIS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:^|[^_])__(\s+[^_]+\s*|\s*[^_]+\s+)__(?:[^_]|$)").unwrap());
+// Code block patterns
+pub static FENCED_CODE_BLOCK_START: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(\s*)```(?:[^`\r\n]*)$").unwrap());
+pub static FENCED_CODE_BLOCK_END: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(\s*)```\s*$").unwrap());
+
+// HTML patterns
+pub static HTML_TAG_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<([a-zA-Z][^>]*)>").unwrap());
+pub static HTML_TAG_QUICK_CHECK: LazyLock<Regex> = LazyLock::new(|| Regex::new("(?i)</?[a-zA-Z]").unwrap());
+
+// Image patterns
+pub static IMAGE_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"!\[([^\]]*)\]\(([^)]+)\)").unwrap());
+
+// Blockquote patterns
+pub static BLOCKQUOTE_PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(\s*>+\s*)").unwrap());
+
+/// Check if a line is blank in the context of blockquotes.
+///
+/// A line is considered "blank" if:
+/// - It's empty or contains only whitespace
+/// - It's a blockquote continuation line with no content (e.g., ">", ">>", "> ")
+///
+/// This is essential for rules like MD058 (blanks-around-tables), MD065 (blanks-around-horizontal-rules),
+/// and any other rule that needs to detect blank lines that might be inside blockquotes.
+///
+/// # Examples
+/// ```
+/// use rumdl_lib::utils::regex_cache::is_blank_in_blockquote_context;
+///
+/// assert!(is_blank_in_blockquote_context(""));           // Empty line
+/// assert!(is_blank_in_blockquote_context("   "));        // Whitespace only
+/// assert!(is_blank_in_blockquote_context(">"));          // Blockquote continuation
+/// assert!(is_blank_in_blockquote_context("> "));         // Blockquote with trailing space
+/// assert!(is_blank_in_blockquote_context(">>"));         // Nested blockquote
+/// assert!(is_blank_in_blockquote_context("> > "));       // Spaced nested blockquote
+/// assert!(!is_blank_in_blockquote_context("> text"));    // Blockquote with content
+/// assert!(!is_blank_in_blockquote_context("text"));      // Regular text
+/// ```
+pub fn is_blank_in_blockquote_context(line: &str) -> bool {
+    // Peel one `\s*>+\s*` prefix at a time. A line is blank-in-blockquote iff,
+    // after removing every blockquote prefix, nothing but whitespace remains.
+    // This is iterative rather than recursive so a line of hundreds of thousands
+    // of spaced markers ("> > > ...") cannot overflow the stack: each prefix
+    // match consumes at least one `>`, so `rest` strictly shrinks every pass.
+    let mut rest = line;
+    loop {
+        if rest.trim().is_empty() {
+            return true;
+        }
+        match BLOCKQUOTE_PREFIX_RE.find(rest) {
+            // `>+` guarantees the match consumes at least one byte; the explicit
+            // `end > 0` guard keeps the loop total even if the pattern changes.
+            Some(m) if m.end() > 0 => rest = &rest[m.end()..],
+            _ => return false,
+        }
+    }
+}
+
+// MD013 specific patterns
+pub static IMAGE_REF_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^!\[.*?\]\[.*?\]$").unwrap());
+pub static LINK_REF_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"^\[.*?\]:\s*\S+(\s+["'(].*)?\s*$"#).unwrap());
+pub static ABBREVIATION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|vs|etc|i\.e|e\.g|Inc|Corp|Ltd|Co|St|Ave|Blvd|Rd|Ph\.D|M\.D|B\.A|M\.A|Ph\.D|U\.S|U\.K|U\.N|N\.Y|L\.A|D\.C)\.\s+[A-Z]").unwrap()
+});
+pub static LIST_ITEM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*\d+\.\s+").unwrap());
+
+// Email pattern
+pub static EMAIL_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}").unwrap());
+
+// Third lazy_static block for link and image patterns used by MD052 and text_reflow
+// Reference link patterns (shared by MD052 and text_reflow)
+// Pattern to match reference links: [text][reference] or [text][]
+pub static REF_LINK_REGEX: LazyLock<FancyRegex> =
+    LazyLock::new(|| FancyRegex::new(r"(?<!\\)\[((?:[^\[\]\\]|\\.|\[[^\]]*\])*)\]\[([^\]]*)\]").unwrap());
+
+// Pattern for shortcut reference links: [reference]
+// Must not be preceded by ] or ) (to avoid matching second part of [text][ref])
+// Must not be followed by [ or ( (to avoid matching first part of [text][ref] or [text](url))
+// The capturing group handles nested brackets to support cases like [`Union[T, None]`]
+pub static SHORTCUT_REF_REGEX: LazyLock<FancyRegex> =
+    LazyLock::new(|| FancyRegex::new(r"(?<![\\)\]])\[((?:[^\[\]\\]|\\.|\[[^\]]*\])*)\](?!\s*[\[\(])").unwrap());
+
+// Inline link with fancy regex for better escaping handling (used by text_reflow)
+pub static INLINE_LINK_FANCY_REGEX: LazyLock<FancyRegex> =
+    LazyLock::new(|| FancyRegex::new(r"(?<!\\)\[([^\]]+)\]\(([^)]+)\)").unwrap());
+
+// Inline image (used by MD052 and text_reflow)
+pub static INLINE_IMAGE_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"!\[([^\]]*)\]\(([^)]+)\)").unwrap());
+
+// Linked images (clickable badges) - all 4 variants
+// Must be detected before inline_image and inline_link to treat as atomic units
+//
+// Limitation: Alt text containing brackets like [![[v1.0]](img)](link) is not supported.
+// The [^\]]* pattern cannot match nested brackets. This is rare in practice.
+//
+// Pattern 1: Inline image in inline link - [![alt](img-url)](link-url)
+pub static LINKED_IMAGE_INLINE_INLINE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[!\[([^\]]*)\]\(([^)]+)\)\]\(([^)]+)\)").unwrap());
+
+// Pattern 2: Reference image in inline link - [![alt][img-ref]](link-url)
+pub static LINKED_IMAGE_REF_INLINE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[!\[([^\]]*)\]\[([^\]]*)\]\]\(([^)]+)\)").unwrap());
+
+// Pattern 3: Inline image in reference link - [![alt](img-url)][link-ref]
+pub static LINKED_IMAGE_INLINE_REF: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[!\[([^\]]*)\]\(([^)]+)\)\]\[([^\]]*)\]").unwrap());
+
+// Pattern 4: Reference image in reference link - [![alt][img-ref]][link-ref]
+pub static LINKED_IMAGE_REF_REF: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[!\[([^\]]*)\]\[([^\]]*)\]\]\[([^\]]*)\]").unwrap());
+
+// Reference image: ![alt][ref] or ![alt][]
+pub static REF_IMAGE_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"!\[((?:[^\[\]\\]|\\.|\[[^\]]*\])*)\]\[([^\]]*)\]").unwrap());
+
+// Footnote reference: [^note]
+pub static FOOTNOTE_REF_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[\^([^\]]+)\]").unwrap());
+
+// Wiki-style links: [[wiki]] or [[wiki|display text]]
+pub static WIKI_LINK_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[\[([^\]]+)\]\]").unwrap());
+
+// Math formulas: $inline$ or $$display$$
+pub static INLINE_MATH_REGEX: LazyLock<FancyRegex> =
+    LazyLock::new(|| FancyRegex::new(r"(?<!\$)\$(?!\$)([^\$]+)\$(?!\$)").unwrap());
+pub static DISPLAY_MATH_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\$\$([^\$]+)\$\$").unwrap());
+
+// Emoji shortcodes: :emoji:
+pub static EMOJI_SHORTCODE_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r":([a-zA-Z0-9_+-]+):").unwrap());
+
+// HTML tags (opening, closing, self-closing)
+pub static HTML_TAG_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"</?[a-zA-Z][^>]*>|<[a-zA-Z][^>]*/\s*>").unwrap());
+
+// HTML entities: named (&nbsp;), decimal (&#59;) and hexadecimal (&#x3B; or &#X3B;)
+pub static HTML_ENTITY_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"&[a-zA-Z][a-zA-Z0-9]*;|&#\d+;|&#[xX][0-9a-fA-F]+;").unwrap());
+
+// Hugo/Go template shortcodes: {{< figure ... >}} and {{% shortcode %}}
+// Matches both delimiters: {{< ... >}} (shortcode) and {{% ... %}} (template)
+// Handles multi-line content with embedded quotes and newlines
+pub static HUGO_SHORTCODE_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{\{[<%][\s\S]*?[%>]\}\}").unwrap());
+
+// HTML heading pattern (matches <h1> through <h6> tags)
+// Uses FancyRegex because the pattern requires a backreference (\1)
+pub static HTML_HEADING_PATTERN: LazyLock<FancyRegex> =
+    LazyLock::new(|| FancyRegex::new(r"^\s*<h([1-6])(?:\s[^>]*)?>.*</h\1>\s*$").unwrap());
+
+/// Escapes a string to be used in a regex pattern
+pub fn escape_regex(s: &str) -> String {
+    let mut result = String::with_capacity(s.len() * 2);
+
+    for c in s.chars() {
+        // Use matches! for O(1) lookup instead of array.contains() which is O(n)
+        if matches!(
+            c,
+            '.' | '+' | '*' | '?' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\'
+        ) {
+            result.push('\\');
+        }
+        result.push(c);
+    }
+
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_regex_cache_new() {
+        let cache = RegexCache::new();
+        assert!(cache.cache.is_empty());
+        assert!(cache.usage_stats.is_empty());
+    }
+
+    #[test]
+    fn test_regex_cache_default() {
+        let cache = RegexCache::default();
+        assert!(cache.cache.is_empty());
+        assert!(cache.usage_stats.is_empty());
+    }
+
+    #[test]
+    fn test_get_regex_compilation() {
+        let mut cache = RegexCache::new();
+
+        // First call compiles and caches
+        let regex1 = cache.get_regex(r"\d+").unwrap();
+        assert_eq!(cache.cache.len(), 1);
+        assert_eq!(cache.usage_stats.get(r"\d+"), Some(&1));
+
+        // Second call returns cached version
+        let regex2 = cache.get_regex(r"\d+").unwrap();
+        assert_eq!(cache.cache.len(), 1);
+        assert_eq!(cache.usage_stats.get(r"\d+"), Some(&2));
+
+        // Both should be the same Arc
+        assert!(Arc::ptr_eq(&regex1, &regex2));
+    }
+
+    #[test]
+    fn test_get_regex_invalid_pattern() {
+        let mut cache = RegexCache::new();
+        let result = cache.get_regex(r"[unterminated");
+        assert!(result.is_err());
+        assert!(cache.cache.is_empty());
+    }
+
+    #[test]
+    fn test_get_stats() {
+        let mut cache = RegexCache::new();
+
+        // Use some patterns
+        let _ = cache.get_regex(r"\d+").unwrap();
+        let _ = cache.get_regex(r"\d+").unwrap();
+        let _ = cache.get_regex(r"\w+").unwrap();
+
+        let stats = cache.get_stats();
+        assert_eq!(stats.get(r"\d+"), Some(&2));
+        assert_eq!(stats.get(r"\w+"), Some(&1));
+    }
+
+    #[test]
+    fn test_clear_cache() {
+        let mut cache = RegexCache::new();
+
+        // Add some patterns
+        let _ = cache.get_regex(r"\d+").unwrap();
+
+        assert!(!cache.cache.is_empty());
+        assert!(!cache.usage_stats.is_empty());
+
+        // Clear cache
+        cache.clear();
+
+        assert!(cache.cache.is_empty());
+        assert!(cache.usage_stats.is_empty());
+    }
+
+    #[test]
+    fn test_global_cache_functions() {
+        // Test get_cached_regex
+        let regex1 = get_cached_regex(r"\d{3}").unwrap();
+        let regex2 = get_cached_regex(r"\d{3}").unwrap();
+        assert!(Arc::ptr_eq(&regex1, &regex2));
+
+        // Test stats
+        let stats = get_cache_stats();
+        assert!(stats.contains_key(r"\d{3}"));
+    }
+
+    #[test]
+    fn test_regex_lazy_macro() {
+        let re = regex_lazy!(r"^test.*end$");
+        assert!(re.is_match("test something end"));
+        assert!(!re.is_match("test something"));
+
+        // The macro creates a new static for each invocation location,
+        // so we can't test pointer equality across different invocations
+        // But we can test that the regex works correctly
+        let re2 = regex_lazy!(r"^start.*finish$");
+        assert!(re2.is_match("start and finish"));
+        assert!(!re2.is_match("start without end"));
+    }
+
+    #[test]
+    fn test_escape_regex() {
+        assert_eq!(escape_regex("a.b"), "a\\.b");
+        assert_eq!(escape_regex("a+b*c"), "a\\+b\\*c");
+        assert_eq!(escape_regex("(test)"), "\\(test\\)");
+        assert_eq!(escape_regex("[a-z]"), "\\[a-z\\]");
+        assert_eq!(escape_regex("normal text"), "normal text");
+
+        // Test all special characters
+        assert_eq!(escape_regex(".$^{[(|)*+?\\"), "\\.\\$\\^\\{\\[\\(\\|\\)\\*\\+\\?\\\\");
+
+        // Test empty string
+        assert_eq!(escape_regex(""), "");
+
+        // Test mixed content
+        assert_eq!(escape_regex("test.com/path?query=1"), "test\\.com/path\\?query=1");
+    }
+
+    #[test]
+    fn test_static_regex_patterns() {
+        // Test URL patterns
+        assert!(URL_SIMPLE_REGEX.is_match("https://example.com"));
+        assert!(URL_SIMPLE_REGEX.is_match("http://test.org/path"));
+        assert!(URL_SIMPLE_REGEX.is_match("ftp://files.com"));
+        assert!(!URL_SIMPLE_REGEX.is_match("not a url"));
+
+        // Test heading patterns
+        assert!(ATX_HEADING_REGEX.is_match("# Heading"));
+        assert!(ATX_HEADING_REGEX.is_match("  ## Indented"));
+        assert!(ATX_HEADING_REGEX.is_match("### "));
+        assert!(!ATX_HEADING_REGEX.is_match("Not a heading"));
+
+        // Test list patterns
+        assert!(UNORDERED_LIST_MARKER_REGEX.is_match("* Item"));
+        assert!(UNORDERED_LIST_MARKER_REGEX.is_match("- Item"));
+        assert!(UNORDERED_LIST_MARKER_REGEX.is_match("+ Item"));
+        assert!(ORDERED_LIST_MARKER_REGEX.is_match("1. Item"));
+        assert!(ORDERED_LIST_MARKER_REGEX.is_match("99. Item"));
+
+        // Test HTML patterns
+        assert!(HTML_TAG_REGEX.is_match("<div>"));
+        assert!(HTML_TAG_REGEX.is_match("<span class='test'>"));
+
+        // Test blockquote pattern
+        assert!(BLOCKQUOTE_PREFIX_RE.is_match("> Quote"));
+        assert!(BLOCKQUOTE_PREFIX_RE.is_match("  > Indented quote"));
+        assert!(BLOCKQUOTE_PREFIX_RE.is_match(">> Nested"));
+    }
+
+    #[test]
+    fn test_thread_safety() {
+        use std::thread;
+
+        let handles: Vec<_> = (0..10)
+            .map(|i| {
+                thread::spawn(move || {
+                    let pattern = format!(r"\d{{{i}}}");
+                    let regex = get_cached_regex(&pattern).unwrap();
+                    assert!(regex.is_match(&"1".repeat(i)));
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
+
+    // ==========================================================================
+    // Comprehensive URL Regex Tests
+    // ==========================================================================
+
+    #[test]
+    fn test_url_standard_basic() {
+        // Basic HTTP/HTTPS URLs
+        assert!(URL_STANDARD_REGEX.is_match("https://example.com"));
+        assert!(URL_STANDARD_REGEX.is_match("http://example.com"));
+        assert!(URL_STANDARD_REGEX.is_match("https://example.com/"));
+        assert!(URL_STANDARD_REGEX.is_match("https://example.com/path"));
+        assert!(URL_STANDARD_REGEX.is_match("ftp://files.example.com"));
+        assert!(URL_STANDARD_REGEX.is_match("ftps://secure.example.com"));
+
+        // Should not match non-URLs
+        assert!(!URL_STANDARD_REGEX.is_match("not a url"));
+        assert!(!URL_STANDARD_REGEX.is_match("example.com"));
+        assert!(!URL_STANDARD_REGEX.is_match("www.example.com"));
+    }
+
+    #[test]
+    fn test_url_standard_with_path() {
+        assert!(URL_STANDARD_REGEX.is_match("https://example.com/path/to/page"));
+        assert!(URL_STANDARD_REGEX.is_match("https://example.com/path/to/page.html"));
+        assert!(URL_STANDARD_REGEX.is_match("https://example.com/path/to/page/"));
+    }
+
+    #[test]
+    fn test_url_standard_with_query() {
+        assert!(URL_STANDARD_REGEX.is_match("https://example.com?query=value"));
+        assert!(URL_STANDARD_REGEX.is_match("https://example.com/path?query=value"));
+        assert!(URL_STANDARD_REGEX.is_match("https://example.com/path?a=1&b=2"));
+    }
+
+    #[test]
+    fn test_url_standard_with_fragment() {
+        assert!(URL_STANDARD_REGEX.is_match("https://example.com#section"));
+        assert!(URL_STANDARD_REGEX.is_match("https://example.com/path#section"));
+        assert!(URL_STANDARD_REGEX.is_match("https://example.com/path?query=value#section"));
+    }
+
+    #[test]
+    fn test_url_standard_with_port() {
+        assert!(URL_STANDARD_REGEX.is_match("https://example.com:8080"));
+        assert!(URL_STANDARD_REGEX.is_match("https://example.com:443/path"));
+        assert!(URL_STANDARD_REGEX.is_match("http://localhost:3000"));
+        assert!(URL_STANDARD_REGEX.is_match("https://192.168.1.1:8080/path"));
+    }
+
+    #[test]
+    fn test_url_standard_wikipedia_style_parentheses() {
+        // Wikipedia-style URLs with parentheses in path (Issue #240)
+        let url = "https://en.wikipedia.org/wiki/Rust_(programming_language)";
+        assert!(URL_STANDARD_REGEX.is_match(url));
+
+        // Verify the full URL is captured
+        let cap = URL_STANDARD_REGEX.find(url).unwrap();
+        assert_eq!(cap.as_str(), url);
+
+        // Multiple parentheses pairs
+        let url2 = "https://example.com/path_(foo)_(bar)";
+        let cap2 = URL_STANDARD_REGEX.find(url2).unwrap();
+        assert_eq!(cap2.as_str(), url2);
+    }
+
+    #[test]
+    fn test_url_standard_ipv6() {
+        // IPv6 addresses in URLs
+        assert!(URL_STANDARD_REGEX.is_match("https://[::1]/path"));
+        assert!(URL_STANDARD_REGEX.is_match("https://[2001:db8::1]:8080/path"));
+        assert!(URL_STANDARD_REGEX.is_match("http://[fe80::1%eth0]/"));
+    }
+
+    #[test]
+    fn test_url_www_basic() {
+        // www URLs without protocol
+        assert!(URL_WWW_REGEX.is_match("www.example.com"));
+        assert!(URL_WWW_REGEX.is_match("www.example.co.uk"));
+        assert!(URL_WWW_REGEX.is_match("www.sub.example.com"));
+
+        // Should not match plain domains without www
+        assert!(!URL_WWW_REGEX.is_match("example.com"));
+
+        // Note: https://www.example.com DOES match because it contains "www."
+        // The URL_WWW_REGEX is designed to find www. URLs that lack a protocol
+        // Use URL_STANDARD_REGEX for full URLs with protocols
+        assert!(URL_WWW_REGEX.is_match("https://www.example.com"));
+    }
+
+    #[test]
+    fn test_url_www_with_path() {
+        assert!(URL_WWW_REGEX.is_match("www.example.com/path"));
+        assert!(URL_WWW_REGEX.is_match("www.example.com/path/to/page"));
+        assert!(URL_WWW_REGEX.is_match("www.example.com/path_(with_parens)"));
+    }
+
+    #[test]
+    fn test_url_ipv6_basic() {
+        // IPv6 specific patterns
+        assert!(URL_IPV6_REGEX.is_match("https://[::1]/"));
+        assert!(URL_IPV6_REGEX.is_match("http://[2001:db8::1]/path"));
+        assert!(URL_IPV6_REGEX.is_match("https://[fe80::1]:8080/path"));
+        assert!(URL_IPV6_REGEX.is_match("ftp://[::ffff:192.168.1.1]/file"));
+    }
+
+    #[test]
+    fn test_url_ipv6_with_zone_id() {
+        // IPv6 with zone identifiers
+        assert!(URL_IPV6_REGEX.is_match("https://[fe80::1%eth0]/path"));
+        assert!(URL_IPV6_REGEX.is_match("http://[fe80::1%25eth0]:8080/"));
+    }
+
+    #[test]
+    fn test_url_simple_detection() {
+        // Simple pattern for content characteristic detection
+        assert!(URL_SIMPLE_REGEX.is_match("https://example.com"));
+        assert!(URL_SIMPLE_REGEX.is_match("http://test.org/path"));
+        assert!(URL_SIMPLE_REGEX.is_match("ftp://files.com/file.zip"));
+        assert!(!URL_SIMPLE_REGEX.is_match("not a url"));
+    }
+
+    #[test]
+    fn test_url_quick_check() {
+        // Quick check pattern for early exits
+        assert!(URL_QUICK_CHECK_REGEX.is_match("https://example.com"));
+        assert!(URL_QUICK_CHECK_REGEX.is_match("http://example.com"));
+        assert!(URL_QUICK_CHECK_REGEX.is_match("ftp://files.com"));
+        assert!(URL_QUICK_CHECK_REGEX.is_match("www.example.com"));
+        assert!(URL_QUICK_CHECK_REGEX.is_match("user@example.com"));
+        assert!(!URL_QUICK_CHECK_REGEX.is_match("just plain text"));
+    }
+
+    #[test]
+    fn test_url_edge_cases() {
+        // URLs with special characters that should be excluded
+        let url = "https://example.com/path";
+        assert!(URL_STANDARD_REGEX.is_match(url));
+
+        // URL followed by punctuation - the regex captures trailing punctuation
+        // because trimming is done by `trim_trailing_punctuation()` in the rule
+        let text = "Check https://example.com, it's great!";
+        let cap = URL_STANDARD_REGEX.find(text).unwrap();
+        // The comma IS captured by the regex - rule-level trimming handles this
+        assert!(cap.as_str().ends_with(','));
+
+        // URL in angle brackets should still be found
+        let text2 = "See <https://example.com> for more";
+        assert!(URL_STANDARD_REGEX.is_match(text2));
+
+        // URL ending at angle bracket should stop at >
+        let cap2 = URL_STANDARD_REGEX.find(text2).unwrap();
+        assert!(!cap2.as_str().contains('>'));
+    }
+
+    #[test]
+    fn test_url_with_complex_paths() {
+        // Complex real-world URLs
+        let urls = [
+            "https://github.com/owner/repo/blob/main/src/file.rs#L123",
+            "https://docs.example.com/api/v2/endpoint?format=json&page=1",
+            "https://cdn.example.com/assets/images/logo.png?v=2023",
+            "https://search.example.com/results?q=test+query&filter=all",
+        ];
+
+        for url in urls {
+            assert!(URL_STANDARD_REGEX.is_match(url), "Should match: {url}");
+        }
+    }
+
+    #[test]
+    fn test_url_pattern_strings_are_valid() {
+        // Verify patterns compile into valid regexes by accessing them
+        assert!(URL_STANDARD_REGEX.is_match("https://example.com"));
+        assert!(URL_WWW_REGEX.is_match("www.example.com"));
+        assert!(URL_IPV6_REGEX.is_match("https://[::1]/"));
+        assert!(URL_QUICK_CHECK_REGEX.is_match("https://example.com"));
+        assert!(URL_SIMPLE_REGEX.is_match("https://example.com"));
+    }
+
+    // =========================================================================
+    // Tests for is_blank_in_blockquote_context
+    // This is a shared utility used by MD058, MD065, and other rules that need
+    // to detect blank lines inside blockquotes (Issue #305)
+    // =========================================================================
+
+    #[test]
+    fn test_is_blank_in_blockquote_context_regular_blanks() {
+        // Regular blank lines
+        assert!(is_blank_in_blockquote_context(""));
+        assert!(is_blank_in_blockquote_context("   "));
+        assert!(is_blank_in_blockquote_context("\t"));
+        assert!(is_blank_in_blockquote_context("  \t  "));
+    }
+
+    #[test]
+    fn test_is_blank_in_blockquote_context_blockquote_blanks() {
+        // Blockquote continuation lines with no content (should be treated as blank)
+        assert!(is_blank_in_blockquote_context(">"));
+        assert!(is_blank_in_blockquote_context("> "));
+        assert!(is_blank_in_blockquote_context(">  "));
+        assert!(is_blank_in_blockquote_context(">>"));
+        assert!(is_blank_in_blockquote_context(">> "));
+        assert!(is_blank_in_blockquote_context(">>>"));
+        assert!(is_blank_in_blockquote_context(">>> "));
+    }
+
+    #[test]
+    fn test_is_blank_in_blockquote_context_spaced_nested() {
+        // Spaced nested blockquotes ("> > " style)
+        assert!(is_blank_in_blockquote_context("> > "));
+        assert!(is_blank_in_blockquote_context("> > > "));
+        assert!(is_blank_in_blockquote_context(">  >  "));
+    }
+
+    #[test]
+    fn test_is_blank_in_blockquote_context_with_leading_space() {
+        // Blockquote with leading whitespace
+        assert!(is_blank_in_blockquote_context("  >"));
+        assert!(is_blank_in_blockquote_context("  > "));
+        assert!(is_blank_in_blockquote_context("  >>"));
+    }
+
+    #[test]
+    fn test_is_blank_in_blockquote_context_not_blank() {
+        // Lines with actual content (should NOT be treated as blank)
+        assert!(!is_blank_in_blockquote_context("text"));
+        assert!(!is_blank_in_blockquote_context("> text"));
+        assert!(!is_blank_in_blockquote_context(">> text"));
+        assert!(!is_blank_in_blockquote_context("> | table |"));
+        assert!(!is_blank_in_blockquote_context("| table |"));
+        assert!(!is_blank_in_blockquote_context("> # Heading"));
+        assert!(!is_blank_in_blockquote_context(">text")); // No space after > but has text
+    }
+
+    #[test]
+    fn test_is_blank_in_blockquote_context_edge_cases() {
+        // Edge cases
+        assert!(!is_blank_in_blockquote_context(">a")); // Content immediately after >
+        assert!(!is_blank_in_blockquote_context("> a")); // Single char content
+        assert!(is_blank_in_blockquote_context(">   ")); // Multiple spaces after >
+        assert!(!is_blank_in_blockquote_context(">  text")); // Multiple spaces before content
+    }
+
+    #[test]
+    fn test_is_blank_in_blockquote_context_deeply_nested_no_stack_overflow() {
+        // Adversarial input: a line built from hundreds of thousands of spaced
+        // blockquote markers. Each "> " is a separate prefix match, so a
+        // recursive implementation overflows the stack and aborts the process.
+        // The iterative implementation returns in bounded stack. The test
+        // completing at all is the assertion; the return value is also checked.
+        let blank_markers = "> ".repeat(500_000);
+        assert!(is_blank_in_blockquote_context(&blank_markers));
+
+        // Same depth, but with trailing content: must be recognized as non-blank
+        // without overflowing either.
+        let markers_with_content = format!("{}text", "> ".repeat(500_000));
+        assert!(!is_blank_in_blockquote_context(&markers_with_content));
+    }
+}

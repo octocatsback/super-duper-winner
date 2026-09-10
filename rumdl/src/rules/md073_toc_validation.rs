@@ -1,0 +1,2778 @@
+//! MD073: Table of Contents validation rule
+//!
+//! Validates that TOC sections match the actual document headings.
+
+use crate::lint_context::LintContext;
+use crate::rule::{Fix, LintError, LintResult, LintWarning, Rule, RuleCategory, Severity};
+use crate::utils::anchor_styles::AnchorStyle;
+use crate::utils::header_id_utils::{extract_html_anchor_ids, is_backslash_escaped};
+use percent_encoding::percent_decode_str;
+use regex::Regex;
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::LazyLock;
+
+/// Regex for TOC start marker: `<!-- toc -->` with optional whitespace variations
+static TOC_START_MARKER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)<!--\s*toc\s*-->").unwrap());
+
+/// Regex for TOC stop marker: `<!-- tocstop -->` or `<!-- /toc -->`
+static TOC_STOP_MARKER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)<!--\s*(?:tocstop|/toc)\s*-->").unwrap());
+
+/// Regex for extracting TOC entries: `- [text](#anchor)` or `* [text](#anchor)`
+/// with optional leading whitespace for nested items
+/// Handles nested brackets like `[`check [PATHS...]`](#check-paths)`
+static TOC_ENTRY_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(\s*)[-*]\s+\[([^\[\]]*(?:\[[^\[\]]*\][^\[\]]*)*)\]\(#([^)]+)\)").unwrap());
+
+/// Represents a detected TOC region in the document
+#[derive(Debug, Clone)]
+struct TocRegion {
+    /// 1-indexed start line of the TOC content (after the marker)
+    start_line: usize,
+    /// 1-indexed end line of the TOC content (before the stop marker)
+    end_line: usize,
+    /// Byte offset where TOC content starts
+    content_start: usize,
+    /// Byte offset where TOC content ends
+    content_end: usize,
+}
+
+/// A parsed TOC entry from the existing TOC
+#[derive(Debug, Clone)]
+struct TocEntry {
+    /// Display text of the link
+    text: String,
+    /// Anchor/fragment (without #)
+    anchor: String,
+    /// Number of leading whitespace characters (for indentation checking)
+    indent_spaces: usize,
+}
+
+/// An expected TOC entry generated from document headings
+#[derive(Debug, Clone)]
+struct ExpectedTocEntry {
+    /// 1-indexed line number of the heading
+    heading_line: usize,
+    /// Heading level (1-6)
+    level: u8,
+    /// Heading text (for display)
+    text: String,
+    /// The fragment a generated entry links to
+    anchor: String,
+    /// Other fragments that also reach the heading. A heading with its own `<a id>`
+    /// keeps the slug generated from its text, so a TOC written against either is
+    /// right.
+    aliases: Vec<String>,
+}
+
+impl ExpectedTocEntry {
+    fn is_reached_by(&self, anchor: &str) -> bool {
+        self.anchor == anchor || self.aliases.iter().any(|alias| alias == anchor)
+    }
+}
+
+/// Types of mismatches between actual and expected TOC
+#[derive(Debug)]
+enum TocMismatch {
+    /// Entry exists in TOC but heading doesn't exist
+    StaleEntry { entry: TocEntry },
+    /// Heading exists but no TOC entry for it
+    MissingEntry { expected: ExpectedTocEntry },
+    /// TOC entry text doesn't match heading text
+    TextMismatch {
+        entry: TocEntry,
+        expected: ExpectedTocEntry,
+    },
+    /// TOC entries are in wrong order
+    OrderMismatch { entry: TocEntry, expected_position: usize },
+    /// TOC entry has wrong indentation level
+    IndentationMismatch {
+        entry: TocEntry,
+        actual_indent: usize,
+        expected_indent: usize,
+    },
+}
+
+/// Regex patterns used by `strip_links_and_images`.
+static MARKDOWN_LINK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[([^\]]+)\]\([^)]+\)").unwrap());
+static MARKDOWN_REF_LINK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[([^\]]+)\]\[[^\]]*\]").unwrap());
+static MARKDOWN_IMAGE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"!\[([^\]]*)\]\([^)]+\)").unwrap());
+
+/// `anchor` written as the destination of a TOC link.
+///
+/// A bare link destination cannot hold whitespace, control characters or an
+/// unbalanced parenthesis, and a `%` would read as the start of an escape, so
+/// those ASCII characters are percent-encoded. Everything else is written as it
+/// is, so a slug generated from heading text, non-ASCII letters included, is
+/// unchanged.
+fn encode_fragment(anchor: &str) -> Cow<'_, str> {
+    fn needs_encoding(c: char) -> bool {
+        c.is_ascii() && (c <= ' ' || c == '\x7f' || matches!(c, '(' | ')' | '%'))
+    }
+
+    if !anchor.contains(needs_encoding) {
+        return Cow::Borrowed(anchor);
+    }
+    let mut encoded = String::with_capacity(anchor.len() + 6);
+    for c in anchor.chars() {
+        if needs_encoding(c) {
+            encoded.push_str(&format!("%{:02X}", c as u32));
+        } else {
+            encoded.push(c);
+        }
+    }
+    Cow::Owned(encoded)
+}
+
+/// The fragment a written TOC entry reaches, its percent-encoding undone, as a
+/// browser decodes a fragment before matching it against ids. An escape sequence
+/// that does not decode to UTF-8 leaves the fragment as written.
+fn decode_fragment(anchor: &str) -> Cow<'_, str> {
+    if !anchor.contains('%') {
+        return Cow::Borrowed(anchor);
+    }
+    percent_decode_str(anchor)
+        .decode_utf8()
+        .unwrap_or(Cow::Borrowed(anchor))
+}
+
+/// Extract code-span byte ranges from `text` using the CommonMark rule:
+/// a run of N backticks opens a span closed by exactly N backticks.
+/// Returns a sorted list of `(start, end)` byte offsets that are inside code spans
+/// (including the backtick delimiters themselves).
+fn code_span_ranges(text: &str) -> Vec<(usize, usize)> {
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut ranges = Vec::new();
+    let mut i = 0;
+
+    while i < len {
+        if chars[i] == '`' {
+            let span_start = i;
+            while i < len && chars[i] == '`' {
+                i += 1;
+            }
+            let n = i - span_start;
+
+            // Search for the matching closing sequence of exactly n backticks
+            let mut j = i;
+            let mut found = false;
+            while j < len {
+                if chars[j] == '`' {
+                    let close_start = j;
+                    while j < len && chars[j] == '`' {
+                        j += 1;
+                    }
+                    if j - close_start == n {
+                        // Convert char indices to byte offsets
+                        let byte_start: usize = text.char_indices().nth(span_start).map_or(0, |(b, _)| b);
+                        let byte_end: usize = text.char_indices().nth(j).map_or(text.len(), |(b, _)| b);
+                        ranges.push((byte_start, byte_end));
+                        i = j;
+                        found = true;
+                        break;
+                    }
+                } else {
+                    j += 1;
+                }
+            }
+            if !found {
+                // No matching close; skip past the opening backticks
+                i = span_start + n;
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    ranges
+}
+
+/// Strip only links and images from `text`, preserving all other inline
+/// formatting (code spans, bold, italic, etc.).
+///
+/// Links and images cannot appear inside a Markdown link label `[...]`, so they
+/// must be removed when building TOC display text. Code spans and emphasis are
+/// valid inside link labels and should be kept so the TOC entry faithfully
+/// reflects the heading's visual appearance.
+///
+/// Code-span contents are protected: link-like syntax such as `[foo](bar)` that
+/// appears inside backticks is left untouched.
+///
+/// Examples:
+/// - `` `my header` `` → `` `my header` `` (code ticks preserved)
+/// - `[terminal](url)` → `terminal` (link stripped)
+/// - `![alt](img.png)` → `alt` (image stripped)
+/// - `**bold**` → `**bold**` (emphasis preserved)
+/// - `` `[foo](bar)` `` → `` `[foo](bar)` `` (link inside code span preserved)
+/// - `Tool: [terminal](url)` → `Tool: terminal`
+fn strip_links_and_images(text: &str) -> String {
+    // Collect code-span byte ranges so we can protect their contents from
+    // the link/image regex substitutions.
+    let protected = code_span_ranges(text);
+
+    // If there are no code spans the fast path avoids all the extra work.
+    if protected.is_empty() {
+        let mut result = text.to_string();
+        result = MARKDOWN_IMAGE.replace_all(&result, "$1").to_string();
+        result = MARKDOWN_LINK.replace_all(&result, "$1").to_string();
+        result = MARKDOWN_REF_LINK.replace_all(&result, "$1").to_string();
+        return result;
+    }
+
+    // Replace each code span with a unique placeholder that cannot be matched
+    // by the link/image regexes, apply the regexes, then restore the originals.
+    let mut placeholders: Vec<(&str, String)> = Vec::with_capacity(protected.len());
+    let mut masked = text.to_string();
+    // Process spans in reverse order so byte offsets remain valid after each replacement.
+    for (i, &(start, end)) in protected.iter().enumerate().rev() {
+        // Placeholder: a string containing no `[`, `]`, `(`, `)`, `!` characters.
+        let placeholder = format!("\x00CODESPAN{i}\x00");
+        let original = &text[start..end];
+        placeholders.push((original, placeholder.clone()));
+        masked.replace_range(start..end, &placeholder);
+    }
+
+    // Apply link/image stripping to the masked string
+    masked = MARKDOWN_IMAGE.replace_all(&masked, "$1").to_string();
+    masked = MARKDOWN_LINK.replace_all(&masked, "$1").to_string();
+    masked = MARKDOWN_REF_LINK.replace_all(&masked, "$1").to_string();
+
+    // Restore the original code-span text
+    for (original, placeholder) in &placeholders {
+        masked = masked.replace(placeholder.as_str(), original);
+    }
+
+    masked
+}
+
+/// MD073: Table of Contents Validation
+///
+/// This rule validates that TOC sections match the actual document headings.
+/// It detects TOC regions via markers (`<!-- toc -->...<!-- tocstop -->`).
+///
+/// To opt into TOC validation, add markers to your document:
+/// ```markdown
+/// <!-- toc -->
+/// - [Section](#section)
+/// <!-- tocstop -->
+/// ```
+///
+/// ## Configuration
+///
+/// ```toml
+/// [MD073]
+/// # Enable the rule (opt-in, disabled by default)
+/// enabled = true
+/// # Minimum heading level to include (default: 2)
+/// min-level = 2
+/// # Maximum heading level to include (default: 4)
+/// max-level = 4
+/// # Whether TOC order must match document order (default: true)
+/// enforce-order = true
+/// # Indent size per nesting level (default: from MD007 config, or 2)
+/// indent = 2
+/// ```
+#[derive(Clone)]
+pub struct MD073TocValidation {
+    /// Whether this rule is enabled (default: false - opt-in rule)
+    enabled: bool,
+    /// Minimum heading level to include
+    min_level: u8,
+    /// Maximum heading level to include
+    max_level: u8,
+    /// Whether to enforce order matching
+    enforce_order: bool,
+    /// Indent size per nesting level (reads from MD007 config by default)
+    pub indent: usize,
+}
+
+impl Default for MD073TocValidation {
+    fn default() -> Self {
+        Self {
+            enabled: false, // Disabled by default - opt-in rule
+            min_level: 2,
+            max_level: 4,
+            enforce_order: true,
+            indent: 2, // Default indent, can be overridden by MD007 config
+        }
+    }
+}
+
+impl std::fmt::Debug for MD073TocValidation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MD073TocValidation")
+            .field("enabled", &self.enabled)
+            .field("min_level", &self.min_level)
+            .field("max_level", &self.max_level)
+            .field("enforce_order", &self.enforce_order)
+            .field("indent", &self.indent)
+            .finish()
+    }
+}
+
+impl MD073TocValidation {
+    /// Create a new rule with default settings
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether `content` contains a TOC marker that is Markdown syntax rather
+    /// than literal text. A marker inside an inline code span is code, and one
+    /// whose `<` is backslash-escaped renders as the characters themselves.
+    fn has_active_marker(ctx: &LintContext, content: &str, line_byte_offset: usize, marker: &Regex) -> bool {
+        marker.find_iter(content).any(|matched| {
+            !ctx.is_in_code_span_byte(line_byte_offset + matched.start())
+                && !is_backslash_escaped(content, matched.start())
+        })
+    }
+
+    /// Detect TOC region using markers
+    fn detect_by_markers(&self, ctx: &LintContext) -> Option<TocRegion> {
+        let mut start_line = None;
+        let mut start_byte = None;
+
+        for (idx, line_info) in ctx.lines.iter().enumerate() {
+            let line_num = idx + 1;
+            let content = line_info.content(ctx.content);
+
+            // Skip if in code block or front matter
+            if line_info.in_code_block || line_info.in_front_matter {
+                continue;
+            }
+
+            // Look for start marker or stop marker
+            if let (Some(s_line), Some(s_byte)) = (start_line, start_byte) {
+                // We have a start, now look for stop marker
+                if Self::has_active_marker(ctx, content, line_info.byte_offset, &TOC_STOP_MARKER) {
+                    let end_line = line_num - 1;
+                    let content_end = line_info.byte_offset;
+
+                    // Handle case where there's no content between markers
+                    if end_line < s_line {
+                        return Some(TocRegion {
+                            start_line: s_line,
+                            end_line: s_line,
+                            content_start: s_byte,
+                            content_end: s_byte,
+                        });
+                    }
+
+                    return Some(TocRegion {
+                        start_line: s_line,
+                        end_line,
+                        content_start: s_byte,
+                        content_end,
+                    });
+                }
+            } else if Self::has_active_marker(ctx, content, line_info.byte_offset, &TOC_START_MARKER) {
+                // TOC content starts on the next line
+                if idx + 1 < ctx.lines.len() {
+                    start_line = Some(line_num + 1);
+                    start_byte = Some(ctx.lines[idx + 1].byte_offset);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Detect TOC region using markers
+    fn detect_toc_region(&self, ctx: &LintContext) -> Option<TocRegion> {
+        self.detect_by_markers(ctx)
+    }
+
+    /// Extract TOC entries from the detected region
+    fn extract_toc_entries(&self, ctx: &LintContext, region: &TocRegion) -> Vec<TocEntry> {
+        let mut entries = Vec::new();
+
+        for idx in (region.start_line - 1)..region.end_line.min(ctx.lines.len()) {
+            let line_info = &ctx.lines[idx];
+            let content = line_info.content(ctx.content);
+
+            if let Some(caps) = TOC_ENTRY_PATTERN.captures(content) {
+                let indent_spaces = caps.get(1).map_or(0, |m| m.as_str().len());
+                let text = caps.get(2).map_or("", |m| m.as_str()).to_string();
+                let anchor = caps.get(3).map_or("", |m| m.as_str()).to_string();
+
+                entries.push(TocEntry {
+                    text,
+                    anchor,
+                    indent_spaces,
+                });
+            }
+        }
+
+        entries
+    }
+
+    /// Build expected TOC entries from document headings
+    fn build_expected_toc(&self, ctx: &LintContext, toc_region: &TocRegion) -> Vec<ExpectedTocEntry> {
+        let mut entries = Vec::new();
+        let mut fragment_counts: HashMap<String, usize> = HashMap::new();
+
+        for (idx, line_info) in ctx.lines.iter().enumerate() {
+            let line_num = idx + 1;
+
+            // Skip headings before/within the TOC region
+            if line_num <= toc_region.end_line {
+                // Also skip the TOC heading itself for heading-based detection
+                continue;
+            }
+
+            // Skip code blocks, front matter, HTML blocks
+            if line_info.in_code_block || line_info.in_front_matter || line_info.in_html_block {
+                continue;
+            }
+
+            if let Some(heading) = &line_info.heading {
+                // Filter by min/max level
+                if heading.level < self.min_level || heading.level > self.max_level {
+                    continue;
+                }
+
+                // A custom ID ({#id}) replaces the generated slug. An HTML anchor
+                // element beside the heading adds a target either way: the
+                // renderer keeps the element's own id, and without a custom ID it
+                // still generates the slug from the text, which still counts
+                // towards the numbering of later duplicates.
+                let (anchor, aliases) = match &heading.custom_id {
+                    Some(custom_id) => (
+                        Self::deduplicate_fragment(&mut fragment_counts, custom_id),
+                        extract_html_anchor_ids(&heading.raw_text),
+                    ),
+                    None => {
+                        let slug = AnchorStyle::GitHub.generate_fragment(&heading.slug_text);
+                        let generated = Self::deduplicate_fragment(&mut fragment_counts, &slug);
+                        let mut explicit = extract_html_anchor_ids(&heading.raw_text);
+                        match explicit.first().cloned() {
+                            Some(preferred) => {
+                                explicit.remove(0);
+                                explicit.push(generated);
+                                (preferred, explicit)
+                            }
+                            // A heading whose text slugs to nothing (an image, an
+                            // emoji) gets no anchor from GitHub, only a number on a
+                            // repeat, so without an element of its own no TOC entry
+                            // can reach it. It still counts towards the numbering.
+                            None if slug.is_empty() => continue,
+                            None => (generated, Vec::new()),
+                        }
+                    }
+                };
+
+                entries.push(ExpectedTocEntry {
+                    heading_line: line_num,
+                    level: heading.level,
+                    text: heading.text.clone(),
+                    anchor,
+                    aliases,
+                });
+            }
+        }
+
+        entries
+    }
+
+    /// The fragment a renderer gives a heading whose base fragment has already
+    /// been seen `n` times: `base`, then `base-1`, `base-2`, ...
+    fn deduplicate_fragment(fragment_counts: &mut HashMap<String, usize>, base: &str) -> String {
+        match fragment_counts.get_mut(base) {
+            Some(count) => {
+                let suffix = *count;
+                *count += 1;
+                format!("{base}-{suffix}")
+            }
+            None => {
+                fragment_counts.insert(base.to_string(), 1);
+                base.to_string()
+            }
+        }
+    }
+
+    /// Pair each actual TOC entry with the first still-unclaimed heading its
+    /// anchor reaches. `None` marks an entry that reaches no heading.
+    fn match_entries(actual: &[TocEntry], expected: &[ExpectedTocEntry]) -> Vec<Option<usize>> {
+        let mut claimed = vec![false; expected.len()];
+        actual
+            .iter()
+            .map(|entry| {
+                let anchor = decode_fragment(&entry.anchor);
+                let found = expected
+                    .iter()
+                    .enumerate()
+                    .position(|(idx, exp)| !claimed[idx] && exp.is_reached_by(&anchor));
+                if let Some(idx) = found {
+                    claimed[idx] = true;
+                }
+                found
+            })
+            .collect()
+    }
+
+    /// Compare actual TOC entries against expected and find mismatches.
+    ///
+    /// `matching` pairs each actual entry with the heading it reaches, as
+    /// computed by [`Self::match_entries`].
+    fn validate_toc(
+        &self,
+        actual: &[TocEntry],
+        expected: &[ExpectedTocEntry],
+        matching: &[Option<usize>],
+    ) -> Vec<TocMismatch> {
+        let mut mismatches = Vec::new();
+        let pairs = || {
+            actual
+                .iter()
+                .zip(matching)
+                .enumerate()
+                .filter_map(|(actual_idx, (entry, matched))| matched.map(|exp_idx| (actual_idx, entry, exp_idx)))
+        };
+
+        // Stale entries reach no heading.
+        for (entry, matched) in actual.iter().zip(matching) {
+            if matched.is_none() {
+                mismatches.push(TocMismatch::StaleEntry { entry: entry.clone() });
+            }
+        }
+
+        // Missing entries are headings no TOC entry reaches.
+        for (exp_idx, exp) in expected.iter().enumerate() {
+            if !matching.contains(&Some(exp_idx)) {
+                mismatches.push(TocMismatch::MissingEntry { expected: exp.clone() });
+            }
+        }
+
+        // Check for text mismatches. Compare with the same normalization used in
+        // generate_toc: strip only links and images, preserve code spans and emphasis.
+        // This ensures a correct user-written TOC entry like `` [`my header`](#anchor) ``
+        // is not flagged against a heading `` `my header` ``.
+        let mut text_mismatched = vec![false; actual.len()];
+        for (actual_idx, entry, exp_idx) in pairs() {
+            let exp = &expected[exp_idx];
+            let actual_normalized = strip_links_and_images(entry.text.trim());
+            let expected_normalized = strip_links_and_images(exp.text.trim());
+            if actual_normalized != expected_normalized {
+                text_mismatched[actual_idx] = true;
+                mismatches.push(TocMismatch::TextMismatch {
+                    entry: entry.clone(),
+                    expected: exp.clone(),
+                });
+            }
+        }
+
+        // Check for indentation mismatches
+        // Expected indentation is indent spaces per level difference from base level
+        if !expected.is_empty() {
+            let base_level = expected.iter().map(|e| e.level).min().unwrap_or(2);
+
+            for (actual_idx, entry, exp_idx) in pairs() {
+                let level_diff = expected[exp_idx].level.saturating_sub(base_level) as usize;
+                let expected_indent = level_diff * self.indent;
+
+                // An entry already reported for its text is not reported again
+                if entry.indent_spaces != expected_indent && !text_mismatched[actual_idx] {
+                    mismatches.push(TocMismatch::IndentationMismatch {
+                        entry: entry.clone(),
+                        actual_indent: entry.indent_spaces,
+                        expected_indent,
+                    });
+                }
+            }
+        }
+
+        // Check order if enforce_order is enabled: walk the headings alongside the
+        // matched entries, and an entry whose heading lies behind the walk is out
+        // of order.
+        if self.enforce_order && !actual.is_empty() && !expected.is_empty() {
+            let mut expected_idx = 0;
+            for (actual_idx, entry, exp_idx) in pairs() {
+                if exp_idx >= expected_idx {
+                    expected_idx = exp_idx + 1;
+                } else if !text_mismatched[actual_idx] {
+                    mismatches.push(TocMismatch::OrderMismatch {
+                        entry: entry.clone(),
+                        expected_position: exp_idx + 1,
+                    });
+                }
+            }
+        }
+
+        mismatches
+    }
+
+    /// Expected entries as they should be regenerated: a TOC entry that already
+    /// reaches its heading keeps the anchor it was written with. The anchor is
+    /// stored decoded, as every expected anchor is, and encoded again on output.
+    fn keep_reached_anchors(
+        actual: &[TocEntry],
+        expected: &[ExpectedTocEntry],
+        matching: &[Option<usize>],
+    ) -> Vec<ExpectedTocEntry> {
+        let mut regenerated = expected.to_vec();
+        for (entry, exp_idx) in actual
+            .iter()
+            .zip(matching)
+            .filter_map(|(entry, m)| m.map(|idx| (entry, idx)))
+        {
+            regenerated[exp_idx].anchor = decode_fragment(&entry.anchor).into_owned();
+        }
+        regenerated
+    }
+
+    /// Generate a new TOC from expected entries (always uses nested indentation)
+    fn generate_toc(&self, expected: &[ExpectedTocEntry]) -> String {
+        if expected.is_empty() {
+            return String::new();
+        }
+
+        let mut result = String::new();
+        let base_level = expected.iter().map(|e| e.level).min().unwrap_or(2);
+        let indent_str = " ".repeat(self.indent);
+
+        for entry in expected {
+            let level_diff = entry.level.saturating_sub(base_level) as usize;
+            let indent = indent_str.repeat(level_diff);
+
+            // Build display text: strip only links and images (which would create invalid
+            // nested-link syntax inside `[...]`), but preserve code spans and emphasis so
+            // the TOC entry reflects the heading's visual appearance.
+            let display_text = strip_links_and_images(&entry.text);
+            let fragment = encode_fragment(&entry.anchor);
+            result.push_str(&format!("{indent}- [{display_text}](#{fragment})\n"));
+        }
+
+        result
+    }
+}
+
+impl Rule for MD073TocValidation {
+    fn name(&self) -> &'static str {
+        "MD073"
+    }
+
+    fn description(&self) -> &'static str {
+        "Table of Contents should match document headings"
+    }
+
+    fn should_skip(&self, ctx: &LintContext) -> bool {
+        // Quick check: skip if no TOC markers. detect_toc_region() is
+        // case-insensitive, so use a case-insensitive containment check here
+        // to avoid skipping fix() on documents with uppercase markers like
+        // `<!-- TOC -->`.
+        let lower = ctx.content.to_ascii_lowercase();
+        !(lower.contains("<!-- toc") || lower.contains("<!--toc"))
+    }
+
+    fn check(&self, ctx: &LintContext) -> LintResult {
+        let mut warnings = Vec::new();
+
+        // Detect TOC region
+        let Some(region) = self.detect_toc_region(ctx) else {
+            // No TOC found - nothing to validate
+            return Ok(warnings);
+        };
+
+        // Extract actual TOC entries
+        let actual_entries = self.extract_toc_entries(ctx, &region);
+
+        // Build expected TOC from headings
+        let expected_entries = self.build_expected_toc(ctx, &region);
+
+        // If no expected entries and no actual entries, nothing to validate
+        if expected_entries.is_empty() && actual_entries.is_empty() {
+            return Ok(warnings);
+        }
+
+        // Validate
+        let matching = Self::match_entries(&actual_entries, &expected_entries);
+        let mismatches = self.validate_toc(&actual_entries, &expected_entries, &matching);
+
+        if !mismatches.is_empty() {
+            // Generate a single warning at the TOC region with details
+            let mut details = Vec::new();
+
+            for mismatch in &mismatches {
+                match mismatch {
+                    TocMismatch::StaleEntry { entry } => {
+                        details.push(format!("Stale entry: '{}' (heading no longer exists)", entry.text));
+                    }
+                    TocMismatch::MissingEntry { expected } => {
+                        details.push(format!(
+                            "Missing entry: '{}' (line {})",
+                            expected.text, expected.heading_line
+                        ));
+                    }
+                    TocMismatch::TextMismatch { entry, expected } => {
+                        details.push(format!(
+                            "Text mismatch: TOC has '{}', heading is '{}'",
+                            entry.text, expected.text
+                        ));
+                    }
+                    TocMismatch::OrderMismatch {
+                        entry,
+                        expected_position,
+                    } => {
+                        details.push(format!(
+                            "Order mismatch: '{}' should be at position {}",
+                            entry.text, expected_position
+                        ));
+                    }
+                    TocMismatch::IndentationMismatch {
+                        entry,
+                        actual_indent,
+                        expected_indent,
+                        ..
+                    } => {
+                        details.push(format!(
+                            "Indentation mismatch: '{}' has {} spaces, expected {} spaces",
+                            entry.text, actual_indent, expected_indent
+                        ));
+                    }
+                }
+            }
+
+            let message = format!(
+                "Table of Contents does not match document headings: {}",
+                details.join("; ")
+            );
+
+            // Generate fix: replace entire TOC content
+            let regenerated = Self::keep_reached_anchors(&actual_entries, &expected_entries, &matching);
+            let new_toc = self.generate_toc(&regenerated);
+            let fix_range = region.content_start..region.content_end;
+
+            warnings.push(LintWarning {
+                rule_name: Some(self.name().to_string()),
+                message,
+                line: region.start_line,
+                column: 1,
+                end_line: region.end_line,
+                end_column: 1,
+                severity: Severity::Warning,
+                fix: Some(Fix::new(fix_range, new_toc)),
+            });
+        }
+
+        Ok(warnings)
+    }
+
+    fn fix(&self, ctx: &LintContext) -> Result<String, LintError> {
+        if self.should_skip(ctx) {
+            return Ok(ctx.content.to_string());
+        }
+        let warnings = self.check(ctx)?;
+        if warnings.is_empty() {
+            return Ok(ctx.content.to_string());
+        }
+        let warnings =
+            crate::utils::fix_utils::filter_warnings_by_inline_config(warnings, ctx.inline_config(), self.name());
+        crate::utils::fix_utils::apply_warning_fixes(ctx.content, &warnings).map_err(LintError::InvalidInput)
+    }
+
+    fn category(&self) -> RuleCategory {
+        RuleCategory::Other
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn default_config_section(&self) -> Option<(String, toml::Value)> {
+        let value: toml::Value = toml::from_str(
+            r#"
+# Whether this rule is enabled (opt-in, disabled by default)
+enabled = false
+# Minimum heading level to include
+min-level = 2
+# Maximum heading level to include
+max-level = 4
+# Whether TOC order must match document order
+enforce-order = true
+# Indentation per nesting level (defaults to MD007's indent value)
+indent = 2
+"#,
+        )
+        .ok()?;
+        Some(("MD073".to_string(), value))
+    }
+
+    fn from_config(config: &crate::config::Config) -> Box<dyn Rule>
+    where
+        Self: Sized,
+    {
+        let mut rule = MD073TocValidation::default();
+        let mut indent_from_md073 = false;
+
+        if let Some(rule_config) = config.rules.get("MD073") {
+            // Parse enabled (opt-in rule, defaults to false)
+            if let Some(enabled) = rule_config.values.get("enabled").and_then(toml::Value::as_bool) {
+                rule.enabled = enabled;
+            }
+
+            // Parse min-level
+            if let Some(min_level) = rule_config.values.get("min-level").and_then(toml::Value::as_integer) {
+                rule.min_level = (min_level.clamp(1, 6)) as u8;
+            }
+
+            // Parse max-level
+            if let Some(max_level) = rule_config.values.get("max-level").and_then(toml::Value::as_integer) {
+                rule.max_level = (max_level.clamp(1, 6)) as u8;
+            }
+
+            // Parse enforce-order
+            if let Some(enforce_order) = rule_config.values.get("enforce-order").and_then(toml::Value::as_bool) {
+                rule.enforce_order = enforce_order;
+            }
+
+            // Parse indent (MD073-specific override)
+            if let Some(indent) = rule_config.values.get("indent").and_then(toml::Value::as_integer) {
+                rule.indent = (indent.clamp(1, 8)) as usize;
+                indent_from_md073 = true;
+            }
+        }
+
+        // If indent not explicitly set in MD073, read from MD007 config
+        if !indent_from_md073
+            && let Some(md007_config) = config.rules.get("MD007")
+            && let Some(indent) = md007_config.values.get("indent").and_then(toml::Value::as_integer)
+        {
+            rule.indent = (indent.clamp(1, 8)) as usize;
+        }
+
+        Box::new(rule)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::MarkdownFlavor;
+    use regex::Regex;
+    use std::sync::LazyLock;
+
+    // ---- Test-only helpers for stripping all inline formatting ----
+    // These are not used in production code; they exist only to test
+    // the individual stripping primitives in isolation.
+
+    /// Strip code spans from text, handling multi-backtick spans per CommonMark spec.
+    fn strip_code_spans(text: &str) -> String {
+        let chars: Vec<char> = text.chars().collect();
+        let len = chars.len();
+        let mut result = String::with_capacity(text.len());
+        let mut i = 0;
+
+        while i < len {
+            if chars[i] == '`' {
+                let open_start = i;
+                while i < len && chars[i] == '`' {
+                    i += 1;
+                }
+                let backtick_count = i - open_start;
+
+                let content_start = i;
+                let mut found_close = false;
+                while i < len {
+                    if chars[i] == '`' {
+                        let close_start = i;
+                        while i < len && chars[i] == '`' {
+                            i += 1;
+                        }
+                        if i - close_start == backtick_count {
+                            let content: String = chars[content_start..close_start].iter().collect();
+                            let stripped = if content.starts_with(' ') && content.ends_with(' ') && content.len() > 1 {
+                                content[1..content.len() - 1].to_string()
+                            } else {
+                                content
+                            };
+                            result.push_str(&stripped);
+                            found_close = true;
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+                if !found_close {
+                    for _ in 0..backtick_count {
+                        result.push('`');
+                    }
+                    let remaining: String = chars[content_start..].iter().collect();
+                    result.push_str(&remaining);
+                    break;
+                }
+            } else {
+                result.push(chars[i]);
+                i += 1;
+            }
+        }
+
+        result
+    }
+
+    static TEST_BOLD_ASTERISK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\*\*([^*]+)\*\*").unwrap());
+    static TEST_BOLD_UNDERSCORE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"__([^_]+)__").unwrap());
+    static TEST_ITALIC_ASTERISK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\*([^*]+)\*").unwrap());
+    static TEST_ITALIC_UNDERSCORE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(^|[^a-zA-Z0-9])_([^_]+)_([^a-zA-Z0-9]|$)").unwrap());
+
+    /// Strip all inline markdown formatting from text, reducing it to plain text.
+    /// Builds on `strip_links_and_images` and additionally removes code spans,
+    /// bold, and italic markers. Used in tests only.
+    fn strip_markdown_formatting(text: &str) -> String {
+        let mut result = strip_links_and_images(text);
+        result = strip_code_spans(&result);
+        result = TEST_BOLD_ASTERISK.replace_all(&result, "$1").to_string();
+        result = TEST_BOLD_UNDERSCORE.replace_all(&result, "$1").to_string();
+        result = TEST_ITALIC_ASTERISK.replace_all(&result, "$1").to_string();
+        result = TEST_ITALIC_UNDERSCORE.replace_all(&result, "$1$2$3").to_string();
+        result
+    }
+
+    fn create_ctx(content: &str) -> LintContext<'_> {
+        LintContext::new(content, MarkdownFlavor::Standard, None)
+    }
+
+    /// Create rule with enabled=true for tests that call check() directly
+    fn create_enabled_rule() -> MD073TocValidation {
+        MD073TocValidation {
+            enabled: true,
+            ..MD073TocValidation::default()
+        }
+    }
+
+    // ========== Detection Tests ==========
+
+    #[test]
+    fn test_detect_markers_basic() {
+        let rule = MD073TocValidation::new();
+        let content = r#"# Title
+
+<!-- toc -->
+
+- [Heading 1](#heading-1)
+
+<!-- tocstop -->
+
+## Heading 1
+
+Content here.
+"#;
+        let ctx = create_ctx(content);
+        let region = rule.detect_by_markers(&ctx);
+        assert!(region.is_some());
+        let region = region.unwrap();
+        // Verify region boundaries are detected correctly
+        assert_eq!(region.start_line, 4);
+        assert_eq!(region.end_line, 6);
+    }
+
+    #[test]
+    fn test_detect_markers_variations() {
+        let rule = MD073TocValidation::new();
+
+        // Test <!--toc--> (no spaces)
+        let content1 = "<!--toc-->\n- [A](#a)\n<!--tocstop-->\n";
+        let ctx1 = create_ctx(content1);
+        assert!(rule.detect_by_markers(&ctx1).is_some());
+
+        // Test <!-- TOC --> (uppercase)
+        let content2 = "<!-- TOC -->\n- [A](#a)\n<!-- TOCSTOP -->\n";
+        let ctx2 = create_ctx(content2);
+        assert!(rule.detect_by_markers(&ctx2).is_some());
+
+        // Test <!-- /toc --> (alternative stop marker)
+        let content3 = "<!-- toc -->\n- [A](#a)\n<!-- /toc -->\n";
+        let ctx3 = create_ctx(content3);
+        assert!(rule.detect_by_markers(&ctx3).is_some());
+    }
+
+    #[test]
+    fn test_no_toc_region() {
+        let rule = MD073TocValidation::new();
+        let content = r#"# Title
+
+## Heading 1
+
+Content here.
+
+## Heading 2
+
+More content.
+"#;
+        let ctx = create_ctx(content);
+        let region = rule.detect_toc_region(&ctx);
+        assert!(region.is_none());
+    }
+
+    // ========== Validation Tests ==========
+
+    #[test]
+    fn test_toc_matches_headings() {
+        let rule = create_enabled_rule();
+        let content = r#"# Title
+
+<!-- toc -->
+
+- [Heading 1](#heading-1)
+- [Heading 2](#heading-2)
+
+<!-- tocstop -->
+
+## Heading 1
+
+Content.
+
+## Heading 2
+
+More content.
+"#;
+        let ctx = create_ctx(content);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty(), "Expected no warnings for matching TOC");
+    }
+
+    #[test]
+    fn test_missing_entry() {
+        let rule = create_enabled_rule();
+        let content = r#"# Title
+
+<!-- toc -->
+
+- [Heading 1](#heading-1)
+
+<!-- tocstop -->
+
+## Heading 1
+
+Content.
+
+## Heading 2
+
+New heading not in TOC.
+"#;
+        let ctx = create_ctx(content);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].message.contains("Missing entry"));
+        assert!(result[0].message.contains("Heading 2"));
+    }
+
+    #[test]
+    fn test_stale_entry() {
+        let rule = create_enabled_rule();
+        let content = r#"# Title
+
+<!-- toc -->
+
+- [Heading 1](#heading-1)
+- [Deleted Heading](#deleted-heading)
+
+<!-- tocstop -->
+
+## Heading 1
+
+Content.
+"#;
+        let ctx = create_ctx(content);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].message.contains("Stale entry"));
+        assert!(result[0].message.contains("Deleted Heading"));
+    }
+
+    #[test]
+    fn test_text_mismatch() {
+        let rule = create_enabled_rule();
+        let content = r#"# Title
+
+<!-- toc -->
+
+- [Old Name](#heading-1)
+
+<!-- tocstop -->
+
+## Heading 1
+
+Content.
+"#;
+        let ctx = create_ctx(content);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].message.contains("Text mismatch"));
+    }
+
+    // ========== Level Filtering Tests ==========
+
+    #[test]
+    fn test_min_level_excludes_h1() {
+        let mut rule = MD073TocValidation::new();
+        rule.min_level = 2;
+
+        let content = r#"<!-- toc -->
+
+<!-- tocstop -->
+
+# Should Be Excluded
+
+## Should Be Included
+
+Content.
+"#;
+        let ctx = create_ctx(content);
+        let region = rule.detect_toc_region(&ctx).unwrap();
+        let expected = rule.build_expected_toc(&ctx, &region);
+
+        assert_eq!(expected.len(), 1);
+        assert_eq!(expected[0].text, "Should Be Included");
+    }
+
+    #[test]
+    fn test_max_level_excludes_h5_h6() {
+        let mut rule = MD073TocValidation::new();
+        rule.max_level = 4;
+
+        let content = r#"<!-- toc -->
+
+<!-- tocstop -->
+
+## Level 2
+
+### Level 3
+
+#### Level 4
+
+##### Level 5 Should Be Excluded
+
+###### Level 6 Should Be Excluded
+"#;
+        let ctx = create_ctx(content);
+        let region = rule.detect_toc_region(&ctx).unwrap();
+        let expected = rule.build_expected_toc(&ctx, &region);
+
+        assert_eq!(expected.len(), 3);
+        assert!(expected.iter().all(|e| e.level <= 4));
+    }
+
+    // ========== Fix Tests ==========
+
+    #[test]
+    fn test_fix_adds_missing_entry() {
+        let rule = MD073TocValidation::new();
+        let content = r#"# Title
+
+<!-- toc -->
+
+- [Heading 1](#heading-1)
+
+<!-- tocstop -->
+
+## Heading 1
+
+Content.
+
+## Heading 2
+
+New heading.
+"#;
+        let ctx = create_ctx(content);
+        let fixed = rule.fix(&ctx).unwrap();
+        assert!(fixed.contains("- [Heading 2](#heading-2)"));
+    }
+
+    #[test]
+    fn test_fix_removes_stale_entry() {
+        let rule = MD073TocValidation::new();
+        let content = r#"# Title
+
+<!-- toc -->
+
+- [Heading 1](#heading-1)
+- [Deleted](#deleted)
+
+<!-- tocstop -->
+
+## Heading 1
+
+Content.
+"#;
+        let ctx = create_ctx(content);
+        let fixed = rule.fix(&ctx).unwrap();
+        assert!(fixed.contains("- [Heading 1](#heading-1)"));
+        assert!(!fixed.contains("Deleted"));
+    }
+
+    #[test]
+    fn test_fix_idempotent() {
+        let rule = MD073TocValidation::new();
+        let content = r#"# Title
+
+<!-- toc -->
+
+- [Heading 1](#heading-1)
+- [Heading 2](#heading-2)
+
+<!-- tocstop -->
+
+## Heading 1
+
+Content.
+
+## Heading 2
+
+More.
+"#;
+        let ctx = create_ctx(content);
+        let fixed1 = rule.fix(&ctx).unwrap();
+        let ctx2 = create_ctx(&fixed1);
+        let fixed2 = rule.fix(&ctx2).unwrap();
+
+        // Second fix should produce same output
+        assert_eq!(fixed1, fixed2);
+    }
+
+    #[test]
+    fn test_fix_preserves_markers() {
+        let rule = MD073TocValidation::new();
+        let content = r#"# Title
+
+<!-- toc -->
+
+Old TOC content.
+
+<!-- tocstop -->
+
+## New Heading
+
+Content.
+"#;
+        let ctx = create_ctx(content);
+        let fixed = rule.fix(&ctx).unwrap();
+
+        // Markers should still be present
+        assert!(fixed.contains("<!-- toc -->"));
+        assert!(fixed.contains("<!-- tocstop -->"));
+        // New content should be generated
+        assert!(fixed.contains("- [New Heading](#new-heading)"));
+    }
+
+    #[test]
+    fn test_fix_requires_markers() {
+        let rule = create_enabled_rule();
+
+        // Document without markers - no TOC detected, no changes
+        let content_no_markers = r#"# Title
+
+## Heading 1
+
+Content.
+"#;
+        let ctx = create_ctx(content_no_markers);
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, content_no_markers);
+
+        // Document with markers - TOC detected and fixed
+        let content_markers = r#"# Title
+
+<!-- toc -->
+
+- [Old Entry](#old-entry)
+
+<!-- tocstop -->
+
+## Heading 1
+
+Content.
+"#;
+        let ctx = create_ctx(content_markers);
+        let fixed = rule.fix(&ctx).unwrap();
+        assert!(fixed.contains("- [Heading 1](#heading-1)"));
+        assert!(!fixed.contains("Old Entry"));
+    }
+
+    // ========== Anchor Tests ==========
+
+    #[test]
+    fn test_duplicate_heading_anchors() {
+        let rule = MD073TocValidation::new();
+        let content = r#"# Title
+
+<!-- toc -->
+
+<!-- tocstop -->
+
+## Duplicate
+
+Content.
+
+## Duplicate
+
+More content.
+
+## Duplicate
+
+Even more.
+"#;
+        let ctx = create_ctx(content);
+        let region = rule.detect_toc_region(&ctx).unwrap();
+        let expected = rule.build_expected_toc(&ctx, &region);
+
+        assert_eq!(expected.len(), 3);
+        assert_eq!(expected[0].anchor, "duplicate");
+        assert_eq!(expected[1].anchor, "duplicate-1");
+        assert_eq!(expected[2].anchor, "duplicate-2");
+    }
+
+    // ========== Edge Cases ==========
+
+    #[test]
+    fn test_headings_in_code_blocks_ignored() {
+        let rule = create_enabled_rule();
+        let content = r#"# Title
+
+<!-- toc -->
+
+- [Real Heading](#real-heading)
+
+<!-- tocstop -->
+
+## Real Heading
+
+```markdown
+## Fake Heading In Code
+```
+
+Content.
+"#;
+        let ctx = create_ctx(content);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty(), "Should not report fake heading in code block");
+    }
+
+    #[test]
+    fn test_empty_toc_region() {
+        let rule = create_enabled_rule();
+        let content = r#"# Title
+
+<!-- toc -->
+<!-- tocstop -->
+
+## Heading 1
+
+Content.
+"#;
+        let ctx = create_ctx(content);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].message.contains("Missing entry"));
+    }
+
+    #[test]
+    fn test_nested_indentation() {
+        let rule = create_enabled_rule();
+
+        let content = r#"<!-- toc -->
+
+<!-- tocstop -->
+
+## Level 2
+
+### Level 3
+
+#### Level 4
+
+## Another Level 2
+"#;
+        let ctx = create_ctx(content);
+        let region = rule.detect_toc_region(&ctx).unwrap();
+        let expected = rule.build_expected_toc(&ctx, &region);
+        let toc = rule.generate_toc(&expected);
+
+        // Check indentation (always nested)
+        assert!(toc.contains("- [Level 2](#level-2)"));
+        assert!(toc.contains("  - [Level 3](#level-3)"));
+        assert!(toc.contains("    - [Level 4](#level-4)"));
+        assert!(toc.contains("- [Another Level 2](#another-level-2)"));
+    }
+
+    // ========== Indentation Mismatch Tests ==========
+
+    #[test]
+    fn test_indentation_mismatch_detected() {
+        let rule = create_enabled_rule();
+        // TOC entries are all at same indentation level, but headings have different levels
+        let content = r#"<!-- toc -->
+- [Hello](#hello)
+- [Another](#another)
+- [Heading](#heading)
+<!-- tocstop -->
+
+## Hello
+
+### Another
+
+## Heading
+"#;
+        let ctx = create_ctx(content);
+        let result = rule.check(&ctx).unwrap();
+        // Should detect indentation mismatch - "Another" is level 3 but has no indent
+        assert_eq!(result.len(), 1, "Should report indentation mismatch: {result:?}");
+        assert!(
+            result[0].message.contains("Indentation mismatch"),
+            "Message should mention indentation: {}",
+            result[0].message
+        );
+        assert!(
+            result[0].message.contains("Another"),
+            "Message should mention the entry: {}",
+            result[0].message
+        );
+    }
+
+    #[test]
+    fn test_indentation_mismatch_fixed() {
+        let rule = create_enabled_rule();
+        // TOC entries are all at same indentation level, but headings have different levels
+        let content = r#"<!-- toc -->
+- [Hello](#hello)
+- [Another](#another)
+- [Heading](#heading)
+<!-- tocstop -->
+
+## Hello
+
+### Another
+
+## Heading
+"#;
+        let ctx = create_ctx(content);
+        let fixed = rule.fix(&ctx).unwrap();
+        // After fix, "Another" should be indented
+        assert!(fixed.contains("- [Hello](#hello)"));
+        assert!(fixed.contains("  - [Another](#another)")); // Indented with 2 spaces
+        assert!(fixed.contains("- [Heading](#heading)"));
+    }
+
+    #[test]
+    fn test_no_indentation_mismatch_when_correct() {
+        let rule = create_enabled_rule();
+        // TOC has correct indentation
+        let content = r#"<!-- toc -->
+- [Hello](#hello)
+  - [Another](#another)
+- [Heading](#heading)
+<!-- tocstop -->
+
+## Hello
+
+### Another
+
+## Heading
+"#;
+        let ctx = create_ctx(content);
+        let result = rule.check(&ctx).unwrap();
+        // Should not report any issues - indentation is correct
+        assert!(result.is_empty(), "Should not report issues: {result:?}");
+    }
+
+    // ========== Order Mismatch Tests ==========
+
+    #[test]
+    fn test_order_mismatch_detected() {
+        let rule = create_enabled_rule();
+        let content = r#"# Title
+
+<!-- toc -->
+
+- [Section B](#section-b)
+- [Section A](#section-a)
+
+<!-- tocstop -->
+
+## Section A
+
+Content A.
+
+## Section B
+
+Content B.
+"#;
+        let ctx = create_ctx(content);
+        let result = rule.check(&ctx).unwrap();
+        // Should detect order mismatch - Section B appears before Section A in TOC
+        // but Section A comes first in document
+        assert!(!result.is_empty(), "Should detect order mismatch");
+    }
+
+    #[test]
+    fn test_order_mismatch_ignored_when_disabled() {
+        let mut rule = create_enabled_rule();
+        rule.enforce_order = false;
+        let content = r#"# Title
+
+<!-- toc -->
+
+- [Section B](#section-b)
+- [Section A](#section-a)
+
+<!-- tocstop -->
+
+## Section A
+
+Content A.
+
+## Section B
+
+Content B.
+"#;
+        let ctx = create_ctx(content);
+        let result = rule.check(&ctx).unwrap();
+        // With enforce_order=false, order mismatches should be ignored
+        assert!(result.is_empty(), "Should not report order mismatch when disabled");
+    }
+
+    // ========== Unicode and Special Characters Tests ==========
+
+    #[test]
+    fn test_unicode_headings() {
+        let rule = create_enabled_rule();
+        let content = r#"# Title
+
+<!-- toc -->
+
+- [日本語の見出し](#日本語の見出し)
+- [Émojis 🎉](#émojis-)
+
+<!-- tocstop -->
+
+## 日本語の見出し
+
+Japanese content.
+
+## Émojis 🎉
+
+Content with emojis.
+"#;
+        let ctx = create_ctx(content);
+        let result = rule.check(&ctx).unwrap();
+        // Should handle unicode correctly
+        assert!(result.is_empty(), "Should handle unicode headings");
+    }
+
+    #[test]
+    fn test_special_characters_in_headings() {
+        let rule = create_enabled_rule();
+        let content = r#"# Title
+
+<!-- toc -->
+
+- [What's New?](#whats-new)
+- [C++ Guide](#c-guide)
+
+<!-- tocstop -->
+
+## What's New?
+
+News content.
+
+## C++ Guide
+
+C++ content.
+"#;
+        let ctx = create_ctx(content);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty(), "Should handle special characters");
+    }
+
+    #[test]
+    fn test_code_spans_in_headings() {
+        let rule = create_enabled_rule();
+        let content = r#"# Title
+
+<!-- toc -->
+
+- [`check [PATHS...]`](#check-paths)
+
+<!-- tocstop -->
+
+## `check [PATHS...]`
+
+Command documentation.
+"#;
+        let ctx = create_ctx(content);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty(), "Should handle code spans in headings with brackets");
+    }
+
+    // ========== Config Tests ==========
+
+    #[test]
+    fn test_from_config_defaults() {
+        let config = crate::config::Config::default();
+        let rule = MD073TocValidation::from_config(&config);
+        let rule = rule.as_any().downcast_ref::<MD073TocValidation>().unwrap();
+
+        assert_eq!(rule.min_level, 2);
+        assert_eq!(rule.max_level, 4);
+        assert!(rule.enforce_order);
+        assert_eq!(rule.indent, 2);
+    }
+
+    #[test]
+    fn test_indent_from_md007_config() {
+        use crate::config::{Config, RuleConfig};
+        use std::collections::BTreeMap;
+
+        let mut config = Config::default();
+
+        // Set MD007 indent to 4
+        let mut md007_values = BTreeMap::new();
+        md007_values.insert("indent".to_string(), toml::Value::Integer(4));
+        config.rules.insert(
+            "MD007".to_string(),
+            RuleConfig {
+                severity: None,
+                values: md007_values,
+            },
+        );
+
+        let rule = MD073TocValidation::from_config(&config);
+        let rule = rule.as_any().downcast_ref::<MD073TocValidation>().unwrap();
+
+        assert_eq!(rule.indent, 4, "Should read indent from MD007 config");
+    }
+
+    #[test]
+    fn test_indent_md073_overrides_md007() {
+        use crate::config::{Config, RuleConfig};
+        use std::collections::BTreeMap;
+
+        let mut config = Config::default();
+
+        // Set MD007 indent to 4
+        let mut md007_values = BTreeMap::new();
+        md007_values.insert("indent".to_string(), toml::Value::Integer(4));
+        config.rules.insert(
+            "MD007".to_string(),
+            RuleConfig {
+                severity: None,
+                values: md007_values,
+            },
+        );
+
+        // Set MD073 indent to 3 (should override MD007)
+        let mut md073_values = BTreeMap::new();
+        md073_values.insert("enabled".to_string(), toml::Value::Boolean(true));
+        md073_values.insert("indent".to_string(), toml::Value::Integer(3));
+        config.rules.insert(
+            "MD073".to_string(),
+            RuleConfig {
+                severity: None,
+                values: md073_values,
+            },
+        );
+
+        let rule = MD073TocValidation::from_config(&config);
+        let rule = rule.as_any().downcast_ref::<MD073TocValidation>().unwrap();
+
+        assert_eq!(rule.indent, 3, "MD073 indent should override MD007");
+    }
+
+    #[test]
+    fn test_generate_toc_with_4_space_indent() {
+        let mut rule = create_enabled_rule();
+        rule.indent = 4;
+
+        let content = r#"<!-- toc -->
+
+<!-- tocstop -->
+
+## Level 2
+
+### Level 3
+
+#### Level 4
+
+## Another Level 2
+"#;
+        let ctx = create_ctx(content);
+        let region = rule.detect_toc_region(&ctx).unwrap();
+        let expected = rule.build_expected_toc(&ctx, &region);
+        let toc = rule.generate_toc(&expected);
+
+        // With 4-space indent:
+        // Level 2 = 0 spaces (base level)
+        // Level 3 = 4 spaces
+        // Level 4 = 8 spaces
+        assert!(toc.contains("- [Level 2](#level-2)"), "Level 2 should have no indent");
+        assert!(
+            toc.contains("    - [Level 3](#level-3)"),
+            "Level 3 should have 4-space indent"
+        );
+        assert!(
+            toc.contains("        - [Level 4](#level-4)"),
+            "Level 4 should have 8-space indent"
+        );
+        assert!(toc.contains("- [Another Level 2](#another-level-2)"));
+    }
+
+    #[test]
+    fn test_validate_toc_with_4_space_indent() {
+        let mut rule = create_enabled_rule();
+        rule.indent = 4;
+
+        // TOC with correct 4-space indentation
+        let content = r#"<!-- toc -->
+- [Hello](#hello)
+    - [Another](#another)
+- [Heading](#heading)
+<!-- tocstop -->
+
+## Hello
+
+### Another
+
+## Heading
+"#;
+        let ctx = create_ctx(content);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should accept 4-space indent when configured: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_toc_wrong_indent_with_4_space_config() {
+        let mut rule = create_enabled_rule();
+        rule.indent = 4;
+
+        // TOC with 2-space indentation (wrong when 4-space is configured)
+        let content = r#"<!-- toc -->
+- [Hello](#hello)
+  - [Another](#another)
+- [Heading](#heading)
+<!-- tocstop -->
+
+## Hello
+
+### Another
+
+## Heading
+"#;
+        let ctx = create_ctx(content);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1, "Should detect wrong indent");
+        assert!(
+            result[0].message.contains("Indentation mismatch"),
+            "Should report indentation mismatch: {}",
+            result[0].message
+        );
+        assert!(
+            result[0].message.contains("expected 4 spaces"),
+            "Should mention expected 4 spaces: {}",
+            result[0].message
+        );
+    }
+
+    // ========== Markdown Stripping Tests ==========
+
+    #[test]
+    fn test_strip_markdown_formatting_link() {
+        let result = strip_markdown_formatting("Tool: [terminal](https://example.com)");
+        assert_eq!(result, "Tool: terminal");
+    }
+
+    #[test]
+    fn test_strip_markdown_formatting_bold() {
+        let result = strip_markdown_formatting("This is **bold** text");
+        assert_eq!(result, "This is bold text");
+
+        let result = strip_markdown_formatting("This is __bold__ text");
+        assert_eq!(result, "This is bold text");
+    }
+
+    #[test]
+    fn test_strip_markdown_formatting_italic() {
+        let result = strip_markdown_formatting("This is *italic* text");
+        assert_eq!(result, "This is italic text");
+
+        let result = strip_markdown_formatting("This is _italic_ text");
+        assert_eq!(result, "This is italic text");
+    }
+
+    #[test]
+    fn test_strip_markdown_formatting_code_span() {
+        let result = strip_markdown_formatting("Use the `format` function");
+        assert_eq!(result, "Use the format function");
+    }
+
+    #[test]
+    fn test_strip_markdown_formatting_image() {
+        let result = strip_markdown_formatting("See ![logo](image.png) for details");
+        assert_eq!(result, "See logo for details");
+    }
+
+    #[test]
+    fn test_strip_markdown_formatting_reference_link() {
+        let result = strip_markdown_formatting("See [documentation][docs] for details");
+        assert_eq!(result, "See documentation for details");
+    }
+
+    #[test]
+    fn test_strip_markdown_formatting_combined() {
+        // Link is stripped first, leaving bold, then bold is stripped
+        let result = strip_markdown_formatting("Tool: [**terminal**](https://example.com)");
+        assert_eq!(result, "Tool: terminal");
+    }
+
+    #[test]
+    fn test_toc_with_link_in_heading_matches_stripped_text() {
+        let rule = create_enabled_rule();
+
+        // TOC entry text matches the stripped heading text
+        let content = r#"# Title
+
+<!-- toc -->
+
+- [Tool: terminal](#tool-terminal)
+
+<!-- tocstop -->
+
+## Tool: [terminal](https://example.com)
+
+Content here.
+"#;
+        let ctx = create_ctx(content);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Stripped heading text should match TOC entry: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_toc_with_simplified_text_still_mismatches() {
+        let rule = create_enabled_rule();
+
+        // TOC entry "terminal" does NOT match stripped heading "Tool: terminal"
+        let content = r#"# Title
+
+<!-- toc -->
+
+- [terminal](#tool-terminal)
+
+<!-- tocstop -->
+
+## Tool: [terminal](https://example.com)
+
+Content here.
+"#;
+        let ctx = create_ctx(content);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1, "Should report text mismatch");
+        assert!(result[0].message.contains("Text mismatch"));
+    }
+
+    #[test]
+    fn test_fix_generates_stripped_toc_entries() {
+        let rule = MD073TocValidation::new();
+        let content = r#"# Title
+
+<!-- toc -->
+
+<!-- tocstop -->
+
+## Tool: [busybox](https://www.busybox.net/)
+
+Content.
+
+## Tool: [mount](https://en.wikipedia.org/wiki/Mount)
+
+More content.
+"#;
+        let ctx = create_ctx(content);
+        let fixed = rule.fix(&ctx).unwrap();
+
+        // Generated TOC should have stripped text (links removed)
+        assert!(
+            fixed.contains("- [Tool: busybox](#tool-busybox)"),
+            "TOC entry should have stripped link text"
+        );
+        assert!(
+            fixed.contains("- [Tool: mount](#tool-mount)"),
+            "TOC entry should have stripped link text"
+        );
+        // TOC entries should NOT contain the URL (the actual headings in the document still will)
+        // Check only within the TOC region (between toc markers)
+        let toc_start = fixed.find("<!-- toc -->").unwrap();
+        let toc_end = fixed.find("<!-- tocstop -->").unwrap();
+        let toc_content = &fixed[toc_start..toc_end];
+        assert!(
+            !toc_content.contains("busybox.net"),
+            "TOC should not contain URLs: {toc_content}"
+        );
+        assert!(
+            !toc_content.contains("wikipedia.org"),
+            "TOC should not contain URLs: {toc_content}"
+        );
+    }
+
+    #[test]
+    fn test_fix_with_bold_in_heading() {
+        let rule = MD073TocValidation::new();
+        let content = r#"# Title
+
+<!-- toc -->
+
+<!-- tocstop -->
+
+## **Important** Section
+
+Content.
+"#;
+        let ctx = create_ctx(content);
+        let fixed = rule.fix(&ctx).unwrap();
+
+        // Generated TOC preserves bold markers in display text; anchor strips them.
+        assert!(fixed.contains("- [**Important** Section](#important-section)"));
+    }
+
+    #[test]
+    fn test_fix_with_code_in_heading() {
+        let rule = MD073TocValidation::new();
+        let content = r#"# Title
+
+<!-- toc -->
+
+<!-- tocstop -->
+
+## Using `async` Functions
+
+Content.
+"#;
+        let ctx = create_ctx(content);
+        let fixed = rule.fix(&ctx).unwrap();
+
+        // Generated TOC preserves code ticks in display text; anchor strips them.
+        assert!(fixed.contains("- [Using `async` Functions](#using-async-functions)"));
+    }
+
+    // ========== Custom Anchor Tests ==========
+
+    #[test]
+    fn test_custom_anchor_id_respected() {
+        let rule = create_enabled_rule();
+        let content = r#"# Title
+
+<!-- toc -->
+
+- [My Section](#my-custom-anchor)
+
+<!-- tocstop -->
+
+## My Section {#my-custom-anchor}
+
+Content here.
+"#;
+        let ctx = create_ctx(content);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty(), "Should respect custom anchor IDs: {result:?}");
+    }
+
+    #[test]
+    fn test_custom_anchor_id_in_generated_toc() {
+        let rule = create_enabled_rule();
+        let content = r#"# Title
+
+<!-- toc -->
+
+<!-- tocstop -->
+
+## First Section {#custom-first}
+
+Content.
+
+## Second Section {#another-custom}
+
+More content.
+"#;
+        let ctx = create_ctx(content);
+        let fixed = rule.fix(&ctx).unwrap();
+        assert!(fixed.contains("- [First Section](#custom-first)"));
+        assert!(fixed.contains("- [Second Section](#another-custom)"));
+    }
+
+    #[test]
+    fn test_mixed_custom_and_generated_anchors() {
+        let rule = create_enabled_rule();
+        let content = r#"# Title
+
+<!-- toc -->
+
+- [Custom Section](#my-id)
+- [Normal Section](#normal-section)
+
+<!-- tocstop -->
+
+## Custom Section {#my-id}
+
+Content.
+
+## Normal Section
+
+More content.
+"#;
+        let ctx = create_ctx(content);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty(), "Should handle mixed custom and generated anchors");
+    }
+
+    // ========== Anchor Generation Tests ==========
+
+    #[test]
+    fn test_github_anchor_style() {
+        let rule = create_enabled_rule();
+
+        let content = r#"<!-- toc -->
+
+<!-- tocstop -->
+
+## Test_With_Underscores
+
+Content.
+"#;
+        let ctx = create_ctx(content);
+        let region = rule.detect_toc_region(&ctx).unwrap();
+        let expected = rule.build_expected_toc(&ctx, &region);
+
+        // GitHub-style anchors preserve underscores
+        assert_eq!(expected[0].anchor, "test_with_underscores");
+    }
+
+    // ========== Stress Tests ==========
+
+    #[test]
+    fn test_stress_many_headings() {
+        let rule = create_enabled_rule();
+
+        // Generate a document with 150 headings
+        let mut content = String::from("# Title\n\n<!-- toc -->\n\n<!-- tocstop -->\n\n");
+
+        for i in 1..=150 {
+            content.push_str(&format!("## Heading Number {i}\n\nContent for section {i}.\n\n"));
+        }
+
+        let ctx = create_ctx(&content);
+
+        // Should not panic or timeout
+        let result = rule.check(&ctx).unwrap();
+
+        // Should report missing entries for all 150 headings
+        assert_eq!(result.len(), 1, "Should report single warning for TOC");
+        assert!(result[0].message.contains("Missing entry"));
+
+        // Fix should generate TOC with 150 entries
+        let fixed = rule.fix(&ctx).unwrap();
+        assert!(fixed.contains("- [Heading Number 1](#heading-number-1)"));
+        assert!(fixed.contains("- [Heading Number 100](#heading-number-100)"));
+        assert!(fixed.contains("- [Heading Number 150](#heading-number-150)"));
+    }
+
+    #[test]
+    fn test_stress_deeply_nested() {
+        let rule = create_enabled_rule();
+        let content = r#"# Title
+
+<!-- toc -->
+
+<!-- tocstop -->
+
+## Level 2 A
+
+### Level 3 A
+
+#### Level 4 A
+
+## Level 2 B
+
+### Level 3 B
+
+#### Level 4 B
+
+## Level 2 C
+
+### Level 3 C
+
+#### Level 4 C
+
+## Level 2 D
+
+### Level 3 D
+
+#### Level 4 D
+"#;
+        let ctx = create_ctx(content);
+        let fixed = rule.fix(&ctx).unwrap();
+
+        // Check nested indentation is correct
+        assert!(fixed.contains("- [Level 2 A](#level-2-a)"));
+        assert!(fixed.contains("  - [Level 3 A](#level-3-a)"));
+        assert!(fixed.contains("    - [Level 4 A](#level-4-a)"));
+        assert!(fixed.contains("- [Level 2 D](#level-2-d)"));
+        assert!(fixed.contains("  - [Level 3 D](#level-3-d)"));
+        assert!(fixed.contains("    - [Level 4 D](#level-4-d)"));
+    }
+
+    // ==================== Duplicate TOC anchors ====================
+
+    #[test]
+    fn test_duplicate_toc_anchors_produce_correct_diagnostics() {
+        let rule = create_enabled_rule();
+        // Document has headings "Example", "Another", "Example" which produce anchors:
+        // "example", "another", "example-1"
+        // TOC incorrectly uses #example twice instead of #example and #example-1
+        let content = r#"# Document
+
+<!-- toc -->
+
+- [Example](#example)
+- [Another](#another)
+- [Example](#example)
+
+<!-- tocstop -->
+
+## Example
+First.
+
+## Another
+Middle.
+
+## Example
+Second.
+"#;
+        let ctx = create_ctx(content);
+        let result = rule.check(&ctx).unwrap();
+
+        // The TOC has #example twice but expected has #example and #example-1.
+        // Should report that #example-1 is missing from the TOC.
+        assert!(!result.is_empty(), "Should detect mismatch with duplicate TOC anchors");
+        assert!(
+            result[0].message.contains("Missing entry") || result[0].message.contains("Stale entry"),
+            "Should report missing or stale entries for duplicate anchors. Got: {}",
+            result[0].message
+        );
+    }
+
+    // ==================== Multi-backtick code spans ====================
+
+    #[test]
+    fn test_strip_double_backtick_code_span() {
+        // Double-backtick code spans should be stripped
+        let result = strip_markdown_formatting("Using ``code with ` backtick``");
+        assert_eq!(
+            result, "Using code with ` backtick",
+            "Should strip double-backtick code spans"
+        );
+    }
+
+    #[test]
+    fn test_strip_triple_backtick_code_span() {
+        // Triple-backtick code spans should be stripped
+        let result = strip_markdown_formatting("Using ```code with `` backticks```");
+        assert_eq!(
+            result, "Using code with `` backticks",
+            "Should strip triple-backtick code spans"
+        );
+    }
+
+    #[test]
+    fn test_toc_with_double_backtick_heading() {
+        let rule = create_enabled_rule();
+        // Use fix() to generate the correct TOC (including anchor), then check()
+        // should produce no warnings on the fixed output.
+        let content = r#"# Title
+
+<!-- toc -->
+
+<!-- tocstop -->
+
+## Using ``code with ` backtick``
+
+Content here.
+"#;
+        let ctx = create_ctx(content);
+        // The heading uses double-backtick code span: ``code with ` backtick``
+        // TOC display text preserves the code span; anchor is derived from raw text.
+        let fixed = rule.fix(&ctx).unwrap();
+
+        // Verify that the generated TOC entry preserves the double-backtick code span
+        // in the display text.
+        let toc_start = fixed.find("<!-- toc -->").unwrap();
+        let toc_end = fixed.find("<!-- tocstop -->").unwrap();
+        let toc_content = &fixed[toc_start..toc_end];
+        assert!(
+            toc_content.contains("``code with ` backtick``"),
+            "Fix should preserve double-backtick code span in TOC display text. Got: {toc_content}"
+        );
+
+        // After fix, check() must produce no warnings (idempotency check)
+        let ctx2 = create_ctx(&fixed);
+        let result = rule.check(&ctx2).unwrap();
+        assert!(
+            result.is_empty(),
+            "check() should not warn on fixed output. Warnings: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_stress_many_duplicates() {
+        let rule = create_enabled_rule();
+
+        // Generate 50 headings with the same text
+        let mut content = String::from("# Title\n\n<!-- toc -->\n\n<!-- tocstop -->\n\n");
+        for _ in 0..50 {
+            content.push_str("## FAQ\n\nContent.\n\n");
+        }
+
+        let ctx = create_ctx(&content);
+        let region = rule.detect_toc_region(&ctx).unwrap();
+        let expected = rule.build_expected_toc(&ctx, &region);
+
+        // Should generate unique anchors for all 50
+        assert_eq!(expected.len(), 50);
+        assert_eq!(expected[0].anchor, "faq");
+        assert_eq!(expected[1].anchor, "faq-1");
+        assert_eq!(expected[49].anchor, "faq-49");
+    }
+
+    /// Core invariant: for every warning with a Fix, fix() must produce
+    /// output consistent with applying that fix directly.
+    #[test]
+    fn test_roundtrip_check_and_fix_alignment() {
+        let rule = create_enabled_rule();
+
+        let inputs = [
+            // Stale entry
+            "# Title\n\n<!-- toc -->\n- [Old Section](#old-section)\n<!-- tocstop -->\n\n## New Section\n",
+            // Missing entry
+            "# Title\n\n<!-- toc -->\n<!-- tocstop -->\n\n## One\n\n## Two\n",
+            // Text mismatch
+            "# Title\n\n<!-- toc -->\n- [Wrong Text](#real-section)\n<!-- tocstop -->\n\n## Real Section\n",
+            // Already correct (no warnings, no change)
+            "# Title\n\n<!-- toc -->\n- [One](#one)\n- [Two](#two)\n<!-- tocstop -->\n\n## One\n\n## Two\n",
+        ];
+
+        for input in &inputs {
+            let ctx = create_ctx(input);
+            let fixed = rule.fix(&ctx).unwrap();
+
+            // Idempotency: fix(fix(x)) == fix(x)
+            let ctx2 = create_ctx(&fixed);
+            let fixed_twice = rule.fix(&ctx2).unwrap();
+            assert_eq!(
+                fixed, fixed_twice,
+                "fix() is not idempotent for input: {input:?}\nfirst:  {fixed:?}\nsecond: {fixed_twice:?}"
+            );
+
+            // After fix, check() should produce no warnings
+            let warnings_after = rule.check(&ctx2).unwrap();
+            assert!(
+                warnings_after.is_empty(),
+                "check() should return no warnings after fix() for input: {input:?}\nfixed: {fixed:?}\nwarnings: {warnings_after:?}"
+            );
+        }
+    }
+
+    /// If a TOC has no mismatches, check() emits no warnings and fix()
+    /// returns content unchanged.
+    #[test]
+    fn test_no_mismatch_preserves_content() {
+        let rule = create_enabled_rule();
+
+        let content = "# Title\n\n<!-- toc -->\n- [First Section](#first-section)\n- [Second Section](#second-section)\n<!-- tocstop -->\n\n## First Section\n\ntext\n\n## Second Section\n\ntext\n";
+        let ctx = create_ctx(content);
+
+        let warnings = rule.check(&ctx).unwrap();
+        assert!(warnings.is_empty(), "No mismatches should emit no warnings");
+
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, content, "Content should be unchanged when TOC matches headings");
+    }
+
+    /// Inline-disabled TOC should not be modified by fix().
+    #[test]
+    fn test_inline_disable_preserves_toc() {
+        let rule = create_enabled_rule();
+
+        // TOC with a stale entry, but MD073 disabled for the TOC region
+        let content = "# Title\n\n<!-- rumdl-disable MD073 -->\n<!-- toc -->\n- [Stale](#stale)\n<!-- tocstop -->\n<!-- rumdl-enable MD073 -->\n\n## Real\n";
+        let ctx = create_ctx(content);
+
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, content, "TOC in a disabled region should be preserved exactly");
+    }
+
+    // ========== Inline Formatting Preservation Tests (#634) ==========
+
+    /// Backticks in a heading must be preserved in the TOC display text.
+    /// The anchor is generated from the raw heading text (which includes backticks)
+    /// and must still use the stripped form.
+    #[test]
+    fn test_fix_code_ticks_preserved_in_toc_display_text() {
+        let rule = MD073TocValidation::new();
+        let content = r#"# Title
+
+<!-- toc -->
+
+<!-- tocstop -->
+
+### `my header`
+
+Content.
+"#;
+        let ctx = create_ctx(content);
+        let fixed = rule.fix(&ctx).unwrap();
+
+        assert!(
+            fixed.contains("- [`my header`](#my-header)"),
+            "Code ticks must be preserved in TOC display text. Got: {fixed}"
+        );
+    }
+
+    /// A correct user-written TOC entry with code ticks must not be re-flagged.
+    #[test]
+    fn test_validate_toc_with_code_ticks_is_valid() {
+        let rule = create_enabled_rule();
+        let content = r#"# Title
+
+<!-- toc -->
+
+- [`my header`](#my-header)
+
+<!-- tocstop -->
+
+## `my header`
+
+Content.
+"#;
+        let ctx = create_ctx(content);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "A TOC entry with preserved code ticks should be accepted as valid: {result:?}"
+        );
+    }
+
+    /// A heading with bold/italic preserves emphasis markers in the TOC display text;
+    /// the anchor is generated from the raw (formatted) heading text and still uses
+    /// the stripped form.
+    #[test]
+    fn test_fix_emphasis_preserved_in_toc_display_text() {
+        let rule = MD073TocValidation::new();
+        let content = r#"# Title
+
+<!-- toc -->
+
+<!-- tocstop -->
+
+## **bold** and *italic*
+
+Content.
+"#;
+        let ctx = create_ctx(content);
+        let fixed = rule.fix(&ctx).unwrap();
+
+        assert!(
+            fixed.contains("- [**bold** and *italic*](#bold-and-italic)"),
+            "Emphasis markers must be preserved in TOC display text. Got: {fixed}"
+        );
+    }
+
+    /// A heading containing a link must have the link stripped from the TOC display
+    /// text (nested links are invalid in Markdown).
+    #[test]
+    fn test_fix_link_in_heading_is_stripped() {
+        let rule = MD073TocValidation::new();
+        let content = r#"# Title
+
+<!-- toc -->
+
+<!-- tocstop -->
+
+## See [docs](http://example.com) for details
+
+Content.
+"#;
+        let ctx = create_ctx(content);
+        let fixed = rule.fix(&ctx).unwrap();
+
+        assert!(
+            fixed.contains("- [See docs for details](#see-docs-for-details)"),
+            "Link must be stripped from TOC display text. Got: {fixed}"
+        );
+        // Ensure no URL leaks into TOC entry
+        let toc_start = fixed.find("<!-- toc -->").unwrap();
+        let toc_end = fixed.find("<!-- tocstop -->").unwrap();
+        let toc_content = &fixed[toc_start..toc_end];
+        assert!(
+            !toc_content.contains("http://example.com"),
+            "TOC should not contain link URL: {toc_content}"
+        );
+    }
+
+    /// An image in a heading must still be stripped from the TOC display text.
+    #[test]
+    fn test_fix_image_in_heading_is_stripped() {
+        let rule = MD073TocValidation::new();
+        let content = r#"# Title
+
+<!-- toc -->
+
+<!-- tocstop -->
+
+## Section ![icon](icon.png) Title
+
+Content.
+"#;
+        let ctx = create_ctx(content);
+        let fixed = rule.fix(&ctx).unwrap();
+
+        assert!(
+            fixed.contains("- [Section icon Title](#section-icon-title)"),
+            "Image must be stripped from TOC display text. Got: {fixed}"
+        );
+    }
+
+    /// Running fix() twice on a document with inline-formatted headings must
+    /// produce stable output (idempotency).
+    #[test]
+    fn test_fix_idempotent_with_inline_formatting() {
+        let rule = MD073TocValidation::new();
+        let content = r#"# Title
+
+<!-- toc -->
+
+<!-- tocstop -->
+
+## `code` heading
+
+### **bold** heading
+
+## See [link](http://x.com)
+
+"#;
+        let ctx = create_ctx(content);
+        let fixed1 = rule.fix(&ctx).unwrap();
+        let ctx2 = create_ctx(&fixed1);
+        let fixed2 = rule.fix(&ctx2).unwrap();
+
+        assert_eq!(fixed1, fixed2, "fix() must be idempotent for inline-formatted headings");
+
+        // After fix, check() must produce no warnings
+        let warnings = rule.check(&ctx2).unwrap();
+        assert!(
+            warnings.is_empty(),
+            "check() must not warn after fix() for inline-formatted headings: {warnings:?}"
+        );
+    }
+
+    /// Link-like syntax inside a code span must not be stripped, because it is
+    /// literal content of the code span and not a real Markdown link.
+    #[test]
+    fn test_link_inside_code_span_preserved_in_toc() {
+        let rule = MD073TocValidation::new();
+        let content = r#"# Title
+
+<!-- toc -->
+
+<!-- tocstop -->
+
+## Use `[foo](bar)` syntax
+
+Content.
+"#;
+        let ctx = create_ctx(content);
+        let fixed = rule.fix(&ctx).unwrap();
+
+        // The code span `[foo](bar)` must survive intact in the TOC display text.
+        // The anchor is generated from the raw heading text by the GitHub algorithm,
+        // which strips backtick, bracket, and paren characters. Verify only the
+        // display-text preservation, not the exact anchor (which depends on the anchor
+        // generation algorithm's treatment of non-alphanumeric chars in code spans).
+        let toc_start = fixed.find("<!-- toc -->").unwrap();
+        let toc_end = fixed.find("<!-- tocstop -->").unwrap();
+        let toc_content = &fixed[toc_start..toc_end];
+        assert!(
+            toc_content.contains("Use `[foo](bar)` syntax"),
+            "Link-like text inside code span must be preserved in TOC display text. Got: {toc_content}"
+        );
+        // Also ensure the real link stripping (outside code spans) still works
+        assert!(
+            !toc_content.contains("http://"),
+            "Real links (outside code spans) should be stripped: {toc_content}"
+        );
+    }
+
+    // ========== HTML anchor targets ==========
+
+    /// The TOC region after `fix`, without the markers and surrounding blank lines.
+    fn generated_toc(content: &str) -> String {
+        let rule = create_enabled_rule();
+        let ctx = create_ctx(content);
+        let fixed = rule.fix(&ctx).unwrap();
+        let start = fixed.find("<!-- toc -->").unwrap() + "<!-- toc -->".len();
+        let end = fixed.find("<!-- tocstop -->").unwrap();
+        fixed[start..end].trim().to_string()
+    }
+
+    fn check_toc(content: &str) -> Vec<LintWarning> {
+        let rule = create_enabled_rule();
+        let ctx = create_ctx(content);
+        rule.check(&ctx).unwrap()
+    }
+
+    #[test]
+    fn test_toc_may_target_the_generated_slug_of_a_heading_with_an_html_anchor() {
+        // GitHub gives the heading both `#cheat-sheets` (generated) and `#cheatsheets`
+        // (the element's own id), so a TOC written against either reaches it.
+        for anchor in ["cheat-sheets", "cheatsheets"] {
+            let content = format!(
+                "# Title\n\n<!-- toc -->\n\n- [Cheat Sheets](#{anchor})\n\n<!-- tocstop -->\n\n## <a name=\"cheatsheets\"></a>Cheat Sheets\n\nContent.\n"
+            );
+            let result = check_toc(&content);
+            assert!(result.is_empty(), "#{anchor} reaches the heading, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_every_anchor_element_on_a_heading_is_a_valid_target() {
+        for anchor in ["old", "older", "foo"] {
+            let content = format!(
+                "# Title\n\n<!-- toc -->\n\n- [Foo](#{anchor})\n\n<!-- tocstop -->\n\n## <a name=\"old\"></a><a id=\"older\"></a>Foo\n"
+            );
+            let result = check_toc(&content);
+            assert!(result.is_empty(), "#{anchor} reaches the heading, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_generated_toc_prefers_the_explicit_html_anchor() {
+        let toc =
+            generated_toc("# Title\n\n<!-- toc -->\n<!-- tocstop -->\n\n## <a name=\"cheatsheets\"></a>Cheat Sheets\n");
+        assert_eq!(toc, "- [Cheat Sheets](#cheatsheets)");
+    }
+
+    #[test]
+    fn test_regeneration_keeps_an_existing_anchor_that_reaches_its_heading() {
+        // The unrelated missing entry forces a rewrite; the entry already reaching its
+        // heading is not switched to the other valid spelling on the way.
+        let content = "# Title\n\n<!-- toc -->\n\n- [Cheat Sheets](#cheat-sheets)\n\n<!-- tocstop -->\n\n## <a name=\"cheatsheets\"></a>Cheat Sheets\n\n## Other\n";
+        assert_eq!(
+            generated_toc(content),
+            "- [Cheat Sheets](#cheat-sheets)\n- [Other](#other)"
+        );
+    }
+
+    #[test]
+    fn test_an_attribute_merely_ending_in_id_or_name_is_not_an_anchor() {
+        let toc = generated_toc(
+            "# Title\n\n<!-- toc -->\n<!-- tocstop -->\n\n## Foo<a data-id=\"tracking\" data-name=\"pixel\"></a>\n",
+        );
+        assert_eq!(toc, "- [Foo](#foo)");
+
+        let result = check_toc(
+            "# Title\n\n<!-- toc -->\n\n- [Foo](#tracking)\n\n<!-- tocstop -->\n\n## Foo<a data-id=\"tracking\"></a>\n",
+        );
+        assert_eq!(result.len(), 1, "{result:?}");
+        assert!(
+            result[0].message.contains("Stale entry: 'Foo'"),
+            "{}",
+            result[0].message
+        );
+        assert!(
+            result[0].message.contains("Missing entry: 'Foo'"),
+            "{}",
+            result[0].message
+        );
+    }
+
+    #[test]
+    fn test_an_empty_id_is_not_an_anchor() {
+        let toc = generated_toc("# Title\n\n<!-- toc -->\n<!-- tocstop -->\n\n## Foo<a id=\"\"></a>\n");
+        assert_eq!(toc, "- [Foo](#foo)");
+    }
+
+    #[test]
+    fn test_an_explicit_anchor_still_consumes_the_generated_slug() {
+        // GitHub numbers duplicate generated slugs whether or not the first heading also
+        // carries its own id, so the second `Same` is `same-1`, never `same`.
+        let toc =
+            generated_toc("# Title\n\n<!-- toc -->\n<!-- tocstop -->\n\n## Same<a id=\"stable\"></a>\n\n## Same\n");
+        assert_eq!(toc, "- [Same](#stable)\n- [Same](#same-1)");
+    }
+
+    #[test]
+    fn test_anchor_markup_inside_a_code_span_is_heading_text() {
+        let heading = "Showing `<a id=\"literal\"></a>` syntax";
+        let toc = generated_toc(&format!("# Title\n\n<!-- toc -->\n<!-- tocstop -->\n\n## {heading}\n"));
+        let slug = AnchorStyle::GitHub.generate_fragment(heading);
+        assert_ne!(slug, "literal");
+        assert_eq!(toc, format!("- [{heading}](#{slug})"));
+    }
+
+    #[test]
+    fn test_anchor_markup_inside_an_html_comment_is_not_a_target() {
+        let heading = "Foo <!-- <a id=\"hidden\"></a> -->";
+        let toc = generated_toc(&format!("# Title\n\n<!-- toc -->\n<!-- tocstop -->\n\n## {heading}\n"));
+        let slug = AnchorStyle::GitHub.generate_fragment(heading);
+        assert_ne!(slug, "hidden");
+        assert_eq!(toc, format!("- [{heading}](#{slug})"));
+    }
+
+    #[test]
+    fn test_an_explicit_anchor_is_written_as_a_valid_link_destination() {
+        // A bare link destination cannot hold `)` or a space, so the anchor is
+        // percent-encoded on the way out, and the encoded entry reaches the heading
+        // again on the next check, so the generated TOC is stable.
+        let headings = "## Alpha<a id=\"foo)bar\"></a>\n\n## Beta<a id=\"has space\"></a>\n";
+        let toc = generated_toc(&format!("# Title\n\n<!-- toc -->\n<!-- tocstop -->\n\n{headings}"));
+        assert_eq!(toc, "- [Alpha](#foo%29bar)\n- [Beta](#has%20space)");
+
+        let result = check_toc(&format!(
+            "# Title\n\n<!-- toc -->\n\n{toc}\n\n<!-- tocstop -->\n\n{headings}"
+        ));
+        assert!(result.is_empty(), "{result:?}");
+    }
+
+    #[test]
+    fn test_regeneration_does_not_encode_an_encoded_entry_twice() {
+        // The entry reaching `foo)bar` is kept as written; the stale sibling forces
+        // the rewrite.
+        let content = "# Title\n\n<!-- toc -->\n\n- [Alpha](#foo%29bar)\n- [Gone](#gone)\n\n<!-- tocstop -->\n\n## Alpha<a id=\"foo)bar\"></a>\n";
+        assert_eq!(generated_toc(content), "- [Alpha](#foo%29bar)");
+    }
+
+    #[test]
+    fn test_a_backslash_escaped_anchor_element_defines_no_target() {
+        // `\<a ...>` renders as literal text, so `#example` reaches nothing.
+        let heading = "Show \\<a id=\"example\"></a> syntax";
+        let result = check_toc(&format!(
+            "# Title\n\n<!-- toc -->\n\n- [{heading}](#example)\n\n<!-- tocstop -->\n\n## {heading}\n"
+        ));
+        assert_eq!(result.len(), 1, "{result:?}");
+        assert!(result[0].message.contains("Stale entry"), "{}", result[0].message);
+
+        let toc = generated_toc(&format!("# Title\n\n<!-- toc -->\n<!-- tocstop -->\n\n## {heading}\n"));
+        let slug = AnchorStyle::GitHub.generate_fragment(heading);
+        assert_ne!(slug, "example");
+        assert_eq!(toc, format!("- [{heading}](#{slug})"));
+    }
+
+    #[test]
+    fn test_a_backslash_escaped_marker_is_text() {
+        // `\<!-- toc -->` renders as the literal text `<!-- toc -->`, so the pair
+        // below delimits no TOC region and the prose between them is left alone.
+        let content = "# Title\n\nWrite these lines:\n\n\\<!-- toc -->\n\nProse that must survive.\n\n\\<!-- tocstop -->\n\n## Alpha\n";
+        let result = check_toc(content);
+        assert!(result.is_empty(), "{result:?}");
+        assert_eq!(create_enabled_rule().fix(&create_ctx(content)).unwrap(), content);
+
+        // An even run of backslashes leaves the `<` itself unescaped, so the comment
+        // is rendered and the marker is real.
+        let toc = generated_toc("# Title\n\n\\\\<!-- toc -->\n<!-- tocstop -->\n\n## Alpha\n");
+        assert_eq!(toc, "- [Alpha](#alpha)");
+    }
+
+    #[test]
+    fn test_the_whitespace_beside_an_anchor_element_stays_in_the_heading_text() {
+        // `Foo<a id="alias"></a> Bar` renders as "Foo Bar", so an entry written
+        // that way is up to date and a regenerated entry reads the same.
+        let content =
+            "# Title\n\n<!-- toc -->\n- [Foo Bar](#foo-bar)\n<!-- tocstop -->\n\n## Foo<a id=\"alias\"></a> Bar\n";
+        let warnings = check_toc(content);
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        let toc = generated_toc("# Title\n\n<!-- toc -->\n<!-- tocstop -->\n\n## Foo<a id=\"alias\"></a> Bar\n");
+        assert_eq!(toc, "- [Foo Bar](#alias)");
+    }
+
+    #[test]
+    fn test_the_whitespace_an_anchor_element_leaves_at_either_end_is_part_of_the_slug() {
+        // `## Alpha <a id="x"></a>` renders as "Alpha", but GitHub slugs the text
+        // content with the space the element leaves, so the heading answers to
+        // `#alpha-` and `#x` and not to `#alpha`. A leading element likewise
+        // leaves `#-beta`.
+        let document = "# Title\n\n<!-- toc -->\n- [Alpha](#alpha-)\n- [Beta](#-beta)\n<!-- tocstop -->\n\n\
+                        ## Alpha <a id=\"x\"></a>\n\n## <a id=\"y\"></a> Beta\n";
+        let warnings = check_toc(document);
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        let trimmed = document.replace("#alpha-", "#alpha").replace("#-beta", "#beta");
+        assert_eq!(
+            check_toc(&trimmed).len(),
+            1,
+            "a TOC written against trimmed slugs is stale"
+        );
+
+        let toc = generated_toc(
+            "# Title\n\n<!-- toc -->\n<!-- tocstop -->\n\n## Alpha <a id=\"x\"></a>\n\n## <a id=\"y\"></a> Beta\n",
+        );
+        assert_eq!(toc, "- [Alpha](#x)\n- [Beta](#y)");
+    }
+
+    #[test]
+    fn test_a_heading_whose_text_slugs_to_nothing_gets_no_toc_entry() {
+        // An image's description becomes its alt text, in which markup is
+        // escaped, so `<a id="img">` inside it is no element and no target, and
+        // the heading's text content is empty: GitHub gives it no anchor at all.
+        // A heading no fragment can reach gets no entry, so the TOC converges
+        // instead of regenerating an `[](#)` entry on every run.
+        let body = "## ![<a id=\"img\"></a>](img.png)\n\n## ![](img.png)\n\n## Plain\n";
+        let toc = generated_toc(&format!("# Title\n\n<!-- toc -->\n<!-- tocstop -->\n\n{body}"));
+        assert_eq!(toc, "- [Plain](#plain)");
+
+        let warnings = check_toc(&format!(
+            "# Title\n\n<!-- toc -->\n- [Plain](#plain)\n<!-- tocstop -->\n\n{body}"
+        ));
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        let warnings = check_toc(&format!(
+            "# Title\n\n<!-- toc -->\n- [img](#img)\n- [Plain](#plain)\n<!-- tocstop -->\n\n{body}"
+        ));
+        assert_eq!(
+            warnings.len(),
+            1,
+            "an entry for the image's anchor is stale: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_an_anchor_inside_another_tags_attribute_value_is_heading_text() {
+        // The `<a>` sits in the span's `title` value, so the browser makes no
+        // element from it: the heading answers to `#foo` and keeps its bytes.
+        let toc = generated_toc(
+            "# Title\n\n<!-- toc -->\n<!-- tocstop -->\n\n## <span title='<a id=\"fake\"></a>'>Foo</span>\n",
+        );
+        assert_eq!(toc, "- [<span title='<a id=\"fake\"></a>'>Foo</span>](#foo)");
+    }
+
+    #[test]
+    fn test_a_heading_with_a_custom_id_keeps_its_html_anchor_as_a_target() {
+        // `{#new}` replaces the generated slug, but the element's own `name` is still
+        // an anchor in the rendered page, so a TOC entry may use either of the two.
+        let heading = "<a name=\"old\"></a>My Section {#new}";
+        let result = check_toc(&format!(
+            "# Title\n\n<!-- toc -->\n\n- [My Section](#old)\n\n<!-- tocstop -->\n\n## {heading}\n"
+        ));
+        assert!(result.is_empty(), "{result:?}");
+
+        let toc = generated_toc(&format!("# Title\n\n<!-- toc -->\n<!-- tocstop -->\n\n## {heading}\n"));
+        assert_eq!(toc, "- [My Section](#new)");
+
+        let result = check_toc(&format!(
+            "# Title\n\n<!-- toc -->\n\n- [My Section](#my-section)\n\n<!-- tocstop -->\n\n## {heading}\n"
+        ));
+        assert_eq!(result.len(), 1, "the generated slug is replaced, got {result:?}");
+    }
+}
