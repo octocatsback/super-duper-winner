@@ -1,0 +1,638 @@
+const t = require('tap')
+const localeCompare = require('@isaacs/string-locale-compare')('en')
+const AuditReport = require('../lib/audit-report.js')
+const Node = require('../lib/node.js')
+const Arborist = require('../')
+const MockRegistry = require('@npmcli/mock-registry')
+
+const { join, resolve } = require('node:path')
+const fixtures = resolve(__dirname, 'fixtures')
+
+const newArb = (path, opts = {}) => new Arborist({ path, ...opts })
+
+const sortReport = report => {
+  const entries = Object.entries(report.vulnerabilities)
+  const vulns = entries.sort(([a], [b]) => localeCompare(a, b))
+    .map(([name, vuln]) => [
+      name,
+      {
+        ...vuln,
+        via: (vuln.via || []).sort((a, b) =>
+          localeCompare(String(a.source || a), String(b.source || b))),
+        effects: (vuln.effects || []).sort(localeCompare),
+      },
+    ])
+  report.vulnerabilities = vulns.reduce((set, [k, v]) => {
+    set[k] = v
+    return set
+  }, {})
+}
+
+const createRegistry = (t) => {
+  const registry = new MockRegistry({
+    strict: true,
+    tap: t,
+    registry: 'https://registry.npmjs.org',
+  })
+  return registry
+}
+
+t.test('all severity levels', async t => {
+  const path = resolve(fixtures, 'audit-all-severities')
+  const registry = createRegistry(t)
+  registry.audit({ convert: true, results: require(resolve(path, 'audit.json')) })
+  registry.mocks({ dir: join(__dirname, 'fixtures') })
+  const cache = t.testdir()
+  const arb = newArb(path, { cache })
+
+  const tree = await arb.loadVirtual()
+  const report = await AuditReport.load(tree, arb.options)
+  t.matchSnapshot(JSON.stringify(report, 0, 2), 'json version')
+  t.equal(report.topVulns.size, 2)
+})
+
+t.test('vulnerable dep not from registry', async t => {
+  const path = resolve(fixtures, 'minimist-git-dep')
+  const registry = createRegistry(t)
+  registry.audit({ convert: true, results: require(resolve(path, 'audit.json')) })
+  registry.mocks({ dir: join(__dirname, 'fixtures') })
+  const cache = t.testdir()
+  const arb = newArb(path, { cache })
+
+  const tree = await arb.loadVirtual()
+  const report = await AuditReport.load(tree, arb.options)
+  t.matchSnapshot(JSON.stringify(report, 0, 2), 'json version')
+  t.equal(report.has('minimist'), true)
+  t.equal(report.topVulns.has('minimist'), true)
+  t.equal(report.isVulnerable(tree.children.get('minimist')), true)
+})
+
+t.test('metavuln where dep is not a registry dep', async t => {
+  const path = resolve(fixtures, 'minimist-git-metadep')
+  const registry = createRegistry(t)
+  registry.audit({ convert: true, results: require(resolve(path, 'audit.json')) })
+  registry.mocks({ dir: join(__dirname, 'fixtures') })
+  const cache = t.testdir()
+  const arb = newArb(path, { cache })
+
+  const tree = await arb.loadVirtual()
+  const report = await AuditReport.load(tree, arb.options)
+  t.matchSnapshot(JSON.stringify(report, 0, 2), 'json version')
+
+  t.equal(report.has('@isaacs/minimist-git-dep'), true)
+  t.equal(report.has('minimist'), true)
+  t.equal(report.topVulns.has('@isaacs/minimist-git-dep'), true)
+})
+
+t.test('metavuln where a dep is not on the registry at all', async t => {
+  const path = resolve(fixtures, 'audit-missing-packument')
+  const registry = createRegistry(t)
+  registry.audit({ convert: true, results: require(resolve(path, 'audit.json')) })
+  registry.mocks({ dir: join(__dirname, 'fixtures') })
+  const cache = t.testdir()
+  const arb = newArb(path, { cache })
+
+  const tree = await arb.loadVirtual()
+  const report = await AuditReport.load(tree, arb.options)
+  t.matchSnapshot(JSON.stringify(report, 0, 2), 'json version')
+  t.equal(report.topVulns.size, 1)
+})
+
+t.test('get advisory about node not in tree', async t => {
+  // this should never happen, but if it does, we're prepared for it
+  const path = resolve(fixtures, 'audit-nyc-mkdirp')
+  const registry = createRegistry(t)
+  registry.audit({ convert: true, results: require(resolve(path, 'audit.json')) })
+  registry.mocks({ dir: join(__dirname, 'fixtures') })
+  const cache = t.testdir()
+  const arb = newArb(path, { cache })
+
+  const tree = await arb.loadVirtual()
+  tree.children.get('mkdirp').parent = null
+  tree.children.get('nyc').parent = null
+  tree.children.get('minimist').parent = null
+  new Node({
+    parent: tree,
+    path: resolve(path, 'node_modules/fooo'),
+    pkg: { name: 'fooo', version: '1.2.3' },
+  })
+  tree.package = { dependencies: {
+    fooo: '',
+  } }
+
+  const report = await AuditReport.load(tree, arb.options)
+  t.equal(report.topVulns.size, 0, 'one top node found vulnerable')
+  t.equal(report.size, 0, 'no vulns that were relevant')
+  t.equal(report.get('nyc'), undefined)
+  t.equal(report.get('mkdirp'), undefined)
+})
+
+t.test('unfixable, but not a semver major forced fix', async t => {
+  const path = resolve(fixtures, 'mkdirp-pinned')
+  const registry = createRegistry(t)
+  registry.audit({ convert: true, results: require(resolve(fixtures, 'audit-nyc-mkdirp', 'audit.json')) })
+  registry.mocks({ dir: join(__dirname, 'fixtures') })
+  const cache = t.testdir()
+  const arb = newArb(path, { cache })
+
+  const tree = await arb.loadVirtual()
+  const report = await AuditReport.load(tree, arb.options)
+  t.matchSnapshot(JSON.stringify(report, 0, 2), 'json version')
+
+  t.equal(report.topVulns.size, 1)
+})
+
+t.test('audit outdated nyc and mkdirp', async t => {
+  const path = resolve(fixtures, 'audit-nyc-mkdirp')
+  const registry = createRegistry(t)
+  registry.audit({ results: require(resolve(path, 'advisory-bulk.json')) })
+  registry.mocks({ dir: join(__dirname, 'fixtures') })
+  const cache = t.testdir()
+  const arb = newArb(path, { cache })
+
+  const tree = await arb.loadVirtual()
+  const report = await AuditReport.load(tree, arb.options)
+  t.matchSnapshot(JSON.stringify(report, 0, 2), 'json version')
+
+  t.throws(() => report.set('foo', 'bar'), {
+    message: 'do not call AuditReport.set() directly',
+  })
+
+  t.equal(report.topVulns.size, 1, 'one top node found vulnerable')
+  t.equal(report.get('nyc').simpleRange, '6.2.0-alpha - 13.1.0')
+  t.equal(report.get('mkdirp').simpleRange, '0.4.1 - 0.5.1')
+})
+
+t.test('audit outdated nyc and mkdirp with before: option', async t => {
+  const path = resolve(fixtures, 'audit-nyc-mkdirp')
+  const registry = createRegistry(t)
+  registry.audit({ results: require(resolve(path, 'advisory-bulk.json')) })
+  registry.mocks({ dir: join(__dirname, 'fixtures') })
+
+  const cache = t.testdir()
+  const arb = newArb(path, { before: new Date('2020-01-01'), cache })
+
+  const tree = await arb.loadVirtual()
+  const report = await AuditReport.load(tree, arb.options)
+  t.matchSnapshot(JSON.stringify(report, 0, 2), 'json version')
+
+  t.equal(report.topVulns.size, 1, 'one top node found vulnerable')
+  t.equal(report.get('nyc').simpleRange, '6.2.0-alpha - 13.1.0')
+  t.equal(report.get('mkdirp').simpleRange, '0.4.1 - 0.5.1')
+})
+
+t.test('min-release-age blocks an available fix', async t => {
+  // mkdirp's fix (0.5.5, published 2020-04) is newer than a 2020-01-01 cutoff,
+  // so the only versions old enough are still vulnerable and audit fix can't
+  // apply the fix it reported as available.
+  const path = resolve(fixtures, 'audit-nyc-mkdirp')
+  const registry = createRegistry(t)
+  registry.audit({ results: require(resolve(path, 'advisory-bulk.json')) })
+  registry.mocks({ dir: join(__dirname, 'fixtures') })
+  const cache = t.testdir()
+  const arb = newArb(path, { before: new Date('2020-01-01'), cache })
+
+  const tree = await arb.loadVirtual()
+  const report = await AuditReport.load(tree, arb.options)
+  t.match(report.get('mkdirp').fixBlockedByReleaseAge, { version: '0.5.5' },
+    'mkdirp fix flagged as blocked by the release-age window')
+})
+
+t.test('min-release-age does not block a fix that is old enough', async t => {
+  const path = resolve(fixtures, 'audit-nyc-mkdirp')
+  const registry = createRegistry(t)
+  registry.audit({ results: require(resolve(path, 'advisory-bulk.json')) })
+  registry.mocks({ dir: join(__dirname, 'fixtures') })
+  const cache = t.testdir()
+  // a cutoff after mkdirp@0.5.5 was published: the fix is reachable
+  const arb = newArb(path, { before: new Date('2021-01-01'), cache })
+
+  const tree = await arb.loadVirtual()
+  const report = await AuditReport.load(tree, arb.options)
+  t.notOk(report.get('mkdirp').fixBlockedByReleaseAge,
+    'fix reachable within the window, so not flagged')
+})
+
+t.test('min-release-age-exclude exempts a package from the block', async t => {
+  const path = resolve(fixtures, 'audit-nyc-mkdirp')
+  const registry = createRegistry(t)
+  registry.audit({ results: require(resolve(path, 'advisory-bulk.json')) })
+  registry.mocks({ dir: join(__dirname, 'fixtures') })
+  const cache = t.testdir()
+  const arb = newArb(path, {
+    before: new Date('2020-01-01'),
+    minReleaseAgeExclude: ['mkdirp'],
+    cache,
+  })
+
+  const tree = await arb.loadVirtual()
+  const report = await AuditReport.load(tree, arb.options)
+  t.notOk(report.get('mkdirp').fixBlockedByReleaseAge,
+    'excluded package is not flagged even when its fix is too new')
+})
+
+t.test('min-release-age blocks when no version is old enough at all', async t => {
+  const path = resolve(fixtures, 'audit-nyc-mkdirp')
+  const registry = createRegistry(t)
+  registry.audit({ results: require(resolve(path, 'advisory-bulk.json')) })
+  registry.mocks({ dir: join(__dirname, 'fixtures') })
+  const cache = t.testdir()
+  // a cutoff before any mkdirp version was published: nothing is installable
+  const arb = newArb(path, { before: new Date('2000-01-01'), cache })
+
+  const tree = await arb.loadVirtual()
+  const report = await AuditReport.load(tree, arb.options)
+  t.match(report.get('mkdirp').fixBlockedByReleaseAge, { version: '0.5.5' },
+    'flagged as blocked when nothing is installable within the window')
+})
+
+t.test('audit returns an error', async t => {
+  const path = resolve(fixtures, 'audit-nyc-mkdirp')
+  const registry = createRegistry(t)
+  registry.audit({ responseCode: 503, results: 'no audit for you' })
+
+  const logs = []
+  const onlog = (...msg) => {
+    if (msg[0] === 'http') {
+      return
+    }
+    logs.push(msg)
+  }
+  process.on('log', onlog)
+  t.teardown(() => process.removeListener('log', onlog))
+
+  const cache = t.testdir()
+  const arb = newArb(path, { cache })
+
+  const tree = await arb.loadVirtual()
+  const report = await AuditReport.load(tree, arb.options)
+  t.equal(report.report, null, 'did not get audit response')
+  t.equal(report.size, 0, 'did not find any vulnerabilities')
+  t.match(logs.filter(l => l[1].includes('audit')), [
+    [
+      'silly',
+      'audit',
+      'bulk request',
+    ],
+    [
+      'verbose',
+      'audit error',
+      report.error,
+    ],
+    ['silly', 'audit error', 'no audit for you'],
+  ], 'logged audit failure')
+  t.match(report.error, Error)
+})
+
+t.test('audit disabled by config', async t => {
+  const path = resolve(fixtures, 'audit-nyc-mkdirp')
+  createRegistry(t)
+
+  const logs = []
+  const onlog = (...msg) => logs.push(msg)
+  process.on('log', onlog)
+  t.teardown(() => process.removeListener('log', onlog))
+
+  const cache = t.testdir()
+  const arb = newArb(path, { audit: false, cache })
+
+  const tree = await arb.loadVirtual()
+  const report = await AuditReport.load(tree, arb.options)
+  t.equal(report.report, null, 'did not get audit response')
+  t.equal(report.size, 0, 'did not find any vulnerabilities')
+  t.match(logs, [], 'no logs of error')
+  t.equal(report.error, null, 'no error encountered')
+})
+
+t.test('audit disabled by offline mode', async t => {
+  const path = resolve(fixtures, 'audit-nyc-mkdirp')
+  createRegistry(t)
+
+  const logs = []
+  const onlog = (...msg) => logs.push(msg)
+  process.on('log', onlog)
+  t.teardown(() => process.removeListener('log', onlog))
+
+  const cache = t.testdir()
+  const arb = newArb(path, { offline: true, cache })
+
+  const tree = await arb.loadVirtual()
+  const report = await AuditReport.load(tree, arb.options)
+  t.equal(report.report, null, 'did not get audit response')
+  t.equal(report.size, 0, 'did not find any vulnerabilities')
+  t.match(logs, [], 'no logs of error')
+  t.equal(report.error, null, 'no error encountered')
+})
+
+t.test('one vulnerability', async t => {
+  const path = resolve(fixtures, 'audit-one-vuln')
+  const registry = createRegistry(t)
+  registry.audit({ convert: true, results: require(resolve(path, 'audit.json')) })
+  registry.mocks({ dir: join(__dirname, 'fixtures') })
+  const cache = t.testdir()
+  const arb = newArb(path, { cache })
+
+  const tree = await arb.loadVirtual()
+  const report = await AuditReport.load(tree, arb.options)
+  t.matchSnapshot(JSON.stringify(report, 0, 2), 'json version')
+
+  t.equal(report.topVulns.size, 0)
+})
+
+t.test('a dep vuln that also has its own advisory against it', async t => {
+  const path = resolve(fixtures, 'audit-dep-vuln-with-own-advisory')
+  const registry = createRegistry(t)
+  registry.audit({ convert: true, results: require(resolve(path, 'audit.json')) })
+  registry.mocks({ dir: join(__dirname, 'fixtures') })
+  const cache = t.testdir()
+  const arb = newArb(path, { cache })
+
+  const tree = await arb.loadVirtual()
+  const report = await AuditReport.load(tree, arb.options)
+  t.matchSnapshot(JSON.stringify(report, 0, 2), 'json version')
+
+  t.equal(report.topVulns.size, 0)
+})
+
+t.test('get default opts when loaded without opts', async t => {
+  const ar = new AuditReport()
+  t.equal(ar.tree, undefined)
+  t.strictSame(ar.options, {})
+})
+
+t.test('audit report with a lying v5 lockfile', async t => {
+  // npm v5 stored the resolved dependency version in the `requires`
+  // set, rather than the spec that is actually required.  As a result,
+  // a dep may _appear_ to be a metavuln, but when we scan the
+  // packument, it turns out that it matches no nodes, and gets deleted.
+  const path = resolve(fixtures, 'eslintme')
+  const registry = createRegistry(t)
+  registry.audit({ results: require(resolve(path, 'audit.json')) })
+  registry.mocks({ dir: join(__dirname, 'fixtures') })
+  const cache = t.testdir()
+  const arb = newArb(path, { cache })
+  const tree = await arb.loadVirtual()
+  const report = await AuditReport.load(tree, arb.options)
+  // also try to delete something that just very much is not present
+  report.delete('eslint')
+  report.delete('eslint')
+  t.matchSnapshot(report.toJSON())
+})
+
+t.test('omit options', async t => {
+  const path = resolve(fixtures, 'audit-omit')
+  const omits = [
+    [],
+    ['dev'],
+    ['optional'],
+    ['dev', 'optional'],
+    ['peer'],
+    ['peer', 'dev'],
+    ['peer', 'dev', 'optional'], // empty
+  ]
+  for (const omit of omits) {
+    await t.test(`omit=[${omit.join(',')}]`, async t => {
+      const cache = t.testdir()
+      const arb = newArb(path, { cache })
+      const tree = await arb.loadVirtual()
+      const registry = createRegistry(t)
+      const s = omit.map(o => `-omit${o}`).join('')
+      const bulkResults = require(resolve(path, `bulk${s}.json`))
+      if (Object.keys(bulkResults).length) { /// peer, dev, optional is empty
+        registry.audit({ convert: false, results: bulkResults })
+        registry.mocks({ dir: join(__dirname, 'fixtures') })
+      }
+      const r1 = (await AuditReport.load(tree, { ...arb.options, omit })).toJSON()
+      sortReport(r1)
+      t.matchSnapshot(r1, 'bulk')
+      const r2 = (await AuditReport.load(tree, { ...arb.options, omit })).toJSON()
+      sortReport(r2)
+      t.strictSame(r1, r2, 'same results')
+    })
+  }
+})
+
+t.test('audit when tree is empty', async t => {
+  createRegistry(t)
+  const tree = new Node({
+    path: '/path/to/tree',
+  })
+  const auditReport = new AuditReport(tree)
+  const { report } = await auditReport.run()
+  t.strictSame(report, null)
+})
+
+t.test('audit when bulk report does not have anything in it', async t => {
+  createRegistry(t)
+  const tree = new Node({
+    path: '/path/to/tree',
+    pkg: {
+      name: 'tree',
+      version: '1.2.3',
+      devDependencies: { something: '1.2.3' },
+    },
+    children: [
+      { pkg: { name: 'something', version: '1.2.3' } },
+    ],
+  })
+  const auditReport = new AuditReport(tree, { omit: ['dev'] })
+  const { report } = await auditReport.run()
+  t.strictSame(report, null)
+})
+
+t.test('audit supports alias deps', async t => {
+  const path = resolve(fixtures, 'audit-nyc-mkdirp')
+  const registry = createRegistry(t)
+  registry.audit({ results: require(resolve(path, 'advisory-bulk.json')) })
+  registry.mocks({ dir: join(__dirname, 'fixtures') })
+  const cache = t.testdir()
+  const arb = newArb(path, { cache })
+  const tree = new Node({
+    path,
+    pkg: {
+      name: 'mkdirp',
+      version: '0.5.0',
+      dependencies: {
+        novulnshereiswear: 'npm:mkdirp@*',
+        mkdirp: 'npm:mkdirp@0.5.1',
+      },
+    },
+    children: [
+      {
+        name: 'novulnshereiswear',
+        pkg: {
+          name: 'mkdirp',
+          version: '0.5.1',
+          dependencies: {
+            minimist: '0.0.8',
+          },
+        },
+      },
+      {
+        pkg: {
+          name: 'mkdirp',
+          version: '0.5.1',
+          dependencies: {
+            minimist: '0.0.8',
+          },
+        },
+      },
+      { pkg: { name: 'minimist', version: '0.0.8' } },
+    ],
+  })
+
+  const report = await AuditReport.load(tree, arb.options)
+  t.matchSnapshot(JSON.stringify(report, 0, 2), 'json version')
+  t.equal(report.get('mkdirp').simpleRange, '0.4.1 - 0.5.1')
+})
+
+t.test('release-age block detection unwraps alias specs', async t => {
+  // An npm: alias edge must be resolved against its target, not fed to
+  // pickManifest as an alias spec (which it rejects). With a release-age
+  // window the alias fix (mkdirp@0.5.5) is too new, so it should be flagged.
+  const path = resolve(fixtures, 'audit-nyc-mkdirp')
+  const registry = createRegistry(t)
+  registry.audit({ results: require(resolve(path, 'advisory-bulk.json')) })
+  registry.mocks({ dir: join(__dirname, 'fixtures') })
+  const cache = t.testdir()
+  const arb = newArb(path, { before: new Date('2020-01-01'), cache })
+  const tree = new Node({
+    path,
+    pkg: {
+      name: 'mkdirp',
+      version: '0.5.0',
+      dependencies: {
+        novulnshereiswear: 'npm:mkdirp@^0.5.0',
+      },
+    },
+    children: [
+      {
+        name: 'novulnshereiswear',
+        pkg: {
+          name: 'mkdirp',
+          version: '0.5.1',
+          dependencies: { minimist: '0.0.8' },
+        },
+      },
+      { pkg: { name: 'minimist', version: '0.0.8' } },
+    ],
+  })
+
+  const report = await AuditReport.load(tree, arb.options)
+  t.match(report.get('mkdirp').fixBlockedByReleaseAge, { version: '0.5.5' },
+    'alias spec is unwrapped and the blocked fix is detected')
+})
+
+t.test('linked local package should not be audited against the registry', async t => {
+  const path = resolve(fixtures, 'audit-linked-package')
+  // No registry.audit() mock needed — no request should be made
+  // because linked packages must be excluded from the bulk payload
+  createRegistry(t)
+  const cache = t.testdir()
+  const arb = newArb(path, { cache })
+
+  const tree = await arb.loadVirtual()
+  const report = await AuditReport.load(tree, arb.options)
+
+  t.equal(
+    report.has('electron-test-app'),
+    false,
+    'linked local package should not appear in audit report'
+  )
+  t.equal(
+    report.size,
+    0,
+    'audit report should be empty when all dependencies are local links'
+  )
+})
+
+t.test('audit with filterSet limiting to only mkdirp and minimist', async t => {
+  const path = resolve(fixtures, 'audit-nyc-mkdirp')
+  const registry = createRegistry(t)
+  registry.audit({ results: require(resolve(path, 'advisory-bulk.json')) })
+  registry.mocks({ dir: join(__dirname, 'fixtures') })
+  const cache = t.testdir()
+  const arb = newArb(path, { cache })
+
+  const tree = await arb.loadVirtual()
+  const filterSet = new Set([
+    tree.children.get('mkdirp'),
+    tree.children.get('minimist'),
+  ])
+  const options = { ...arb.options, filterSet }
+  const report = await AuditReport.load(tree, options)
+  t.matchSnapshot(JSON.stringify(report, 0, 2), 'json version')
+
+  t.equal(report.topVulns.size, 0, 'no top nodes reported')
+  t.equal(report.get('nyc'), undefined, 'no nyc vuln reported')
+  t.equal(report.get('mkdirp').simpleRange, '0.4.1 - 0.5.1', 'mkdirp vuln reported')
+})
+
+t.test('determinism: multiple metavulns with identical range but different dependencies', async t => {
+  const registry = createRegistry(t)
+
+  // Create a tree where A depends on both B and C. Both B and C are vulnerable.
+  const path = t.testdir()
+  const tree = new Node({
+    path,
+    pkg: {
+      name: 'root',
+      dependencies: {
+        A: '1.0.0',
+      },
+    },
+    children: [
+      {
+        pkg: { name: 'A', version: '1.0.0', dependencies: { B: '1.0.0', C: '1.0.0' } },
+      },
+      {
+        pkg: { name: 'B', version: '1.0.0' },
+      },
+      {
+        pkg: { name: 'C', version: '1.0.0' },
+      },
+    ],
+  })
+
+  registry.audit({
+    times: 5,
+    results: {
+      B: [{ id: 1, url: 'https://B', title: 'B vuln', severity: 'high', vulnerable_versions: '*' }],
+      C: [{ id: 2, url: 'https://C', title: 'C vuln', severity: 'high', vulnerable_versions: '*' }],
+    },
+  })
+
+  // We intentionally do not mock the packuments for A, B, and C.
+  // By using the fixtures directory, unmatched GET requests will receive a 404.
+  // This triggers the metavuln calculator fallback which defaults the effective range to `*`.
+  // As a result, both B and C trigger metavulns on A with identical ranges (`*`),
+  // producing the identical collision key `A@*` required to reproduce the determinism bug.
+  registry.mocks({ dir: join(__dirname, 'fixtures') })
+
+  // We loop 5 times just to show it is deterministic.
+  const results = []
+  let lastReport
+  for (let i = 0; i < 5; i++) {
+    lastReport = await AuditReport.load(tree, { registry: 'https://registry.npmjs.org' })
+    results.push(JSON.stringify(lastReport.toJSON()))
+  }
+
+  const uniqueResults = new Set(results)
+  t.equal(uniqueResults.size, 1, 'output is identical across runs')
+
+  // The key assertion is that BOTH B and C are correctly included in A's via list,
+  // which formally proves the determinism bug dropping a via path is fixed.
+  const A = lastReport.get('A')
+  const B = lastReport.get('B')
+  const C = lastReport.get('C')
+
+  t.ok(A, 'A is vulnerable')
+  const viaNames = [...A.via].map(v => v.name)
+  const BEffects = [...B.effects].map(v => v.name)
+  const CEffects = [...C.effects].map(v => v.name)
+
+  t.ok(viaNames.includes('B'), 'A via list includes B')
+  t.ok(viaNames.includes('C'), 'A via list includes C')
+  t.ok(BEffects.includes('A'), 'B effects includes A')
+  t.ok(CEffects.includes('A'), 'C effects includes A')
+})
