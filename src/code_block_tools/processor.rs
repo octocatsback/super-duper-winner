@@ -1,0 +1,3487 @@
+//! Main processor for code block linting and formatting.
+//!
+//! This module coordinates language resolution, tool lookup, execution,
+//! and result collection for processing code blocks in markdown files.
+
+use super::config::{CodeBlockToolsConfig, LanguageToolConfig, NormalizeLanguage, OnError, OnMissing};
+use super::executor::{ExecutorError, ToolExecutor, ToolOutput};
+use super::linguist::LinguistResolver;
+use super::registry::{BuiltinLintMode, ToolRegistry, ToolSlot};
+use crate::config::MarkdownFlavor;
+use crate::rule::{LintWarning, Severity};
+use crate::utils::rumdl_parser_options;
+use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
+
+/// Special built-in tool name for rumdl's own markdown linting.
+/// When this tool is configured for markdown blocks, the processor skips
+/// external execution since it's handled by embedded markdown linting.
+pub const RUMDL_BUILTIN_TOOL: &str = "rumdl";
+
+/// Check if a language is markdown (handles common variations).
+fn is_markdown_language(lang: &str) -> bool {
+    matches!(lang.to_lowercase().as_str(), "markdown" | "md")
+}
+
+/// Strip ANSI escape sequences from tool output.
+///
+/// Many tools output colored text (e.g. `\x1b[1;31mError\x1b[0m`), which prevents
+/// structured parsers from matching patterns like `file:line:col: message`.
+fn strip_ansi_codes(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                // Consume until we hit an ASCII letter (the terminator)
+                while let Some(&next) = chars.peek() {
+                    chars.next();
+                    if next.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// Decode the percent escapes a GitHub Actions workflow command puts in its message.
+///
+/// `%25` encodes `%` itself, so decoding runs left to right in a single pass: replacing
+/// the escapes one after another would turn a literal `%250A` into a line break. A
+/// diagnostic occupies one line, so an encoded line break decodes to a space.
+fn decode_workflow_command(message: &str) -> String {
+    let mut decoded = String::with_capacity(message.len());
+    let mut rest = message;
+
+    while let Some(index) = rest.find('%') {
+        decoded.push_str(&rest[..index]);
+        let escape = rest[index..].get(..3).unwrap_or_default();
+        let replacement = if escape.eq_ignore_ascii_case("%25") {
+            "%"
+        } else if escape.eq_ignore_ascii_case("%0a") || escape.eq_ignore_ascii_case("%0d") {
+            " "
+        } else if escape.eq_ignore_ascii_case("%3a") {
+            ":"
+        } else if escape.eq_ignore_ascii_case("%2c") {
+            ","
+        } else {
+            // Not an escape this format defines; the `%` is literal text.
+            decoded.push('%');
+            rest = &rest[index + 1..];
+            continue;
+        };
+        decoded.push_str(replacement);
+        rest = &rest[index + 3..];
+    }
+
+    decoded.push_str(rest);
+    decoded
+}
+
+/// Ensure content handed to an external tool is newline-terminated.
+///
+/// Code block extraction strips the line ending before the closing fence, but
+/// per CommonMark that final newline is part of the block's content. External
+/// tools treat their stdin as a complete file, so a tool with an end-of-file
+/// newline rule (e.g. yamllint/ryl `new-line-at-end-of-file`, ruff `W292`)
+/// would otherwise emit a false positive. Genuinely empty content is left
+/// untouched so we never synthesize content where there is none.
+fn ensure_trailing_newline(content: &str) -> std::borrow::Cow<'_, str> {
+    if content.is_empty() || content.ends_with('\n') {
+        std::borrow::Cow::Borrowed(content)
+    } else {
+        std::borrow::Cow::Owned(format!("{content}\n"))
+    }
+}
+
+/// Information about a fenced code block for processing.
+#[derive(Debug, Clone)]
+pub struct FencedCodeBlockInfo {
+    /// 0-indexed line number where opening fence starts.
+    pub start_line: usize,
+    /// 0-indexed line number where closing fence ends.
+    pub end_line: usize,
+    /// Byte offset where code content starts (after opening fence line).
+    pub content_start: usize,
+    /// Byte offset where code content ends (before closing fence line).
+    pub content_end: usize,
+    /// Language tag extracted from info string (first token).
+    pub language: String,
+    /// Full info string from the fence.
+    pub info_string: String,
+    /// The fence character used (` or ~).
+    pub fence_char: char,
+    /// Length of the fence (3 or more).
+    pub fence_length: usize,
+    /// Leading whitespace on the fence line.
+    pub indent: usize,
+    /// Exact leading whitespace prefix from the fence line.
+    pub indent_prefix: String,
+}
+
+/// A diagnostic message from an external tool.
+#[derive(Debug, Clone)]
+pub struct CodeBlockDiagnostic {
+    /// Line number in the original markdown file (1-indexed).
+    pub file_line: usize,
+    /// Column number (1-indexed, if available).
+    pub column: Option<usize>,
+    /// Message from the tool.
+    pub message: String,
+    /// Severity (error, warning, info).
+    pub severity: DiagnosticSeverity,
+    /// Name of the tool that produced this.
+    pub tool: String,
+    /// Line where the code block starts (1-indexed, for context).
+    pub code_block_start: usize,
+}
+
+/// Severity level for diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticSeverity {
+    Error,
+    Warning,
+    Info,
+}
+
+impl CodeBlockDiagnostic {
+    /// Convert to a LintWarning for integration with rumdl's warning system.
+    pub fn to_lint_warning(&self) -> LintWarning {
+        let severity = match self.severity {
+            DiagnosticSeverity::Error => Severity::Error,
+            DiagnosticSeverity::Warning => Severity::Warning,
+            DiagnosticSeverity::Info => Severity::Info,
+        };
+
+        LintWarning {
+            message: self.message.clone(),
+            line: self.file_line,
+            column: self.column.unwrap_or(1),
+            end_line: self.file_line,
+            end_column: self.column.unwrap_or(1),
+            severity,
+            fix: None, // External tool diagnostics don't provide fixes
+            rule_name: Some(self.tool.clone()),
+        }
+    }
+}
+
+/// Error during code block processing.
+#[derive(Debug, Clone)]
+pub enum ProcessorError {
+    /// Tool execution failed.
+    ToolError(ExecutorError),
+    /// Tool execution failed with code block location context.
+    ToolErrorAt {
+        error: ExecutorError,
+        line: usize,
+        language: String,
+    },
+    /// No tools configured for language.
+    NoToolsConfigured { language: String, line: usize },
+    /// Tool binary not found.
+    ToolBinaryNotFound {
+        tool: String,
+        language: String,
+        line: usize,
+    },
+    /// Processing was aborted due to on_error = fail.
+    Aborted { message: String },
+}
+
+impl std::fmt::Display for ProcessorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ToolError(e) => write!(f, "{e}"),
+            Self::ToolErrorAt { error, line, language } => {
+                write!(f, "line {line} ({language}): {error}")
+            }
+            Self::NoToolsConfigured { language, line } => {
+                write!(f, "line {line} ({language}): no tools configured")
+            }
+            Self::ToolBinaryNotFound { tool, language, line } => {
+                write!(f, "line {line} ({language}): tool '{tool}' not found in PATH")
+            }
+            Self::Aborted { message } => write!(f, "Processing aborted: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for ProcessorError {}
+
+impl From<ExecutorError> for ProcessorError {
+    fn from(e: ExecutorError) -> Self {
+        Self::ToolError(e)
+    }
+}
+
+/// Result of processing a single code block.
+#[derive(Debug)]
+pub struct CodeBlockResult {
+    /// Diagnostics from linting.
+    pub diagnostics: Vec<CodeBlockDiagnostic>,
+    /// Formatted content (if formatting was requested and succeeded).
+    pub formatted_content: Option<String>,
+    /// Whether the code block was modified.
+    pub was_modified: bool,
+}
+
+/// Result of formatting code blocks in a document.
+#[derive(Debug)]
+pub struct FormatOutput {
+    /// The formatted content (may be partially formatted if errors occurred).
+    pub content: String,
+    /// Whether any messages were collected. Warn-level messages count too.
+    pub had_errors: bool,
+    /// Error messages for blocks that couldn't be formatted, in the prose form
+    /// the terminal shows. Both levels appear here: a message collected under
+    /// `on-error = "warn"` is for the reader and nothing more.
+    pub error_messages: Vec<String>,
+    /// The fail-level subset of the above, as diagnostics rather than prose.
+    ///
+    /// A tool could not run under a setting of `fail`, so the document was only
+    /// partly formatted and the run must not be reported as clean. The lint path
+    /// records the same fact as a diagnostic and every output format carries it;
+    /// these exist so a format run says it in the same machine-readable place
+    /// instead of only in a line of stderr. Messages collected under
+    /// `on-error = "warn"` are not failures and are not here.
+    pub failures: Vec<CodeBlockDiagnostic>,
+}
+
+impl FormatOutput {
+    /// Whether part of the document went unformatted because a tool could not run.
+    pub fn failed(&self) -> bool {
+        !self.failures.is_empty()
+    }
+}
+
+/// Main processor for code block tools.
+pub struct CodeBlockToolProcessor<'a> {
+    config: &'a CodeBlockToolsConfig,
+    flavor: MarkdownFlavor,
+    linguist: LinguistResolver,
+    registry: ToolRegistry,
+    executor: ToolExecutor,
+    user_aliases: std::collections::HashMap<String, String>,
+    /// `config.languages`, keyed by lowercased language name.
+    languages: std::collections::HashMap<String, &'a LanguageToolConfig>,
+}
+
+impl<'a> CodeBlockToolProcessor<'a> {
+    /// Create a new processor with the given configuration and markdown flavor.
+    pub fn new(config: &'a CodeBlockToolsConfig, flavor: MarkdownFlavor) -> Self {
+        let user_aliases = config
+            .language_aliases
+            .iter()
+            .map(|(k, v)| (k.to_lowercase(), v.to_lowercase()))
+            .collect();
+        // A fence tag is resolved to a lowercase canonical name, so a `languages` key has
+        // to be lowercased to be reachable at all. `BTreeMap` iteration is sorted and
+        // uppercase sorts first, so an exact-lowercase key wins over a mixed-case one.
+        let languages = config.languages.iter().map(|(k, v)| (k.to_lowercase(), v)).collect();
+        Self {
+            config,
+            flavor,
+            linguist: LinguistResolver::new(),
+            registry: ToolRegistry::new(config.tools.clone()),
+            executor: ToolExecutor::new(config.timeout),
+            user_aliases,
+            languages,
+        }
+    }
+
+    /// Configuration for a canonical (lowercase) language name.
+    fn language_config(&self, canonical_lang: &str) -> Option<&'a LanguageToolConfig> {
+        self.languages.get(canonical_lang).copied()
+    }
+
+    /// Report a tool id no registry entry answers to.
+    ///
+    /// Both the id and the language it was configured under are text out of whichever
+    /// file supplied the section (the language through `language-aliases`), so a section
+    /// reached through `extends` is described rather than quoted. See
+    /// [`crate::config::Config::withheld_rule_values`] for the same policy on rule options.
+    fn warn_unknown_tool(&self, tool_id: &str, canonical_lang: &str) {
+        if self.config.values_withheld {
+            let withheld = crate::config::WITHHELD;
+            log::warn!("Unknown tool {withheld} configured for language {withheld}");
+        } else {
+            log::warn!("Unknown tool '{tool_id}' configured for language '{canonical_lang}'");
+        }
+    }
+
+    /// Quick check whether any configured language might appear in fenced code blocks.
+    /// Scans for `` ```lang `` or `` ~~~lang `` patterns without full parsing.
+    fn has_potential_matching_blocks(&self, content: &str, lint_mode: bool) -> bool {
+        // Collect languages that have tools configured for the requested mode
+        let configured_langs: Vec<&str> = self
+            .languages
+            .iter()
+            .filter(|(_, lc)| {
+                lc.enabled
+                    && if lint_mode {
+                        !lc.lint.is_empty()
+                    } else {
+                        !lc.format.is_empty()
+                    }
+            })
+            .map(|(lang, _)| lang.as_str())
+            .collect();
+
+        if configured_langs.is_empty() {
+            return false;
+        }
+
+        // Scan content line-by-line for fence openers matching configured languages
+        for line in content.lines() {
+            let trimmed = line.trim_start();
+            let after_fence = if let Some(rest) = trimmed.strip_prefix("```") {
+                rest
+            } else if let Some(rest) = trimmed.strip_prefix("~~~") {
+                rest
+            } else {
+                continue;
+            };
+
+            let lang = after_fence.split_whitespace().next().unwrap_or("");
+            if lang.is_empty() {
+                continue;
+            }
+            // Check both the raw language and the canonical (normalized) form
+            let canonical = self.resolve_language(lang);
+            if configured_langs.contains(&canonical.as_str()) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Extract all fenced code blocks from content.
+    pub fn extract_code_blocks(&self, content: &str) -> Vec<FencedCodeBlockInfo> {
+        let mut blocks = Vec::new();
+        let mut current_block: Option<FencedCodeBlockBuilder> = None;
+
+        let options = rumdl_parser_options();
+        let parser = Parser::new_ext(content, options).into_offset_iter();
+
+        let lines: Vec<&str> = content.lines().collect();
+
+        for (event, range) in parser {
+            match event {
+                Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) => {
+                    let info_string = info.to_string();
+                    let language = info_string.split_whitespace().next().unwrap_or("").to_string();
+
+                    // Find start line
+                    let start_line = content[..range.start].chars().filter(|&c| c == '\n').count();
+
+                    // Find content start (after opening fence line)
+                    let content_start = content[range.start..]
+                        .find('\n')
+                        .map_or(content.len(), |i| range.start + i + 1);
+
+                    // Detect fence character and length from the line
+                    let fence_line = lines.get(start_line).unwrap_or(&"");
+                    let trimmed = fence_line.trim_start();
+                    let indent = fence_line.len() - trimmed.len();
+                    let indent_prefix = fence_line.get(..indent).unwrap_or("").to_string();
+                    let (fence_char, fence_length) = if trimmed.starts_with('~') {
+                        ('~', trimmed.chars().take_while(|&c| c == '~').count())
+                    } else {
+                        ('`', trimmed.chars().take_while(|&c| c == '`').count())
+                    };
+
+                    current_block = Some(FencedCodeBlockBuilder {
+                        start_line,
+                        content_start,
+                        language,
+                        info_string,
+                        fence_char,
+                        fence_length,
+                        indent,
+                        indent_prefix,
+                    });
+                }
+                Event::End(TagEnd::CodeBlock) => {
+                    if let Some(builder) = current_block.take() {
+                        // Find end line
+                        let end_line = content[..range.end].chars().filter(|&c| c == '\n').count();
+
+                        // Find content end (before closing fence line)
+                        let search_start = builder.content_start.min(range.end);
+                        let content_end = if search_start < range.end {
+                            content[search_start..range.end]
+                                .rfind('\n')
+                                .map_or(search_start, |i| search_start + i)
+                        } else {
+                            search_start
+                        };
+
+                        if content_end >= builder.content_start {
+                            blocks.push(FencedCodeBlockInfo {
+                                start_line: builder.start_line,
+                                end_line,
+                                content_start: builder.content_start,
+                                content_end,
+                                language: builder.language,
+                                info_string: builder.info_string,
+                                fence_char: builder.fence_char,
+                                fence_length: builder.fence_length,
+                                indent: builder.indent,
+                                indent_prefix: builder.indent_prefix,
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // For MkDocs flavor, also extract code blocks inside admonitions and tabs
+        if self.flavor == MarkdownFlavor::MkDocs {
+            let mkdocs_blocks = self.extract_mkdocs_code_blocks(content);
+            for mb in mkdocs_blocks {
+                // Deduplicate: only add if no existing block starts at the same line
+                if !blocks.iter().any(|b| b.start_line == mb.start_line) {
+                    blocks.push(mb);
+                }
+            }
+            blocks.sort_by_key(|b| b.start_line);
+        }
+
+        blocks
+    }
+
+    /// Extract fenced code blocks that are inside MkDocs admonitions or tabs.
+    ///
+    /// pulldown_cmark doesn't parse MkDocs-specific constructs, so indented
+    /// code blocks inside `!!!`/`???` admonitions or `===` tabs are missed.
+    /// This method manually scans for them.
+    fn extract_mkdocs_code_blocks(&self, content: &str) -> Vec<FencedCodeBlockInfo> {
+        use crate::utils::mkdocs_admonitions;
+        use crate::utils::mkdocs_tabs;
+
+        let mut blocks = Vec::new();
+        let lines: Vec<&str> = content.lines().collect();
+
+        // Track current MkDocs context indent level
+        // We only need to know if we're inside any MkDocs block, so a simple stack suffices.
+        let mut context_indent_stack: Vec<usize> = Vec::new();
+
+        // Track fence state inside MkDocs context
+        let mut in_fence = false;
+        let mut fence_start_line: usize = 0;
+        let mut fence_content_start: usize = 0;
+        let mut fence_char: char = '`';
+        let mut fence_length: usize = 0;
+        let mut fence_indent: usize = 0;
+        let mut fence_indent_prefix = String::new();
+        let mut fence_language = String::new();
+        let mut fence_info_string = String::new();
+
+        // Compute byte offsets via pointer arithmetic.
+        // `content.lines()` returns slices into the original string,
+        // so each line's pointer offset from `content` gives its byte position.
+        // This correctly handles \n, \r\n, and empty lines.
+        let content_start_ptr = content.as_ptr() as usize;
+        let line_offsets: Vec<usize> = lines
+            .iter()
+            .map(|line| line.as_ptr() as usize - content_start_ptr)
+            .collect();
+
+        for (i, line) in lines.iter().enumerate() {
+            let line_indent = crate::utils::mkdocs_common::get_line_indent(line);
+            let is_admonition = mkdocs_admonitions::is_admonition_start(line);
+            let is_tab = mkdocs_tabs::is_tab_marker(line);
+
+            // Pop contexts when the current line is not indented enough to be content.
+            // This runs for ALL lines (including new admonition/tab starts) to clean
+            // up stale entries before potentially pushing a new context.
+            if !line.trim().is_empty() {
+                while let Some(&ctx_indent) = context_indent_stack.last() {
+                    if line_indent < ctx_indent + 4 {
+                        context_indent_stack.pop();
+                        if in_fence {
+                            in_fence = false;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            // Check for admonition start — push new context
+            if is_admonition && let Some(indent) = mkdocs_admonitions::get_admonition_indent(line) {
+                context_indent_stack.push(indent);
+                continue;
+            }
+
+            // Check for tab marker — push new context
+            if is_tab && let Some(indent) = mkdocs_tabs::get_tab_indent(line) {
+                context_indent_stack.push(indent);
+                continue;
+            }
+
+            // Only look for fences inside a MkDocs context
+            if context_indent_stack.is_empty() {
+                continue;
+            }
+
+            let trimmed = line.trim_start();
+            let leading_spaces = line.len() - trimmed.len();
+
+            if !in_fence {
+                // Check for fence opening
+                let (fc, fl) = if trimmed.starts_with("```") {
+                    ('`', trimmed.chars().take_while(|&c| c == '`').count())
+                } else if trimmed.starts_with("~~~") {
+                    ('~', trimmed.chars().take_while(|&c| c == '~').count())
+                } else {
+                    continue;
+                };
+
+                if fl >= 3 {
+                    in_fence = true;
+                    fence_start_line = i;
+                    fence_char = fc;
+                    fence_length = fl;
+                    fence_indent = leading_spaces;
+                    fence_indent_prefix = line.get(..leading_spaces).unwrap_or("").to_string();
+
+                    let after_fence = &trimmed[fl..];
+                    fence_info_string = after_fence.trim().to_string();
+                    fence_language = fence_info_string.split_whitespace().next().unwrap_or("").to_string();
+
+                    // Content starts at the next line's byte offset
+                    fence_content_start = line_offsets.get(i + 1).copied().unwrap_or(content.len());
+                }
+            } else {
+                // Check for fence closing
+                let is_closing = if fence_char == '`' {
+                    trimmed.starts_with("```")
+                        && trimmed.chars().take_while(|&c| c == '`').count() >= fence_length
+                        && trimmed.trim_start_matches('`').trim().is_empty()
+                } else {
+                    trimmed.starts_with("~~~")
+                        && trimmed.chars().take_while(|&c| c == '~').count() >= fence_length
+                        && trimmed.trim_start_matches('~').trim().is_empty()
+                };
+
+                if is_closing {
+                    let content_end = line_offsets.get(i).copied().unwrap_or(content.len());
+
+                    if content_end >= fence_content_start {
+                        blocks.push(FencedCodeBlockInfo {
+                            start_line: fence_start_line,
+                            end_line: i,
+                            content_start: fence_content_start,
+                            content_end,
+                            language: fence_language.clone(),
+                            info_string: fence_info_string.clone(),
+                            fence_char,
+                            fence_length,
+                            indent: fence_indent,
+                            indent_prefix: fence_indent_prefix.clone(),
+                        });
+                    }
+
+                    in_fence = false;
+                }
+            }
+        }
+
+        blocks
+    }
+
+    /// Resolve a language tag to its canonical name.
+    fn resolve_language(&self, language: &str) -> String {
+        let lower = language.to_lowercase();
+        if let Some(mapped) = self.user_aliases.get(&lower) {
+            return mapped.clone();
+        }
+        match self.config.normalize_language {
+            NormalizeLanguage::Linguist => self.linguist.resolve(&lower),
+            NormalizeLanguage::Exact => lower,
+        }
+    }
+
+    /// Get the effective on_error setting for a language.
+    fn get_on_error(&self, language: &str) -> OnError {
+        self.language_config(language)
+            .and_then(|lc| lc.on_error)
+            .unwrap_or(self.config.on_error)
+    }
+
+    /// Strip the fence indentation prefix from each line of a code block.
+    fn strip_indent_from_block(&self, content: &str, indent_prefix: &str) -> String {
+        if indent_prefix.is_empty() {
+            return content.to_string();
+        }
+
+        let mut out = String::with_capacity(content.len());
+        for line in content.split_inclusive('\n') {
+            if let Some(stripped) = line.strip_prefix(indent_prefix) {
+                out.push_str(stripped);
+            } else {
+                out.push_str(line);
+            }
+        }
+        out
+    }
+
+    /// Re-apply the fence indentation prefix to each line of a code block.
+    fn apply_indent_to_block(&self, content: &str, indent_prefix: &str) -> String {
+        if indent_prefix.is_empty() {
+            return content.to_string();
+        }
+        if content.is_empty() {
+            return String::new();
+        }
+
+        let mut out = String::with_capacity(content.len() + indent_prefix.len());
+        for line in content.split_inclusive('\n') {
+            if line == "\n" {
+                out.push_str(line);
+            } else {
+                out.push_str(indent_prefix);
+                out.push_str(line);
+            }
+        }
+        out
+    }
+
+    /// Lint all code blocks in the content.
+    ///
+    /// Returns diagnostics from all configured linters.
+    pub fn lint(&self, content: &str) -> Result<Vec<CodeBlockDiagnostic>, ProcessorError> {
+        // Skip the expensive parse when no tools could possibly produce output.
+        // With on_missing=Ignore (default) and no languages with lint tools configured,
+        // every block would be skipped, so the parse is wasted work.
+        if self.config.on_missing_language_definition.skips_the_block()
+            && !self
+                .config
+                .languages
+                .values()
+                .any(|lc| lc.enabled && !lc.lint.is_empty())
+        {
+            return Ok(Vec::new());
+        }
+
+        // Quick content check: skip parsing if no configured language appears in the content.
+        // This avoids the expensive pulldown-cmark parse when there are no matching code blocks.
+        if self.config.on_missing_language_definition.skips_the_block()
+            && !self.has_potential_matching_blocks(content, true)
+        {
+            return Ok(Vec::new());
+        }
+
+        let mut all_diagnostics = Vec::new();
+        let blocks = self.extract_code_blocks(content);
+
+        for block in blocks {
+            if block.language.is_empty() {
+                continue; // Skip blocks without language tag
+            }
+
+            let canonical_lang = self.resolve_language(&block.language);
+
+            // Get lint tools for this language
+            let lang_config = self.language_config(&canonical_lang);
+
+            // If language is explicitly configured with enabled=false, skip silently
+            if let Some(lc) = lang_config
+                && !lc.enabled
+            {
+                continue;
+            }
+
+            let lint_tools = match lang_config {
+                Some(lc) if !lc.lint.is_empty() => &lc.lint,
+                // Defined with format tools only. That is a complete definition:
+                // `on-missing-language-definition` speaks for a language the config never
+                // gave any tool, not for a mode a defined language does not use.
+                Some(lc) if !lc.format.is_empty() => continue,
+                _ => {
+                    // The language has no tools in either mode
+                    match self.config.on_missing_language_definition {
+                        // Which languages appear in a document is not known before
+                        // reading it, so there is no once-per-run place to say this
+                        // and `warn` has nothing to add over `ignore`. Config
+                        // validation tells the user that, rather than leaving a
+                        // setting quietly doing nothing.
+                        OnMissing::Ignore | OnMissing::Warn => continue,
+                        OnMissing::Fail => {
+                            all_diagnostics.push(CodeBlockDiagnostic {
+                                file_line: block.start_line + 1,
+                                column: None,
+                                message: format!("No lint tools configured for language '{canonical_lang}'"),
+                                severity: DiagnosticSeverity::Error,
+                                tool: "code-block-tools".to_string(),
+                                code_block_start: block.start_line + 1,
+                            });
+                            continue;
+                        }
+                        OnMissing::FailFast => {
+                            return Err(ProcessorError::NoToolsConfigured {
+                                language: canonical_lang,
+                                line: block.start_line + 1,
+                            });
+                        }
+                    }
+                }
+            };
+
+            // Extract code block content
+            let code_content_raw = if block.content_start < block.content_end && block.content_end <= content.len() {
+                &content[block.content_start..block.content_end]
+            } else {
+                continue;
+            };
+            let code_content = self.strip_indent_from_block(code_content_raw, &block.indent_prefix);
+
+            // Run each lint tool
+            for tool_id in lint_tools {
+                // Skip built-in "rumdl" tool for markdown - handled separately by embedded markdown linting
+                if tool_id == RUMDL_BUILTIN_TOOL && is_markdown_language(&canonical_lang) {
+                    continue;
+                }
+
+                let Some(resolved_id) = self.registry.resolve_id(tool_id, ToolSlot::Lint) else {
+                    self.warn_unknown_tool(tool_id, &canonical_lang);
+                    continue;
+                };
+                let Some(tool_def) = self.registry.get(&resolved_id) else {
+                    self.warn_unknown_tool(tool_id, &canonical_lang);
+                    continue;
+                };
+
+                // Check if tool binary exists before running
+                let tool_name = tool_def.command.first().map_or("", String::as_str);
+                if !tool_name.is_empty() && !self.executor.is_tool_available(tool_name) {
+                    match self.config.on_missing_tool_binary {
+                        // `warn` is announced once for the whole run, beside the
+                        // configuration that named the tool, rather than once per
+                        // block. Here it skips exactly as `ignore` does.
+                        OnMissing::Ignore | OnMissing::Warn => {
+                            log::debug!("Tool binary '{tool_name}' not found, skipping");
+                            continue;
+                        }
+                        OnMissing::Fail => {
+                            all_diagnostics.push(CodeBlockDiagnostic {
+                                file_line: block.start_line + 1,
+                                column: None,
+                                message: format!("Tool binary '{tool_name}' not found in PATH"),
+                                severity: DiagnosticSeverity::Error,
+                                tool: "code-block-tools".to_string(),
+                                code_block_start: block.start_line + 1,
+                            });
+                            continue;
+                        }
+                        OnMissing::FailFast => {
+                            return Err(ProcessorError::ToolBinaryNotFound {
+                                tool: tool_name.to_string(),
+                                language: canonical_lang.clone(),
+                                line: block.start_line + 1,
+                            });
+                        }
+                    }
+                }
+
+                let tool_input = ensure_trailing_newline(&code_content);
+                let run = match self.registry.lint_mode(&resolved_id) {
+                    // A formatter answers "is this block ok?" by formatting it and
+                    // comparing, so `check` reports exactly the blocks `fmt` rewrites.
+                    Some(BuiltinLintMode::FormatCheck) => self
+                        .executor
+                        .format(tool_def, &tool_input, Some(self.config.timeout))
+                        .map(|output| {
+                            self.format_check_diagnostics(&output, &code_content, tool_id, block.start_line + 1)
+                        }),
+                    _ => self
+                        .executor
+                        .lint(tool_def, &tool_input, Some(self.config.timeout))
+                        .map(|output| {
+                            self.parse_tool_output(
+                                &output,
+                                tool_id,
+                                block.start_line + 1, // Convert to 1-indexed
+                            )
+                        }),
+                };
+                match run {
+                    Ok(diagnostics) => {
+                        all_diagnostics.extend(diagnostics);
+                    }
+                    Err(e) => {
+                        let on_error = self.get_on_error(&canonical_lang);
+                        match on_error {
+                            OnError::Fail => return Err(e.into()),
+                            OnError::Warn => {
+                                log::warn!("Tool '{tool_id}' failed: {e}");
+                            }
+                            OnError::Skip => {
+                                // Silently skip
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(all_diagnostics)
+    }
+
+    /// Format all code blocks in the content.
+    ///
+    /// Returns the modified content with formatted code blocks and any errors that occurred.
+    /// With `on-missing-*` = `fail`, errors are collected but formatting continues.
+    /// With `on-missing-*` = `fail-fast`, returns Err immediately on first error.
+    pub fn format(&self, content: &str) -> Result<FormatOutput, ProcessorError> {
+        let no_output = FormatOutput {
+            content: content.to_string(),
+            had_errors: false,
+            error_messages: Vec::new(),
+            failures: Vec::new(),
+        };
+
+        // Skip the expensive parse when no tools could produce output
+        if self.config.on_missing_language_definition.skips_the_block()
+            && !self
+                .config
+                .languages
+                .values()
+                .any(|lc| lc.enabled && !lc.format.is_empty())
+        {
+            return Ok(no_output);
+        }
+
+        // Quick content check: skip parsing if no configured language appears in the content
+        if self.config.on_missing_language_definition.skips_the_block()
+            && !self.has_potential_matching_blocks(content, false)
+        {
+            return Ok(no_output);
+        }
+
+        let blocks = self.extract_code_blocks(content);
+
+        if blocks.is_empty() {
+            return Ok(FormatOutput {
+                content: content.to_string(),
+                had_errors: false,
+                error_messages: Vec::new(),
+                failures: Vec::new(),
+            });
+        }
+
+        // Process blocks in reverse order to maintain byte offsets
+        let mut result = content.to_string();
+        let mut error_messages: Vec<String> = Vec::new();
+        let mut failures: Vec<CodeBlockDiagnostic> = Vec::new();
+
+        for block in blocks.into_iter().rev() {
+            if block.language.is_empty() {
+                continue;
+            }
+
+            let canonical_lang = self.resolve_language(&block.language);
+
+            // Get format tools for this language
+            let lang_config = self.language_config(&canonical_lang);
+
+            // If language is explicitly configured with enabled=false, skip silently
+            if let Some(lc) = lang_config
+                && !lc.enabled
+            {
+                continue;
+            }
+
+            let format_tools = match lang_config {
+                Some(lc) if !lc.format.is_empty() => &lc.format,
+                // Defined with lint tools only. See the matching arm in `lint`.
+                Some(lc) if !lc.lint.is_empty() => continue,
+                _ => {
+                    // The language has no tools in either mode
+                    match self.config.on_missing_language_definition {
+                        // See the matching arm in `lint`.
+                        OnMissing::Ignore | OnMissing::Warn => continue,
+                        OnMissing::Fail => {
+                            error_messages.push(format!(
+                                "No format tools configured for language '{canonical_lang}' at line {}",
+                                block.start_line + 1
+                            ));
+                            failures.push(CodeBlockDiagnostic {
+                                file_line: block.start_line + 1,
+                                column: None,
+                                message: format!("No format tools configured for language '{canonical_lang}'"),
+                                severity: DiagnosticSeverity::Error,
+                                tool: "code-block-tools".to_string(),
+                                code_block_start: block.start_line + 1,
+                            });
+                            continue;
+                        }
+                        OnMissing::FailFast => {
+                            return Err(ProcessorError::NoToolsConfigured {
+                                language: canonical_lang,
+                                line: block.start_line + 1,
+                            });
+                        }
+                    }
+                }
+            };
+
+            // Extract code block content
+            if block.content_start >= block.content_end || block.content_end > result.len() {
+                continue;
+            }
+            let code_content_raw = result[block.content_start..block.content_end].to_string();
+            let code_content = self.strip_indent_from_block(&code_content_raw, &block.indent_prefix);
+
+            // Run format tools (use first successful one)
+            let mut formatted = code_content.clone();
+            let mut tool_ran = false;
+            for tool_id in format_tools {
+                // Skip built-in "rumdl" tool for markdown - handled separately by embedded markdown formatting
+                if tool_id == RUMDL_BUILTIN_TOOL && is_markdown_language(&canonical_lang) {
+                    continue;
+                }
+
+                let Some(tool_def) = self.registry.resolve(tool_id, ToolSlot::Format) else {
+                    self.warn_unknown_tool(tool_id, &canonical_lang);
+                    continue;
+                };
+
+                // A linter writes its report to stdout, so running one here replaces the
+                // block with that report: `ruff:check` in a format slot turns a clean
+                // Python block into the literal text `All checks passed!`. The
+                // empty-output guard below does not catch it, because a linter with
+                // nothing to say still exits 0 and can still print a summary line.
+                // Config validation reports this too, but a warning cannot undo an
+                // overwritten block, so the run declines the tool as well.
+                if self.registry.fills_format_slot(tool_id) == Some(false) {
+                    log::warn!(
+                        "Tool '{tool_id}' is a linter and cannot format '{canonical_lang}' code blocks; move it to the lint slot"
+                    );
+                    continue;
+                }
+
+                // Check if tool binary exists before running
+                let tool_name = tool_def.command.first().map_or("", String::as_str);
+                if !tool_name.is_empty() && !self.executor.is_tool_available(tool_name) {
+                    match self.config.on_missing_tool_binary {
+                        // See the matching arm in `lint`.
+                        OnMissing::Ignore | OnMissing::Warn => {
+                            log::debug!("Tool binary '{tool_name}' not found, skipping");
+                            continue;
+                        }
+                        OnMissing::Fail => {
+                            error_messages.push(format!(
+                                "Tool binary '{tool_name}' not found in PATH for language '{canonical_lang}' at line {}",
+                                block.start_line + 1
+                            ));
+                            failures.push(CodeBlockDiagnostic {
+                                file_line: block.start_line + 1,
+                                column: None,
+                                message: format!("Tool binary '{tool_name}' not found in PATH"),
+                                severity: DiagnosticSeverity::Error,
+                                tool: "code-block-tools".to_string(),
+                                code_block_start: block.start_line + 1,
+                            });
+                            continue;
+                        }
+                        OnMissing::FailFast => {
+                            return Err(ProcessorError::ToolBinaryNotFound {
+                                tool: tool_name.to_string(),
+                                language: canonical_lang.clone(),
+                                line: block.start_line + 1,
+                            });
+                        }
+                    }
+                }
+
+                let tool_input = ensure_trailing_newline(&formatted);
+                match self.executor.format(tool_def, &tool_input, Some(self.config.timeout)) {
+                    Ok(output) => {
+                        // Guard against formatters that produce empty output for non-empty input.
+                        // This prevents data loss from misconfigured tools (e.g., a lint tool
+                        // used as a formatter that validates but doesn't output content).
+                        if output.trim().is_empty() && !formatted.trim().is_empty() {
+                            log::warn!("Formatter '{tool_id}' produced empty output for non-empty input, skipping");
+                            continue;
+                        }
+
+                        // Ensure trailing newline matches original (unindented)
+                        formatted = output;
+                        if code_content.ends_with('\n') && !formatted.ends_with('\n') {
+                            formatted.push('\n');
+                        } else if !code_content.ends_with('\n') && formatted.ends_with('\n') {
+                            formatted.pop();
+                        }
+                        tool_ran = true;
+                        break; // Use first successful formatter
+                    }
+                    Err(e) => {
+                        let on_error = self.get_on_error(&canonical_lang);
+                        match on_error {
+                            OnError::Fail => {
+                                return Err(ProcessorError::ToolErrorAt {
+                                    error: e,
+                                    line: block.start_line + 1,
+                                    language: canonical_lang,
+                                });
+                            }
+                            OnError::Warn => {
+                                error_messages.push(format!("line {} ({}): {e}", block.start_line + 1, canonical_lang));
+                            }
+                            OnError::Skip => {}
+                        }
+                    }
+                }
+            }
+
+            // Replace content if changed and a tool actually ran
+            if tool_ran && formatted != code_content {
+                let reindented = self.apply_indent_to_block(&formatted, &block.indent_prefix);
+                if reindented != code_content_raw {
+                    result.replace_range(block.content_start..block.content_end, &reindented);
+                }
+            }
+        }
+
+        Ok(FormatOutput {
+            content: result,
+            had_errors: !error_messages.is_empty(),
+            error_messages,
+            failures,
+        })
+    }
+
+    /// Diagnostics for a built-in formatter used in a `lint` slot.
+    ///
+    /// The formatter's own output is the answer: a block that comes back changed is not
+    /// formatted. This deliberately does not use per-tool check flags, which disagree on
+    /// every axis that matters (exit code, whether the diff goes to stdout, whether the
+    /// flag survives alongside the stdin argument the tool also needs).
+    ///
+    /// The comparison mirrors the one [`Self::format_blocks`] makes before rewriting a
+    /// block, so `check` reports exactly the blocks `fmt` would change.
+    fn format_check_diagnostics(
+        &self,
+        output: &str,
+        code_content: &str,
+        tool_id: &str,
+        code_block_start_line: usize,
+    ) -> Vec<CodeBlockDiagnostic> {
+        // Same guard the format path applies: a formatter that empties a non-empty block
+        // is misconfigured, not a finding about the block.
+        if output.trim().is_empty() && !code_content.trim().is_empty() {
+            log::warn!("Formatter '{tool_id}' produced empty output for non-empty input, skipping");
+            return Vec::new();
+        }
+
+        let mut formatted = output.to_string();
+        if code_content.ends_with('\n') && !formatted.ends_with('\n') {
+            formatted.push('\n');
+        } else if !code_content.ends_with('\n') && formatted.ends_with('\n') {
+            formatted.pop();
+        }
+
+        if formatted == code_content {
+            return Vec::new();
+        }
+
+        vec![CodeBlockDiagnostic {
+            file_line: code_block_start_line,
+            column: None,
+            message: "Code block is not formatted".to_string(),
+            severity: DiagnosticSeverity::Warning,
+            tool: tool_id.to_string(),
+            code_block_start: code_block_start_line,
+        }]
+    }
+
+    /// Parse tool output into diagnostics.
+    ///
+    /// This is a basic parser that handles common output formats.
+    /// Tools vary widely in their output format, so this is best-effort.
+    fn parse_tool_output(
+        &self,
+        output: &ToolOutput,
+        tool_id: &str,
+        code_block_start_line: usize,
+    ) -> Vec<CodeBlockDiagnostic> {
+        let mut diagnostics = Vec::new();
+        let mut shellcheck_line: Option<usize> = None;
+
+        // Strip ANSI escape codes and combine stdout + stderr for parsing
+        let stdout_clean = strip_ansi_codes(&output.stdout);
+        let stderr_clean = strip_ansi_codes(&output.stderr);
+        let combined = format!("{stdout_clean}\n{stderr_clean}");
+
+        // State for multi-line "Error: msg" / "at line N column M" pattern
+        let mut pending_error: Option<(String, DiagnosticSeverity)> = None;
+
+        for line in combined.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            // Resolve pending "Error: msg" from previous line
+            if let Some((ref msg, severity)) = pending_error {
+                if let Some((line_num, col)) = Self::parse_at_line_column(line) {
+                    diagnostics.push(CodeBlockDiagnostic {
+                        file_line: code_block_start_line + line_num,
+                        column: Some(col),
+                        message: msg.clone(),
+                        severity,
+                        tool: tool_id.to_string(),
+                        code_block_start: code_block_start_line,
+                    });
+                    pending_error = None;
+                    continue;
+                }
+                // No position line followed; fall back to what the message itself says.
+                diagnostics.push(Self::unpositioned_diagnostic(
+                    msg,
+                    severity,
+                    tool_id,
+                    code_block_start_line,
+                ));
+                pending_error = None;
+                // Fall through to parse current line
+            }
+
+            if let Some(line_num) = self.parse_shellcheck_header(line) {
+                shellcheck_line = Some(line_num);
+                continue;
+            }
+
+            if let Some(line_num) = shellcheck_line
+                && let Some(diag) = self.parse_shellcheck_message(line, tool_id, code_block_start_line, line_num)
+            {
+                diagnostics.push(diag);
+                continue;
+            }
+
+            // Try pattern: "::warning file=f,line=N,col=M::message" (GitHub annotation)
+            if let Some(diag) = Self::parse_github_annotation(line, tool_id, code_block_start_line) {
+                diagnostics.push(diag);
+                continue;
+            }
+
+            // Try pattern: "file:line:col: message" or "file:line: message"
+            if let Some(diag) = self.parse_standard_format(line, tool_id, code_block_start_line) {
+                diagnostics.push(diag);
+                continue;
+            }
+
+            // Try pattern: "line:col message" (eslint style)
+            if let Some(diag) = self.parse_eslint_format(line, tool_id, code_block_start_line) {
+                diagnostics.push(diag);
+                continue;
+            }
+
+            // Try single-line shellcheck format fallback
+            if let Some(diag) = self.parse_shellcheck_format(line, tool_id, code_block_start_line) {
+                diagnostics.push(diag);
+                continue;
+            }
+
+            // Try multi-line "Error: msg" / "Warning: msg" pattern
+            if let Some(error_info) = Self::parse_error_line(line) {
+                pending_error = Some(error_info);
+            }
+        }
+
+        // Flush any remaining pending error
+        if let Some((msg, severity)) = pending_error {
+            diagnostics.push(Self::unpositioned_diagnostic(
+                &msg,
+                severity,
+                tool_id,
+                code_block_start_line,
+            ));
+        }
+
+        // If no diagnostics parsed but tool failed, use combined output as fallback
+        if diagnostics.is_empty() && !output.success {
+            let lines: Vec<&str> = combined.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+
+            if lines.is_empty() {
+                let exit_code = output.exit_code;
+                diagnostics.push(CodeBlockDiagnostic {
+                    file_line: code_block_start_line,
+                    column: None,
+                    message: format!("Tool exited with code {exit_code}"),
+                    severity: DiagnosticSeverity::Error,
+                    tool: tool_id.to_string(),
+                    code_block_start: code_block_start_line,
+                });
+            } else {
+                for line_text in lines {
+                    diagnostics.push(Self::unpositioned_diagnostic(
+                        line_text,
+                        DiagnosticSeverity::Error,
+                        tool_id,
+                        code_block_start_line,
+                    ));
+                }
+            }
+        }
+
+        diagnostics
+    }
+
+    /// Build a diagnostic for a message that carried no `file:line:col:` prefix.
+    ///
+    /// A tool that states the position in prose instead ("parse error: ... at line 3,
+    /// column 8") is still telling us where the problem is, so the diagnostic goes there.
+    /// Only a message that names no position at all anchors at the fence.
+    fn unpositioned_diagnostic(
+        message: &str,
+        severity: DiagnosticSeverity,
+        tool_id: &str,
+        code_block_start_line: usize,
+    ) -> CodeBlockDiagnostic {
+        let (line_offset, column) = Self::parse_position_in_message(message).unwrap_or((0, None));
+        CodeBlockDiagnostic {
+            file_line: code_block_start_line + line_offset,
+            column,
+            message: message.to_string(),
+            severity,
+            tool: tool_id.to_string(),
+            code_block_start: code_block_start_line,
+        }
+    }
+
+    /// Find an "at line N" / "at line N, column M" position stated inside a message.
+    ///
+    /// The last occurrence wins: the message is a sentence, and a tool that mentions more
+    /// than one position ends on the one the diagnostic is about.
+    fn parse_position_in_message(message: &str) -> Option<(usize, Option<usize>)> {
+        // ASCII-lowercasing preserves byte offsets, so positions found here index `message`
+        // itself; only ASCII digits are ever parsed out of it.
+        let lower = message.to_ascii_lowercase();
+        let after_marker = &lower[lower.rfind("at line ")? + "at line ".len()..];
+
+        let leading_number = |text: &str| -> Option<usize> {
+            let end = text.find(|c: char| !c.is_ascii_digit()).unwrap_or(text.len());
+            text[..end].parse::<usize>().ok()
+        };
+
+        let line_num = leading_number(after_marker)?;
+        let after_line = after_marker.trim_start_matches(|c: char| c.is_ascii_digit());
+        let after_separator = after_line
+            .trim_start()
+            .strip_prefix(',')
+            .unwrap_or(after_line)
+            .trim_start();
+        let column = after_separator.strip_prefix("column ").and_then(leading_number);
+
+        Some((line_num, column))
+    }
+
+    /// Parse standard "file:line:col: message" format.
+    fn parse_standard_format(
+        &self,
+        line: &str,
+        tool_id: &str,
+        code_block_start_line: usize,
+    ) -> Option<CodeBlockDiagnostic> {
+        // Match patterns like "file.py:1:10: E501 message"
+        let mut parts = line.rsplitn(4, ':');
+        let message = parts.next()?.trim().to_string();
+        let part1 = parts.next()?.trim().to_string();
+        let part2 = parts.next()?.trim().to_string();
+        let part3 = parts.next().map(|s| s.trim().to_string());
+
+        let (line_part, col_part) = if part3.is_some() {
+            (part2, Some(part1))
+        } else {
+            (part1, None)
+        };
+
+        if let Ok(line_num) = line_part.parse::<usize>() {
+            let column = col_part.and_then(|s| s.parse::<usize>().ok());
+            let message = Self::strip_fixable_markers(&message);
+            if !message.is_empty() {
+                let severity = self.infer_severity(&message);
+                return Some(CodeBlockDiagnostic {
+                    file_line: code_block_start_line + line_num,
+                    column,
+                    message,
+                    severity,
+                    tool: tool_id.to_string(),
+                    code_block_start: code_block_start_line,
+                });
+            }
+        }
+        None
+    }
+
+    /// Parse a GitHub Actions workflow command: `::<level> <k=v>,...::<message>`.
+    ///
+    /// Emitted by `--format github-annotation-native` (sqlfluff) and by other tools with a
+    /// GitHub Actions mode. Only the three annotation levels are diagnostics: `::group::`
+    /// and `::endgroup::` bracket the findings and carry none, so they are skipped rather
+    /// than reported. A missing `line` anchors the diagnostic at the fence, the same place
+    /// an unpositioned message goes.
+    fn parse_github_annotation(line: &str, tool_id: &str, code_block_start_line: usize) -> Option<CodeBlockDiagnostic> {
+        let body = line.strip_prefix("::")?;
+        let (head, message) = body.split_once("::")?;
+
+        let (level, properties) = head.split_once(' ').unwrap_or((head, ""));
+        let severity = match level {
+            "error" => DiagnosticSeverity::Error,
+            "warning" => DiagnosticSeverity::Warning,
+            "notice" => DiagnosticSeverity::Info,
+            _ => return None,
+        };
+
+        let property = |name: &str| -> Option<usize> {
+            properties
+                .split(',')
+                .filter_map(|pair| pair.split_once('='))
+                .find(|(key, _)| *key == name)
+                .and_then(|(_, value)| value.parse::<usize>().ok())
+        };
+
+        let message = Self::strip_fixable_markers(&decode_workflow_command(message));
+        if message.is_empty() {
+            return None;
+        }
+
+        Some(CodeBlockDiagnostic {
+            file_line: code_block_start_line + property("line").unwrap_or(0),
+            column: property("col"),
+            message,
+            severity,
+            tool: tool_id.to_string(),
+            code_block_start: code_block_start_line,
+        })
+    }
+
+    /// Parse eslint-style "line:col severity message" format.
+    fn parse_eslint_format(
+        &self,
+        line: &str,
+        tool_id: &str,
+        code_block_start_line: usize,
+    ) -> Option<CodeBlockDiagnostic> {
+        // Match "1:10 error Message"
+        let parts: Vec<&str> = line.splitn(3, ' ').collect();
+        if parts.len() >= 2 {
+            let loc_parts: Vec<&str> = parts[0].split(':').collect();
+            if loc_parts.len() == 2
+                && let (Ok(line_num), Ok(col)) = (loc_parts[0].parse::<usize>(), loc_parts[1].parse::<usize>())
+            {
+                let (sev_part, msg_part) = if parts.len() >= 3 {
+                    (parts[1], parts[2])
+                } else {
+                    (parts[1], "")
+                };
+                let message = if msg_part.is_empty() {
+                    sev_part.to_string()
+                } else {
+                    msg_part.to_string()
+                };
+                let message = Self::strip_fixable_markers(&message);
+                let severity = match sev_part.to_lowercase().as_str() {
+                    "error" => DiagnosticSeverity::Error,
+                    "warning" | "warn" => DiagnosticSeverity::Warning,
+                    "info" => DiagnosticSeverity::Info,
+                    _ => self.infer_severity(&message),
+                };
+                return Some(CodeBlockDiagnostic {
+                    file_line: code_block_start_line + line_num,
+                    column: Some(col),
+                    message,
+                    severity,
+                    tool: tool_id.to_string(),
+                    code_block_start: code_block_start_line,
+                });
+            }
+        }
+        None
+    }
+
+    /// Parse shellcheck-style "In - line N: message" format.
+    fn parse_shellcheck_format(
+        &self,
+        line: &str,
+        tool_id: &str,
+        code_block_start_line: usize,
+    ) -> Option<CodeBlockDiagnostic> {
+        // Match "In - line 5:" pattern
+        if line.starts_with("In ")
+            && line.contains(" line ")
+            && let Some(line_start) = line.find(" line ")
+        {
+            let after_line = &line[line_start + 6..];
+            if let Some(colon_pos) = after_line.find(':')
+                && let Ok(line_num) = after_line[..colon_pos].trim().parse::<usize>()
+            {
+                let message = Self::strip_fixable_markers(after_line[colon_pos + 1..].trim());
+                if !message.is_empty() {
+                    let severity = self.infer_severity(&message);
+                    return Some(CodeBlockDiagnostic {
+                        file_line: code_block_start_line + line_num,
+                        column: None,
+                        message,
+                        severity,
+                        tool: tool_id.to_string(),
+                        code_block_start: code_block_start_line,
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// Parse shellcheck header line to capture line number context.
+    fn parse_shellcheck_header(&self, line: &str) -> Option<usize> {
+        if line.starts_with("In ")
+            && line.contains(" line ")
+            && let Some(line_start) = line.find(" line ")
+        {
+            let after_line = &line[line_start + 6..];
+            if let Some(colon_pos) = after_line.find(':') {
+                return after_line[..colon_pos].trim().parse::<usize>().ok();
+            }
+        }
+        None
+    }
+
+    /// Parse shellcheck message line containing SCXXXX codes.
+    fn parse_shellcheck_message(
+        &self,
+        line: &str,
+        tool_id: &str,
+        code_block_start_line: usize,
+        line_num: usize,
+    ) -> Option<CodeBlockDiagnostic> {
+        let sc_pos = line.find("SC")?;
+        let after_sc = &line[sc_pos + 2..];
+        let code_len = after_sc.chars().take_while(char::is_ascii_digit).count();
+        if code_len == 0 {
+            return None;
+        }
+        let after_code = &after_sc[code_len..];
+        let sev_start = after_code.find('(')? + 1;
+        let sev_end = after_code[sev_start..].find(')')? + sev_start;
+        let sev = after_code[sev_start..sev_end].trim().to_lowercase();
+        let message_start = after_code.find("):")? + 2;
+        let message = Self::strip_fixable_markers(after_code[message_start..].trim());
+        if message.is_empty() {
+            return None;
+        }
+
+        let severity = match sev.as_str() {
+            "error" => DiagnosticSeverity::Error,
+            "warning" | "warn" => DiagnosticSeverity::Warning,
+            "info" | "style" => DiagnosticSeverity::Info,
+            _ => self.infer_severity(&message),
+        };
+
+        Some(CodeBlockDiagnostic {
+            file_line: code_block_start_line + line_num,
+            column: None,
+            message,
+            severity,
+            tool: tool_id.to_string(),
+            code_block_start: code_block_start_line,
+        })
+    }
+
+    /// Parse "Error: <message>" or "Warning: <message>" lines.
+    ///
+    /// Used for tools like tombi that output multi-line diagnostics where the
+    /// error message and position are on separate lines. Only matches capitalized
+    /// prefixes to avoid conflicting with lowercase `error:` in less structured output.
+    fn parse_error_line(line: &str) -> Option<(String, DiagnosticSeverity)> {
+        let (msg, severity) = if let Some(msg) = line.strip_prefix("Error:") {
+            (msg, DiagnosticSeverity::Error)
+        } else if let Some(msg) = line.strip_prefix("Warning:") {
+            (msg, DiagnosticSeverity::Warning)
+        } else {
+            return None;
+        };
+        let msg = msg.trim();
+        if msg.is_empty() {
+            return None;
+        }
+        Some((msg.to_string(), severity))
+    }
+
+    /// Parse "at line N column M" position lines (case-insensitive).
+    ///
+    /// Returns (line_number, column_number) if the pattern matches.
+    fn parse_at_line_column(line: &str) -> Option<(usize, usize)> {
+        let lower = line.to_lowercase();
+        let rest = lower.strip_prefix("at line ")?;
+        let mut parts = rest.split_whitespace();
+        let line_num: usize = parts.next()?.parse().ok()?;
+        if parts.next()? != "column" {
+            return None;
+        }
+        let col: usize = parts.next()?.parse().ok()?;
+        Some((line_num, col))
+    }
+
+    /// Infer severity from message content.
+    fn infer_severity(&self, message: &str) -> DiagnosticSeverity {
+        let lower = message.to_lowercase();
+        if lower.contains("error")
+            || lower.starts_with('e') && lower.chars().nth(1).is_some_and(|c| c.is_ascii_digit())
+            || lower.starts_with('f') && lower.chars().nth(1).is_some_and(|c| c.is_ascii_digit())
+        {
+            DiagnosticSeverity::Error
+        } else if lower.contains("warning")
+            || lower.contains("warn")
+            || lower.starts_with('w') && lower.chars().nth(1).is_some_and(|c| c.is_ascii_digit())
+        {
+            DiagnosticSeverity::Warning
+        } else {
+            DiagnosticSeverity::Info
+        }
+    }
+
+    /// Strip "fixable" markers from external tool messages.
+    ///
+    /// External tools like ruff show `[*]` to indicate fixable issues, but in rumdl's
+    /// context these markers can be misleading - the lint tool's fix capability may
+    /// differ from what our configured formatter can fix. We strip these markers
+    /// to avoid making promises we can't keep.
+    fn strip_fixable_markers(message: &str) -> String {
+        message
+            .replace(" [*]", "")
+            .replace("[*] ", "")
+            .replace("[*]", "")
+            .replace(" (fixable)", "")
+            .replace("(fixable) ", "")
+            .replace("(fixable)", "")
+            .replace(" [fix available]", "")
+            .replace("[fix available] ", "")
+            .replace("[fix available]", "")
+            .replace(" [autofix]", "")
+            .replace("[autofix] ", "")
+            .replace("[autofix]", "")
+            .trim()
+            .to_string()
+    }
+}
+
+/// Builder for FencedCodeBlockInfo during parsing.
+struct FencedCodeBlockBuilder {
+    start_line: usize,
+    content_start: usize,
+    language: String,
+    info_string: String,
+    fence_char: char,
+    fence_length: usize,
+    indent: usize,
+    indent_prefix: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_config() -> CodeBlockToolsConfig {
+        CodeBlockToolsConfig::default()
+    }
+
+    #[test]
+    fn test_extract_code_blocks() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let content = r#"# Example
+
+```python
+def hello():
+    print("Hello")
+```
+
+Some text
+
+```rust
+fn main() {}
+```
+"#;
+
+        let blocks = processor.extract_code_blocks(content);
+
+        assert_eq!(blocks.len(), 2);
+
+        assert_eq!(blocks[0].language, "python");
+        assert_eq!(blocks[0].fence_char, '`');
+        assert_eq!(blocks[0].fence_length, 3);
+        assert_eq!(blocks[0].start_line, 2);
+        assert_eq!(blocks[0].indent, 0);
+        assert_eq!(blocks[0].indent_prefix, "");
+
+        assert_eq!(blocks[1].language, "rust");
+        assert_eq!(blocks[1].fence_char, '`');
+        assert_eq!(blocks[1].fence_length, 3);
+    }
+
+    #[test]
+    fn test_extract_code_blocks_with_info_string() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let content = "```python title=\"example.py\"\ncode\n```";
+        let blocks = processor.extract_code_blocks(content);
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].language, "python");
+        assert_eq!(blocks[0].info_string, "python title=\"example.py\"");
+    }
+
+    #[test]
+    fn test_extract_code_blocks_tilde_fence() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let content = "~~~bash\necho hello\n~~~";
+        let blocks = processor.extract_code_blocks(content);
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].language, "bash");
+        assert_eq!(blocks[0].fence_char, '~');
+        assert_eq!(blocks[0].fence_length, 3);
+        assert_eq!(blocks[0].indent_prefix, "");
+    }
+
+    #[test]
+    fn test_extract_code_blocks_with_indent_prefix() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let content = "  - item\n    ```python\n    print('hi')\n    ```";
+        let blocks = processor.extract_code_blocks(content);
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].indent_prefix, "    ");
+    }
+
+    #[test]
+    fn test_extract_code_blocks_no_language() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let content = "```\nplain code\n```";
+        let blocks = processor.extract_code_blocks(content);
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].language, "");
+    }
+
+    #[test]
+    fn test_resolve_language_linguist() {
+        let mut config = default_config();
+        config.normalize_language = NormalizeLanguage::Linguist;
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        assert_eq!(processor.resolve_language("py"), "python");
+        assert_eq!(processor.resolve_language("bash"), "shell");
+        assert_eq!(processor.resolve_language("js"), "javascript");
+    }
+
+    #[test]
+    fn test_resolve_language_exact() {
+        let mut config = default_config();
+        config.normalize_language = NormalizeLanguage::Exact;
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        assert_eq!(processor.resolve_language("py"), "py");
+        assert_eq!(processor.resolve_language("BASH"), "bash");
+    }
+
+    #[test]
+    fn test_resolve_language_user_alias_override() {
+        let mut config = default_config();
+        config.language_aliases.insert("py".to_string(), "python".to_string());
+        config.normalize_language = NormalizeLanguage::Exact;
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        assert_eq!(processor.resolve_language("PY"), "python");
+    }
+
+    #[test]
+    fn test_indent_strip_and_reapply_roundtrip() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let raw = "    def hello():\n        print('hi')";
+        let stripped = processor.strip_indent_from_block(raw, "    ");
+        assert_eq!(stripped, "def hello():\n    print('hi')");
+
+        let reapplied = processor.apply_indent_to_block(&stripped, "    ");
+        assert_eq!(reapplied, raw);
+    }
+
+    #[test]
+    fn test_infer_severity() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        assert_eq!(
+            processor.infer_severity("E501 line too long"),
+            DiagnosticSeverity::Error
+        );
+        assert_eq!(
+            processor.infer_severity("W291 trailing whitespace"),
+            DiagnosticSeverity::Warning
+        );
+        assert_eq!(
+            processor.infer_severity("error: something failed"),
+            DiagnosticSeverity::Error
+        );
+        assert_eq!(
+            processor.infer_severity("warning: unused variable"),
+            DiagnosticSeverity::Warning
+        );
+        assert_eq!(
+            processor.infer_severity("note: consider using"),
+            DiagnosticSeverity::Info
+        );
+    }
+
+    #[test]
+    fn test_parse_standard_format_windows_path() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let output = ToolOutput {
+            stdout: "C:\\path\\file.py:2:5: E123 message".to_string(),
+            stderr: String::new(),
+            exit_code: 1,
+            success: false,
+        };
+
+        let diags = processor.parse_tool_output(&output, "ruff:check", 10);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].file_line, 12);
+        assert_eq!(diags[0].column, Some(5));
+        assert_eq!(diags[0].message, "E123 message");
+    }
+
+    #[test]
+    fn test_parse_eslint_severity() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let output = ToolOutput {
+            stdout: "1:2 error Unexpected token".to_string(),
+            stderr: String::new(),
+            exit_code: 1,
+            success: false,
+        };
+
+        let diags = processor.parse_tool_output(&output, "eslint", 5);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].file_line, 6);
+        assert_eq!(diags[0].column, Some(2));
+        assert_eq!(diags[0].severity, DiagnosticSeverity::Error);
+        assert_eq!(diags[0].message, "Unexpected token");
+    }
+
+    #[test]
+    fn test_parse_shellcheck_multiline() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let output = ToolOutput {
+            stdout: "In - line 3:\necho $var\n ^-- SC2086 (info): Double quote to prevent globbing".to_string(),
+            stderr: String::new(),
+            exit_code: 1,
+            success: false,
+        };
+
+        let diags = processor.parse_tool_output(&output, "shellcheck", 10);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].file_line, 13);
+        assert_eq!(diags[0].severity, DiagnosticSeverity::Info);
+        assert_eq!(diags[0].message, "Double quote to prevent globbing");
+    }
+
+    #[test]
+    fn test_lint_no_config() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let content = "```python\nprint('hello')\n```";
+        let result = processor.lint(content);
+
+        // Should succeed with no diagnostics (no tools configured)
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_format_no_config() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let content = "```python\nprint('hello')\n```";
+        let result = processor.format(content);
+
+        // Should succeed with unchanged content (no tools configured)
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert_eq!(output.content, content);
+        assert!(!output.had_errors);
+        assert!(output.error_messages.is_empty());
+    }
+
+    #[test]
+    fn test_lint_on_missing_language_definition_fail() {
+        let mut config = default_config();
+        config.on_missing_language_definition = OnMissing::Fail;
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let content = "```python\nprint('hello')\n```\n\n```javascript\nconsole.log('hi');\n```";
+        let result = processor.lint(content);
+
+        // Should succeed but return diagnostics for both missing language definitions
+        assert!(result.is_ok());
+        let diagnostics = result.unwrap();
+        assert_eq!(diagnostics.len(), 2);
+        assert!(diagnostics[0].message.contains("No lint tools configured"));
+        assert!(diagnostics[0].message.contains("python"));
+        assert!(diagnostics[1].message.contains("javascript"));
+    }
+
+    #[test]
+    fn test_lint_on_missing_language_definition_fail_fast() {
+        let mut config = default_config();
+        config.on_missing_language_definition = OnMissing::FailFast;
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let content = "```python\nprint('hello')\n```\n\n```javascript\nconsole.log('hi');\n```";
+        let result = processor.lint(content);
+
+        // Should fail immediately on first missing language
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ProcessorError::NoToolsConfigured { .. }));
+    }
+
+    #[test]
+    fn test_format_on_missing_language_definition_fail() {
+        let mut config = default_config();
+        config.on_missing_language_definition = OnMissing::Fail;
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let content = "```python\nprint('hello')\n```";
+        let result = processor.format(content);
+
+        // Should succeed but report errors
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert_eq!(output.content, content); // Content unchanged
+        assert!(output.had_errors);
+        assert!(!output.error_messages.is_empty());
+        assert!(output.error_messages[0].contains("No format tools configured"));
+    }
+
+    #[test]
+    fn test_format_on_missing_language_definition_fail_fast() {
+        let mut config = default_config();
+        config.on_missing_language_definition = OnMissing::FailFast;
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let content = "```python\nprint('hello')\n```";
+        let result = processor.format(content);
+
+        // Should fail immediately
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ProcessorError::NoToolsConfigured { .. }));
+    }
+
+    #[test]
+    fn test_lint_on_missing_tool_binary_fail() {
+        use super::super::config::{LanguageToolConfig, ToolDefinition};
+
+        let mut config = default_config();
+        config.on_missing_tool_binary = OnMissing::Fail;
+
+        // Configure a tool with a non-existent binary
+        let lang_config = LanguageToolConfig {
+            lint: vec!["nonexistent-linter".to_string()],
+            ..Default::default()
+        };
+        config.languages.insert("python".to_string(), lang_config);
+
+        let tool_def = ToolDefinition {
+            command: vec!["nonexistent-binary-xyz123".to_string()],
+            ..Default::default()
+        };
+        config.tools.insert("nonexistent-linter".to_string(), tool_def);
+
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let content = "```python\nprint('hello')\n```";
+        let result = processor.lint(content);
+
+        // Should succeed but return diagnostic for missing binary
+        assert!(result.is_ok());
+        let diagnostics = result.unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains("not found in PATH"));
+    }
+
+    #[test]
+    fn test_lint_on_missing_tool_binary_fail_fast() {
+        use super::super::config::{LanguageToolConfig, ToolDefinition};
+
+        let mut config = default_config();
+        config.on_missing_tool_binary = OnMissing::FailFast;
+
+        // Configure a tool with a non-existent binary
+        let lang_config = LanguageToolConfig {
+            lint: vec!["nonexistent-linter".to_string()],
+            ..Default::default()
+        };
+        config.languages.insert("python".to_string(), lang_config);
+
+        let tool_def = ToolDefinition {
+            command: vec!["nonexistent-binary-xyz123".to_string()],
+            ..Default::default()
+        };
+        config.tools.insert("nonexistent-linter".to_string(), tool_def);
+
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let content = "```python\nprint('hello')\n```";
+        let result = processor.lint(content);
+
+        // Should fail immediately
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ProcessorError::ToolBinaryNotFound { .. }));
+    }
+
+    #[test]
+    fn test_format_on_missing_tool_binary_fail() {
+        use super::super::config::{LanguageToolConfig, ToolDefinition};
+
+        let mut config = default_config();
+        config.on_missing_tool_binary = OnMissing::Fail;
+
+        // Configure a tool with a non-existent binary
+        let lang_config = LanguageToolConfig {
+            format: vec!["nonexistent-formatter".to_string()],
+            ..Default::default()
+        };
+        config.languages.insert("python".to_string(), lang_config);
+
+        let tool_def = ToolDefinition {
+            command: vec!["nonexistent-binary-xyz123".to_string()],
+            ..Default::default()
+        };
+        config.tools.insert("nonexistent-formatter".to_string(), tool_def);
+
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let content = "```python\nprint('hello')\n```";
+        let result = processor.format(content);
+
+        // Should succeed but report errors
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert_eq!(output.content, content); // Content unchanged
+        assert!(output.had_errors);
+        assert!(!output.error_messages.is_empty());
+        assert!(output.error_messages[0].contains("not found in PATH"));
+    }
+
+    #[test]
+    fn test_format_on_missing_tool_binary_fail_fast() {
+        use super::super::config::{LanguageToolConfig, ToolDefinition};
+
+        let mut config = default_config();
+        config.on_missing_tool_binary = OnMissing::FailFast;
+
+        // Configure a tool with a non-existent binary
+        let lang_config = LanguageToolConfig {
+            format: vec!["nonexistent-formatter".to_string()],
+            ..Default::default()
+        };
+        config.languages.insert("python".to_string(), lang_config);
+
+        let tool_def = ToolDefinition {
+            command: vec!["nonexistent-binary-xyz123".to_string()],
+            ..Default::default()
+        };
+        config.tools.insert("nonexistent-formatter".to_string(), tool_def);
+
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let content = "```python\nprint('hello')\n```";
+        let result = processor.format(content);
+
+        // Should fail immediately
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ProcessorError::ToolBinaryNotFound { .. }));
+    }
+
+    #[test]
+    fn test_lint_rumdl_builtin_skipped_for_markdown() {
+        // Configure the built-in "rumdl" tool for markdown
+        // The processor should skip it (handled by embedded markdown linting)
+        let mut config = default_config();
+        config.languages.insert(
+            "markdown".to_string(),
+            LanguageToolConfig {
+                lint: vec![RUMDL_BUILTIN_TOOL.to_string()],
+                ..Default::default()
+            },
+        );
+        config.on_missing_language_definition = OnMissing::Fail;
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let content = "```markdown\n# Hello\n```";
+        let result = processor.lint(content);
+
+        // Should succeed with no diagnostics - "rumdl" tool is skipped, not treated as unknown
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_format_rumdl_builtin_skipped_for_markdown() {
+        // Configure the built-in "rumdl" tool for markdown
+        let mut config = default_config();
+        config.languages.insert(
+            "markdown".to_string(),
+            LanguageToolConfig {
+                format: vec![RUMDL_BUILTIN_TOOL.to_string()],
+                ..Default::default()
+            },
+        );
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let content = "```markdown\n# Hello\n```";
+        let result = processor.format(content);
+
+        // Should succeed with unchanged content - "rumdl" tool is skipped
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert_eq!(output.content, content);
+        assert!(!output.had_errors);
+    }
+
+    #[test]
+    fn test_is_markdown_language() {
+        // Test the helper function
+        assert!(is_markdown_language("markdown"));
+        assert!(is_markdown_language("Markdown"));
+        assert!(is_markdown_language("MARKDOWN"));
+        assert!(is_markdown_language("md"));
+        assert!(is_markdown_language("MD"));
+        assert!(!is_markdown_language("python"));
+        assert!(!is_markdown_language("rust"));
+        assert!(!is_markdown_language(""));
+    }
+
+    // Issue #423: MkDocs admonition code block detection
+
+    #[test]
+    fn test_extract_mkdocs_admonition_code_block() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::MkDocs);
+
+        let content = "!!! note\n    Some text\n\n    ```python\n    def hello():\n        pass\n    ```\n";
+        let blocks = processor.extract_code_blocks(content);
+
+        assert_eq!(blocks.len(), 1, "Should detect code block inside MkDocs admonition");
+        assert_eq!(blocks[0].language, "python");
+    }
+
+    #[test]
+    fn test_extract_mkdocs_tab_code_block() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::MkDocs);
+
+        let content = "=== \"Python\"\n\n    ```python\n    print(\"hello\")\n    ```\n";
+        let blocks = processor.extract_code_blocks(content);
+
+        assert_eq!(blocks.len(), 1, "Should detect code block inside MkDocs tab");
+        assert_eq!(blocks[0].language, "python");
+    }
+
+    #[test]
+    fn test_standard_flavor_ignores_admonition_indented_content() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        // With standard flavor, pulldown_cmark parses this differently;
+        // our MkDocs extraction should NOT run
+        let content = "!!! note\n    Some text\n\n    ```python\n    def hello():\n        pass\n    ```\n";
+        let blocks = processor.extract_code_blocks(content);
+
+        // Standard flavor relies on pulldown_cmark only, which may or may not detect
+        // indented fenced blocks. The key assertion is that we don't double-detect.
+        // With standard flavor, the MkDocs extraction path is skipped entirely.
+        for (i, b) in blocks.iter().enumerate() {
+            for (j, b2) in blocks.iter().enumerate() {
+                if i != j {
+                    assert_ne!(b.start_line, b2.start_line, "No duplicate blocks should exist");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_mkdocs_top_level_blocks_alongside_admonition() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::MkDocs);
+
+        let content =
+            "```rust\nfn main() {}\n```\n\n!!! note\n    Some text\n\n    ```python\n    print(\"hello\")\n    ```\n";
+        let blocks = processor.extract_code_blocks(content);
+
+        assert_eq!(
+            blocks.len(),
+            2,
+            "Should detect both top-level and admonition code blocks"
+        );
+        assert_eq!(blocks[0].language, "rust");
+        assert_eq!(blocks[1].language, "python");
+    }
+
+    #[test]
+    fn test_mkdocs_nested_admonition_code_block() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::MkDocs);
+
+        let content = "\
+!!! note
+    Some text
+
+    !!! warning
+        Nested content
+
+        ```python
+        x = 1
+        ```
+";
+        let blocks = processor.extract_code_blocks(content);
+        assert_eq!(blocks.len(), 1, "Should detect code block inside nested admonition");
+        assert_eq!(blocks[0].language, "python");
+    }
+
+    #[test]
+    fn test_mkdocs_consecutive_admonitions_no_stale_context() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::MkDocs);
+
+        // Two consecutive admonitions at the same indent level.
+        // The first has no code block, the second does.
+        let content = "\
+!!! note
+    First admonition content
+
+!!! warning
+    Second admonition content
+
+    ```python
+    y = 2
+    ```
+";
+        let blocks = processor.extract_code_blocks(content);
+        assert_eq!(blocks.len(), 1, "Should detect code block in second admonition only");
+        assert_eq!(blocks[0].language, "python");
+    }
+
+    #[test]
+    fn test_mkdocs_crlf_line_endings() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::MkDocs);
+
+        // Use \r\n line endings
+        let content = "!!! note\r\n    Some text\r\n\r\n    ```python\r\n    x = 1\r\n    ```\r\n";
+        let blocks = processor.extract_code_blocks(content);
+
+        assert_eq!(blocks.len(), 1, "Should detect code block with CRLF line endings");
+        assert_eq!(blocks[0].language, "python");
+
+        // Verify byte offsets point to valid content
+        let extracted = &content[blocks[0].content_start..blocks[0].content_end];
+        assert!(
+            extracted.contains("x = 1"),
+            "Extracted content should contain code. Got: {extracted:?}"
+        );
+    }
+
+    #[test]
+    fn test_mkdocs_unclosed_fence_in_admonition() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::MkDocs);
+
+        // Unclosed fence should not produce a block
+        let content = "!!! note\n    ```python\n    x = 1\n    no closing fence\n";
+        let blocks = processor.extract_code_blocks(content);
+        assert_eq!(blocks.len(), 0, "Unclosed fence should not produce a block");
+    }
+
+    #[test]
+    fn test_mkdocs_tilde_fence_in_admonition() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::MkDocs);
+
+        let content = "!!! note\n    ~~~ruby\n    puts 'hi'\n    ~~~\n";
+        let blocks = processor.extract_code_blocks(content);
+        assert_eq!(blocks.len(), 1, "Should detect tilde-fenced code block");
+        assert_eq!(blocks[0].language, "ruby");
+    }
+
+    #[test]
+    fn test_mkdocs_empty_lines_in_code_block() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::MkDocs);
+
+        // Code block with empty lines inside — verifies byte offsets are correct
+        // across empty lines (the previous find("") approach would break here)
+        let content = "!!! note\n    ```python\n    x = 1\n\n    y = 2\n    ```\n";
+        let blocks = processor.extract_code_blocks(content);
+        assert_eq!(blocks.len(), 1);
+
+        let extracted = &content[blocks[0].content_start..blocks[0].content_end];
+        assert!(
+            extracted.contains("x = 1") && extracted.contains("y = 2"),
+            "Extracted content should span across the empty line. Got: {extracted:?}"
+        );
+    }
+
+    #[test]
+    fn test_mkdocs_content_byte_offsets_lf() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::MkDocs);
+
+        let content = "!!! note\n    ```python\n    print('hi')\n    ```\n";
+        let blocks = processor.extract_code_blocks(content);
+        assert_eq!(blocks.len(), 1);
+
+        // Verify the extracted content is exactly the code body
+        let extracted = &content[blocks[0].content_start..blocks[0].content_end];
+        assert_eq!(extracted, "    print('hi')\n", "Content offsets should be exact for LF");
+    }
+
+    #[test]
+    fn test_mkdocs_content_byte_offsets_crlf() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::MkDocs);
+
+        let content = "!!! note\r\n    ```python\r\n    print('hi')\r\n    ```\r\n";
+        let blocks = processor.extract_code_blocks(content);
+        assert_eq!(blocks.len(), 1);
+
+        let extracted = &content[blocks[0].content_start..blocks[0].content_end];
+        assert_eq!(
+            extracted, "    print('hi')\r\n",
+            "Content offsets should be exact for CRLF"
+        );
+    }
+
+    #[test]
+    fn test_lint_enabled_false_skips_language_in_strict_mode() {
+        // With on-missing-language-definition = "fail", a language configured
+        // with enabled=false should be silently skipped (no error).
+        let mut config = default_config();
+        config.normalize_language = NormalizeLanguage::Exact;
+        config.on_missing_language_definition = OnMissing::Fail;
+
+        // Python has tools, plaintext is disabled
+        config.languages.insert(
+            "python".to_string(),
+            LanguageToolConfig {
+                lint: vec!["ruff:check".to_string()],
+                ..Default::default()
+            },
+        );
+        config.languages.insert(
+            "plaintext".to_string(),
+            LanguageToolConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let content = "```plaintext\nsome text\n```";
+        let result = processor.lint(content);
+
+        // No error for plaintext: enabled=false satisfies strict mode
+        assert!(result.is_ok());
+        let diagnostics = result.unwrap();
+        assert!(
+            diagnostics.is_empty(),
+            "Expected no diagnostics for disabled language, got: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn test_format_enabled_false_skips_language_in_strict_mode() {
+        // Same test but for format mode
+        let mut config = default_config();
+        config.normalize_language = NormalizeLanguage::Exact;
+        config.on_missing_language_definition = OnMissing::Fail;
+
+        config.languages.insert(
+            "plaintext".to_string(),
+            LanguageToolConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let content = "```plaintext\nsome text\n```";
+        let result = processor.format(content);
+
+        // No error for plaintext: enabled=false satisfies strict mode
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(!output.had_errors, "Expected no errors for disabled language");
+        assert!(
+            output.error_messages.is_empty(),
+            "Expected no error messages, got: {:?}",
+            output.error_messages
+        );
+    }
+
+    #[test]
+    fn test_enabled_false_default_true_preserved() {
+        // Verify that when enabled is not set, it defaults to true (existing behavior)
+        let mut config = default_config();
+        config.on_missing_language_definition = OnMissing::Fail;
+
+        // Configure python without explicitly setting enabled
+        config.languages.insert(
+            "python".to_string(),
+            LanguageToolConfig {
+                lint: vec!["ruff:check".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let lang_config = config.languages.get("python").unwrap();
+        assert!(lang_config.enabled, "enabled should default to true");
+    }
+
+    #[test]
+    fn test_enabled_false_with_fail_fast_no_error() {
+        // Even with fail-fast, enabled=false should skip silently
+        let mut config = default_config();
+        config.normalize_language = NormalizeLanguage::Exact;
+        config.on_missing_language_definition = OnMissing::FailFast;
+
+        config.languages.insert(
+            "unknown".to_string(),
+            LanguageToolConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let content = "```unknown\nsome content\n```";
+        let result = processor.lint(content);
+
+        // Should not return an error: enabled=false takes precedence over fail-fast
+        assert!(result.is_ok(), "Expected Ok but got Err: {result:?}");
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_enabled_false_format_with_fail_fast_no_error() {
+        // Same for format mode
+        let mut config = default_config();
+        config.normalize_language = NormalizeLanguage::Exact;
+        config.on_missing_language_definition = OnMissing::FailFast;
+
+        config.languages.insert(
+            "unknown".to_string(),
+            LanguageToolConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let content = "```unknown\nsome content\n```";
+        let result = processor.format(content);
+
+        assert!(result.is_ok(), "Expected Ok but got Err: {result:?}");
+        let output = result.unwrap();
+        assert!(!output.had_errors);
+    }
+
+    #[test]
+    fn test_enabled_false_with_tools_still_skips() {
+        // If enabled=false but tools are listed, the language should still be skipped
+        let mut config = default_config();
+        config.on_missing_language_definition = OnMissing::Fail;
+
+        config.languages.insert(
+            "python".to_string(),
+            LanguageToolConfig {
+                enabled: false,
+                lint: vec!["ruff:check".to_string()],
+                format: vec!["ruff:format".to_string()],
+                on_error: None,
+            },
+        );
+
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let content = "```python\nprint('hello')\n```";
+
+        // Lint should skip
+        let lint_result = processor.lint(content);
+        assert!(lint_result.is_ok());
+        assert!(lint_result.unwrap().is_empty());
+
+        // Format should skip
+        let format_result = processor.format(content);
+        assert!(format_result.is_ok());
+        let output = format_result.unwrap();
+        assert!(!output.had_errors);
+        assert_eq!(output.content, content, "Content should be unchanged");
+    }
+
+    #[test]
+    fn test_enabled_true_without_tools_triggers_strict_mode() {
+        // A language configured with enabled=true (default) but no tools
+        // should still trigger strict mode errors
+        let mut config = default_config();
+        config.on_missing_language_definition = OnMissing::Fail;
+
+        config.languages.insert(
+            "python".to_string(),
+            LanguageToolConfig {
+                // enabled defaults to true, no tools
+                ..Default::default()
+            },
+        );
+
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let content = "```python\nprint('hello')\n```";
+        let result = processor.lint(content);
+
+        // Should report an error because enabled=true but no lint tools configured
+        assert!(result.is_ok());
+        let diagnostics = result.unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains("No lint tools configured"));
+    }
+
+    #[test]
+    fn test_mixed_enabled_and_disabled_languages() {
+        // Multiple languages: one disabled, one unconfigured
+        let mut config = default_config();
+        config.normalize_language = NormalizeLanguage::Exact;
+        config.on_missing_language_definition = OnMissing::Fail;
+
+        config.languages.insert(
+            "plaintext".to_string(),
+            LanguageToolConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let content = "\
+```plaintext
+some text
+```
+
+```javascript
+console.log('hi');
+```
+";
+
+        let result = processor.lint(content);
+        assert!(result.is_ok());
+        let diagnostics = result.unwrap();
+
+        // plaintext: skipped (enabled=false), no error
+        // javascript: not configured at all, should trigger strict mode error
+        assert_eq!(diagnostics.len(), 1, "Expected 1 diagnostic, got: {diagnostics:?}");
+        assert!(
+            diagnostics[0].message.contains("javascript"),
+            "Error should be about javascript, got: {}",
+            diagnostics[0].message
+        );
+    }
+
+    #[test]
+    fn test_generic_fallback_includes_all_stderr_lines() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        // Use output that won't be parsed by any structured format parser
+        let output = ToolOutput {
+            stdout: String::new(),
+            stderr: "Parse error at position 42\nUnexpected token '::'\n3 errors found".to_string(),
+            exit_code: 1,
+            success: false,
+        };
+
+        let diags = processor.parse_tool_output(&output, "tombi", 5);
+        assert_eq!(diags.len(), 3, "Expected one diagnostic per non-empty stderr line");
+        assert_eq!(diags[0].message, "Parse error at position 42");
+        assert_eq!(diags[1].message, "Unexpected token '::'");
+        assert_eq!(diags[2].message, "3 errors found");
+        assert!(diags.iter().all(|d| d.tool == "tombi"));
+        assert!(diags.iter().all(|d| d.file_line == 5));
+    }
+
+    #[test]
+    fn test_generic_fallback_includes_all_stdout_lines_when_stderr_empty() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let output = ToolOutput {
+            stdout: "Line 1 error\nLine 2 detail\nLine 3 summary".to_string(),
+            stderr: String::new(),
+            exit_code: 1,
+            success: false,
+        };
+
+        let diags = processor.parse_tool_output(&output, "some-tool", 10);
+        assert_eq!(diags.len(), 3);
+        assert_eq!(diags[0].message, "Line 1 error");
+        assert_eq!(diags[1].message, "Line 2 detail");
+        assert_eq!(diags[2].message, "Line 3 summary");
+    }
+
+    #[test]
+    fn test_generic_fallback_skips_blank_lines() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let output = ToolOutput {
+            stdout: String::new(),
+            stderr: "error: bad input\n\n  \n\ndetail: see above\n".to_string(),
+            exit_code: 1,
+            success: false,
+        };
+
+        let diags = processor.parse_tool_output(&output, "tool", 1);
+        assert_eq!(diags.len(), 2);
+        assert_eq!(diags[0].message, "error: bad input");
+        assert_eq!(diags[1].message, "detail: see above");
+    }
+
+    #[test]
+    fn test_generic_fallback_exit_code_when_no_output() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let output = ToolOutput {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 42,
+            success: false,
+        };
+
+        let diags = processor.parse_tool_output(&output, "tool", 1);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].message, "Tool exited with code 42");
+    }
+
+    #[test]
+    fn test_generic_fallback_not_triggered_on_success() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let output = ToolOutput {
+            stdout: "some informational output".to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+            success: true,
+        };
+
+        let diags = processor.parse_tool_output(&output, "tool", 1);
+        assert!(
+            diags.is_empty(),
+            "Successful tool runs should produce no fallback diagnostics"
+        );
+    }
+
+    #[test]
+    fn test_ansi_codes_stripped_before_parsing() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        // ruff-style output with ANSI color codes wrapping the message
+        let output = ToolOutput {
+            stdout: "\x1b[1m_.py\x1b[0m:\x1b[33m1\x1b[0m:\x1b[33m1\x1b[0m: \x1b[31mE501\x1b[0m Line too long"
+                .to_string(),
+            stderr: String::new(),
+            exit_code: 1,
+            success: false,
+        };
+
+        let diags = processor.parse_tool_output(&output, "ruff:check", 5);
+        assert_eq!(diags.len(), 1, "ANSI-colored output should still be parsed");
+        assert_eq!(diags[0].message, "E501 Line too long");
+        assert_eq!(diags[0].file_line, 6); // 5 + 1
+    }
+
+    #[test]
+    fn test_tombi_multiline_error_format() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        // Simulates tombi output (ANSI codes stripped for clarity)
+        let output = ToolOutput {
+            stdout: "[test]\ntest: \"test\"\nError: invalid key\n    at line 2 column 1\nError: expected key\n    at line 2 column 1\nError: expected '='\n    at line 2 column 1\nError: expected value\n    at line 2 column 1".to_string(),
+            stderr: "1 file failed to be formatted".to_string(),
+            exit_code: 1,
+            success: false,
+        };
+
+        let diags = processor.parse_tool_output(&output, "tombi", 7);
+        assert_eq!(
+            diags.len(),
+            4,
+            "Expected 4 diagnostics from tombi errors, got {diags:?}"
+        );
+        assert_eq!(diags[0].message, "invalid key");
+        assert_eq!(diags[0].file_line, 9); // 7 + 2
+        assert_eq!(diags[0].column, Some(1));
+        assert_eq!(diags[1].message, "expected key");
+        assert_eq!(diags[1].file_line, 9);
+        assert_eq!(diags[2].message, "expected '='");
+        assert_eq!(diags[3].message, "expected value");
+        assert!(diags.iter().all(|d| d.tool == "tombi"));
+    }
+
+    #[test]
+    fn test_tombi_with_ansi_codes() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        // Real tombi output with ANSI escape codes
+        let output = ToolOutput {
+            stdout: "[test]\ntest: \"test\"\n\x1b[1;31m  Error\x1b[0m: \x1b[1minvalid key\x1b[0m\n    \x1b[90mat line 2 column 1\x1b[0m\n\x1b[1;31m  Error\x1b[0m: \x1b[1mexpected '='\x1b[0m\n    \x1b[90mat line 2 column 1\x1b[0m".to_string(),
+            stderr: "1 file failed to be formatted".to_string(),
+            exit_code: 1,
+            success: false,
+        };
+
+        let diags = processor.parse_tool_output(&output, "tombi", 7);
+        assert_eq!(
+            diags.len(),
+            2,
+            "Expected 2 diagnostics from ANSI-colored tombi output, got {diags:?}"
+        );
+        assert_eq!(diags[0].message, "invalid key");
+        assert_eq!(diags[0].file_line, 9);
+        assert_eq!(diags[1].message, "expected '='");
+        assert_eq!(diags[1].file_line, 9);
+    }
+
+    /// sqlfluff's `github-annotation-native` output, verbatim, for `SELECT   1  FROM   t`.
+    ///
+    /// The `::group::` / `::endgroup::` markers bracket every run and carry no finding, so
+    /// a parser that treated any `::...::` line as a diagnostic would report five.
+    const SQLFLUFF_ANNOTATIONS: &str = "\
+::group::stdin
+::warning title=SQLFluff,file=stdin,line=1,col=7,endLine=1,endColumn=10::LT01: Expected only single space before numeric literal. Found '   '. [layout.spacing]
+::warning title=SQLFluff,file=stdin,line=1,col=11,endLine=1,endColumn=13::LT01: Expected only single space before 'FROM' keyword. Found '  '. [layout.spacing]
+::warning title=SQLFluff,file=stdin,line=1,col=17,endLine=1,endColumn=20::LT01: Expected only single space before naked identifier. Found '   '. [layout.spacing]
+::endgroup::";
+
+    #[test]
+    fn test_github_annotation_maps_line_and_column() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let output = ToolOutput {
+            stdout: SQLFLUFF_ANNOTATIONS.to_string(),
+            stderr: String::new(),
+            exit_code: 1,
+            success: false,
+        };
+
+        let diags = processor.parse_tool_output(&output, "sqlfluff:lint", 3);
+        assert_eq!(diags.len(), 3, "the group markers carry no finding: {diags:?}");
+        assert_eq!(diags.iter().map(|d| d.file_line).collect::<Vec<_>>(), vec![4, 4, 4]);
+        assert_eq!(
+            diags.iter().map(|d| d.column).collect::<Vec<_>>(),
+            vec![Some(7), Some(11), Some(17)]
+        );
+        assert!(diags[0].message.starts_with("LT01: Expected only single space"));
+        assert!(diags.iter().all(|d| matches!(d.severity, DiagnosticSeverity::Warning)));
+    }
+
+    #[test]
+    fn test_github_annotation_severity_per_level() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let output = ToolOutput {
+            stdout: "::error line=1::broken\n::warning line=2::suspicious\n::notice line=3::detail".to_string(),
+            stderr: String::new(),
+            exit_code: 1,
+            success: false,
+        };
+
+        let diags = processor.parse_tool_output(&output, "tool", 10);
+        assert_eq!(diags.len(), 3);
+        assert!(matches!(diags[0].severity, DiagnosticSeverity::Error));
+        assert!(matches!(diags[1].severity, DiagnosticSeverity::Warning));
+        assert!(matches!(diags[2].severity, DiagnosticSeverity::Info));
+        assert_eq!(diags[2].file_line, 13);
+    }
+
+    #[test]
+    fn test_github_annotation_without_line_anchors_at_fence() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let output = ToolOutput {
+            stdout: "::error::something the tool could not place".to_string(),
+            stderr: String::new(),
+            exit_code: 1,
+            success: false,
+        };
+
+        let diags = processor.parse_tool_output(&output, "tool", 12);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].file_line, 12);
+        assert_eq!(diags[0].column, None);
+        assert_eq!(diags[0].message, "something the tool could not place");
+    }
+
+    #[test]
+    fn test_github_annotation_decodes_escaped_message() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        // The format escapes `%`, `:`, `,` and line breaks, because each of them is a
+        // separator in the line the message is embedded in.
+        let output = ToolOutput {
+            stdout: "::error line=1,col=2::100%25 of rows%3A a%2C b%0Aand more".to_string(),
+            stderr: String::new(),
+            exit_code: 1,
+            success: false,
+        };
+
+        let diags = processor.parse_tool_output(&output, "tool", 5);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].message, "100% of rows: a, b and more");
+        assert_eq!(diags[0].file_line, 6);
+        assert_eq!(diags[0].column, Some(2));
+    }
+
+    #[test]
+    fn test_decode_workflow_command_is_a_single_left_to_right_pass() {
+        // `%250A` is an escaped `%` followed by the literal text "0A". Decoding `%25` first
+        // and then looking for `%0A` in the result would turn it into a line break.
+        assert_eq!(decode_workflow_command("%250A"), "%0A");
+        assert_eq!(decode_workflow_command("no escapes"), "no escapes");
+        assert_eq!(decode_workflow_command("50% off"), "50% off");
+        assert_eq!(decode_workflow_command("trailing %"), "trailing %");
+        assert_eq!(decode_workflow_command("%0d%0a"), "  ");
+        assert_eq!(decode_workflow_command("%3A%2C"), ":,");
+    }
+
+    #[test]
+    fn test_position_in_message_anchors_a_prose_position() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        // jq names the position inside the message rather than prefixing it, and exits
+        // non-zero, so this arrives through the raw-output fallback.
+        let output = ToolOutput {
+            stdout: String::new(),
+            stderr: "jq: error (at <stdin>:0): syntax error, unexpected '}' at line 3, column 8".to_string(),
+            exit_code: 2,
+            success: false,
+        };
+
+        let diags = processor.parse_tool_output(&output, "jq", 20);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].file_line, 23);
+        assert_eq!(diags[0].column, Some(8));
+    }
+
+    #[test]
+    fn test_position_in_message_takes_the_last_one_named() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let output = ToolOutput {
+            stdout: "unterminated string started at line 2, column 1 at line 6, column 4".to_string(),
+            stderr: String::new(),
+            exit_code: 1,
+            success: false,
+        };
+
+        let diags = processor.parse_tool_output(&output, "tool", 0);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].file_line, 6, "the sentence ends on the position it is about");
+        assert_eq!(diags[0].column, Some(4));
+    }
+
+    #[test]
+    fn test_message_naming_no_position_stays_on_the_fence() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let output = ToolOutput {
+            stdout: "could not parse the input".to_string(),
+            stderr: String::new(),
+            exit_code: 1,
+            success: false,
+        };
+
+        let diags = processor.parse_tool_output(&output, "tool", 7);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].file_line, 7);
+        assert_eq!(diags[0].column, None);
+    }
+
+    #[test]
+    fn test_fallback_combines_stdout_and_stderr() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        // Tool puts some errors on stdout, summary on stderr
+        let output = ToolOutput {
+            stdout: "problem found in input".to_string(),
+            stderr: "1 file failed".to_string(),
+            exit_code: 1,
+            success: false,
+        };
+
+        let diags = processor.parse_tool_output(&output, "tool", 1);
+        assert_eq!(diags.len(), 2, "Fallback should include both stdout and stderr");
+        assert_eq!(diags[0].message, "problem found in input");
+        assert_eq!(diags[1].message, "1 file failed");
+    }
+
+    #[test]
+    fn test_error_line_without_position_info() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        // Error: line not followed by "at line N column M"
+        let output = ToolOutput {
+            stdout: "Error: something went wrong\nsome unrelated line".to_string(),
+            stderr: String::new(),
+            exit_code: 1,
+            success: false,
+        };
+
+        let diags = processor.parse_tool_output(&output, "tool", 5);
+        // "Error: something went wrong" → parsed by error-line parser (no position)
+        // "some unrelated line" → no parser matches, but diagnostics not empty → no fallback
+        assert!(!diags.is_empty());
+        assert_eq!(diags[0].message, "something went wrong");
+        assert_eq!(diags[0].file_line, 5); // No line offset, uses code_block_start
+    }
+
+    #[test]
+    fn test_warning_line_with_position() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let output = ToolOutput {
+            stdout: "Warning: deprecated syntax\n    at line 3 column 5".to_string(),
+            stderr: String::new(),
+            exit_code: 1,
+            success: false,
+        };
+
+        let diags = processor.parse_tool_output(&output, "tool", 10);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].message, "deprecated syntax");
+        assert_eq!(diags[0].file_line, 13); // 10 + 3
+        assert_eq!(diags[0].column, Some(5));
+        assert!(matches!(diags[0].severity, DiagnosticSeverity::Warning));
+    }
+
+    #[test]
+    fn test_strip_ansi_codes() {
+        assert_eq!(strip_ansi_codes("hello"), "hello");
+        assert_eq!(strip_ansi_codes("\x1b[31mred\x1b[0m"), "red");
+        assert_eq!(
+            strip_ansi_codes("\x1b[1;31m  Error\x1b[0m: \x1b[1mmsg\x1b[0m"),
+            "  Error: msg"
+        );
+        assert_eq!(strip_ansi_codes("no codes here"), "no codes here");
+        assert_eq!(strip_ansi_codes(""), "");
+        assert_eq!(
+            strip_ansi_codes("\x1b[90mat line 2 column 1\x1b[0m"),
+            "at line 2 column 1"
+        );
+    }
+
+    #[test]
+    fn test_parse_at_line_column() {
+        assert_eq!(
+            CodeBlockToolProcessor::parse_at_line_column("at line 2 column 1"),
+            Some((2, 1))
+        );
+        assert_eq!(
+            CodeBlockToolProcessor::parse_at_line_column("at line 10 column 15"),
+            Some((10, 15))
+        );
+        assert_eq!(
+            CodeBlockToolProcessor::parse_at_line_column("At Line 5 Column 3"),
+            Some((5, 3))
+        );
+        assert_eq!(
+            CodeBlockToolProcessor::parse_at_line_column("not a position line"),
+            None
+        );
+        assert_eq!(
+            CodeBlockToolProcessor::parse_at_line_column("at line abc column 1"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_error_line() {
+        let (msg, sev) = CodeBlockToolProcessor::parse_error_line("Error: invalid key").unwrap();
+        assert_eq!(msg, "invalid key");
+        assert!(matches!(sev, DiagnosticSeverity::Error));
+
+        let (msg, sev) = CodeBlockToolProcessor::parse_error_line("Warning: deprecated").unwrap();
+        assert_eq!(msg, "deprecated");
+        assert!(matches!(sev, DiagnosticSeverity::Warning));
+
+        // Lowercase should NOT match (avoids conflict with unstructured tool output)
+        assert!(CodeBlockToolProcessor::parse_error_line("error: bad input").is_none());
+        assert!(CodeBlockToolProcessor::parse_error_line("warning: minor issue").is_none());
+
+        // Empty message after prefix should not match
+        assert!(CodeBlockToolProcessor::parse_error_line("Error:").is_none());
+        assert!(CodeBlockToolProcessor::parse_error_line("Error:   ").is_none());
+
+        // Not an error line
+        assert!(CodeBlockToolProcessor::parse_error_line("some random text").is_none());
+    }
+
+    #[test]
+    fn test_consecutive_error_lines_without_position() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        // Two Error: lines in a row — first should flush without position,
+        // second gets position from "at line"
+        let output = ToolOutput {
+            stdout: "Error: first problem\nError: second problem\n    at line 3 column 1".to_string(),
+            stderr: String::new(),
+            exit_code: 1,
+            success: false,
+        };
+
+        let diags = processor.parse_tool_output(&output, "tool", 5);
+        assert_eq!(diags.len(), 2, "Expected 2 diagnostics, got {diags:?}");
+        // First error flushed without position when second Error: was encountered
+        assert_eq!(diags[0].message, "first problem");
+        assert_eq!(diags[0].file_line, 5); // No line mapping
+        assert_eq!(diags[0].column, None);
+        // Second error resolved with position
+        assert_eq!(diags[1].message, "second problem");
+        assert_eq!(diags[1].file_line, 8); // 5 + 3
+        assert_eq!(diags[1].column, Some(1));
+    }
+
+    #[test]
+    fn test_error_line_at_end_of_output() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        // Error: as the very last line — flushed by post-loop code
+        let output = ToolOutput {
+            stdout: "Error: trailing error".to_string(),
+            stderr: String::new(),
+            exit_code: 1,
+            success: false,
+        };
+
+        let diags = processor.parse_tool_output(&output, "tool", 5);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].message, "trailing error");
+        assert_eq!(diags[0].file_line, 5); // No position info available
+        assert_eq!(diags[0].column, None);
+    }
+
+    #[test]
+    fn test_blank_lines_between_error_and_position() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        // Blank lines between Error: and "at line" should be transparently skipped
+        let output = ToolOutput {
+            stdout: "Error: spaced out\n\n\n    at line 4 column 2".to_string(),
+            stderr: String::new(),
+            exit_code: 1,
+            success: false,
+        };
+
+        let diags = processor.parse_tool_output(&output, "tool", 10);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].message, "spaced out");
+        assert_eq!(diags[0].file_line, 14); // 10 + 4
+        assert_eq!(diags[0].column, Some(2));
+    }
+
+    #[test]
+    fn test_mixed_structured_and_error_line_parsers() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        // Mix of ruff-style structured output and tombi-style Error: output
+        let output = ToolOutput {
+            stdout: "_.py:1:5: E501 Line too long\nError: invalid syntax\n    at line 3 column 1".to_string(),
+            stderr: String::new(),
+            exit_code: 1,
+            success: false,
+        };
+
+        let diags = processor.parse_tool_output(&output, "tool", 5);
+        assert_eq!(diags.len(), 2, "Expected 2 diagnostics, got {diags:?}");
+        // First: standard format parser
+        assert_eq!(diags[0].message, "E501 Line too long");
+        assert_eq!(diags[0].file_line, 6); // 5 + 1
+        // Second: Error: + at line parser
+        assert_eq!(diags[1].message, "invalid syntax");
+        assert_eq!(diags[1].file_line, 8); // 5 + 3
+    }
+
+    #[test]
+    fn test_at_line_without_preceding_error() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        // "at line N column M" without a preceding Error: should not create a diagnostic
+        let output = ToolOutput {
+            stdout: "at line 2 column 1\nsome other text".to_string(),
+            stderr: String::new(),
+            exit_code: 1,
+            success: false,
+        };
+
+        let diags = processor.parse_tool_output(&output, "tool", 5);
+        // No pending error, so "at line" is just an unmatched line
+        // Both lines are unmatched, fallback fires with combined output
+        assert_eq!(diags.len(), 2);
+        assert_eq!(diags[0].message, "at line 2 column 1");
+        assert_eq!(diags[1].message, "some other text");
+    }
+
+    // =========================================================================
+    // Issue #527: formatter that produces empty output should not erase content
+    // =========================================================================
+
+    /// A formatter that produces no stdout (like `tombi lint -` mistakenly used
+    /// as a formatter) should not replace non-empty content with an empty string.
+    /// This test uses `true` which exits 0 with no output, simulating the bug.
+    #[test]
+    fn test_format_empty_output_does_not_erase_content() {
+        use super::super::config::LanguageToolConfig;
+
+        let mut config = default_config();
+        config.languages.insert(
+            "toml".to_string(),
+            LanguageToolConfig {
+                format: vec!["empty-formatter".to_string()],
+                ..Default::default()
+            },
+        );
+        // Define a tool that exits 0 but produces no stdout (simulates `tombi lint -`)
+        config.tools.insert(
+            "empty-formatter".to_string(),
+            super::super::config::ToolDefinition {
+                command: vec!["true".to_string()],
+                stdin: true,
+                stdout: true,
+                lint_args: vec![],
+                format_args: vec![],
+            },
+        );
+
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let content = "```toml\nkey = \"value\"\n```\n";
+        let result = processor.format(content);
+
+        assert!(result.is_ok(), "Format should not error");
+        let output = result.unwrap();
+
+        // The content must NOT be erased — original content should be preserved
+        assert!(
+            output.content.contains("key = \"value\""),
+            "Empty formatter output should not erase content. Got: {:?}",
+            output.content
+        );
+    }
+
+    /// A formatter that echoes input back (like `cat`) should preserve content.
+    #[test]
+    fn test_format_identity_formatter_preserves_content() {
+        use super::super::config::LanguageToolConfig;
+
+        let mut config = default_config();
+        config.languages.insert(
+            "toml".to_string(),
+            LanguageToolConfig {
+                format: vec!["cat-formatter".to_string()],
+                ..Default::default()
+            },
+        );
+        config.tools.insert(
+            "cat-formatter".to_string(),
+            super::super::config::ToolDefinition {
+                command: vec!["cat".to_string()],
+                stdin: true,
+                stdout: true,
+                lint_args: vec![],
+                format_args: vec![],
+            },
+        );
+
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let content = "```toml\nkey = \"value\"\n```\n";
+        let result = processor.format(content);
+
+        assert!(result.is_ok(), "Format should not error");
+        let output = result.unwrap();
+        assert_eq!(
+            output.content, content,
+            "Identity formatter should preserve content exactly"
+        );
+    }
+
+    /// Verify that the context-aware tool resolution resolves bare "tombi"
+    /// to "tombi:format" in format context and "tombi:lint" in lint context.
+    #[test]
+    fn test_resolve_tool_context_aware_tombi() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        // In format context, bare "tombi" should resolve to "tombi:format"
+        let format_def = processor
+            .registry
+            .resolve("tombi", ToolSlot::Format)
+            .expect("Should resolve tombi in format context");
+        assert!(
+            format_def.command.iter().any(|arg| arg == "format"),
+            "Bare 'tombi' in format context should resolve to 'tombi format', got: {:?}",
+            format_def.command
+        );
+
+        // In lint context, bare "tombi" should resolve to "tombi:lint"
+        let lint_def = processor
+            .registry
+            .resolve("tombi", ToolSlot::Lint)
+            .expect("Should resolve tombi in lint context");
+        assert!(
+            lint_def.command.iter().any(|arg| arg == "lint"),
+            "Bare 'tombi' in lint context should resolve to 'tombi lint', got: {:?}",
+            lint_def.command
+        );
+
+        // Explicit suffix should bypass context-aware resolution
+        let explicit_def = processor
+            .registry
+            .resolve("tombi:lint", ToolSlot::Format)
+            .expect("Should resolve explicit tombi:lint even in format context");
+        assert!(
+            explicit_def.command.iter().any(|arg| arg == "lint"),
+            "Explicit 'tombi:lint' should always use lint, got: {:?}",
+            explicit_def.command
+        );
+    }
+
+    /// Verify context-aware resolution for ruff (uses "check" suffix, not "lint").
+    #[test]
+    fn test_resolve_tool_context_aware_ruff() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        // In lint context, bare "ruff" should resolve to "ruff:check"
+        let lint_def = processor
+            .registry
+            .resolve("ruff", ToolSlot::Lint)
+            .expect("Should resolve ruff in lint context");
+        assert!(
+            lint_def.command.iter().any(|arg| arg == "check"),
+            "Bare 'ruff' in lint context should resolve to 'ruff check', got: {:?}",
+            lint_def.command
+        );
+
+        // In format context, bare "ruff" should resolve to "ruff:format"
+        let format_def = processor
+            .registry
+            .resolve("ruff", ToolSlot::Format)
+            .expect("Should resolve ruff in format context");
+        assert!(
+            format_def.command.iter().any(|arg| arg == "format"),
+            "Bare 'ruff' in format context should resolve to 'ruff format', got: {:?}",
+            format_def.command
+        );
+    }
+
+    /// Tools without context-specific variants should still resolve via bare name.
+    #[test]
+    fn test_resolve_tool_bare_name_fallback() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        // "shellcheck" has no :lint or :format variant — should fall back to bare name
+        let def = processor
+            .registry
+            .resolve("shellcheck", ToolSlot::Lint)
+            .expect("Should resolve shellcheck via fallback");
+        assert!(
+            def.command.iter().any(|arg| arg == "shellcheck"),
+            "shellcheck should resolve to itself, got: {:?}",
+            def.command
+        );
+    }
+
+    /// Context-aware resolution for tools with non-standard format suffixes.
+    #[test]
+    fn test_resolve_tool_context_aware_sqlfluff() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        // sqlfluff uses ":fix" as its format variant
+        let format_def = processor
+            .registry
+            .resolve("sqlfluff", ToolSlot::Format)
+            .expect("Should resolve sqlfluff in format context");
+        assert!(
+            format_def.command.iter().any(|arg| arg == "fix"),
+            "Bare 'sqlfluff' in format context should resolve to 'sqlfluff fix', got: {:?}",
+            format_def.command
+        );
+    }
+
+    /// Context-aware resolution for djlint (:reformat suffix).
+    #[test]
+    fn test_resolve_tool_context_aware_djlint() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        // djlint uses ":reformat" as its format variant
+        let format_def = processor
+            .registry
+            .resolve("djlint", ToolSlot::Format)
+            .expect("Should resolve djlint in format context");
+        assert!(
+            format_def.command.iter().any(|arg| arg.contains("reformat")),
+            "Bare 'djlint' in format context should resolve to djlint reformat, got: {:?}",
+            format_def.command
+        );
+    }
+
+    /// User-defined tools with context-specific variants resolve correctly.
+    #[test]
+    fn test_resolve_tool_user_defined_with_context_variant() {
+        use super::super::config::ToolDefinition;
+
+        let mut config = default_config();
+        config.tools.insert(
+            "mytool".to_string(),
+            ToolDefinition {
+                command: vec!["mytool".to_string(), "--lint".to_string()],
+                ..Default::default()
+            },
+        );
+        config.tools.insert(
+            "mytool:format".to_string(),
+            ToolDefinition {
+                command: vec!["mytool".to_string(), "--format".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        // In format context, should resolve to "mytool:format"
+        let def = processor
+            .registry
+            .resolve("mytool", ToolSlot::Format)
+            .expect("Should resolve user tool in format context");
+        assert!(
+            def.command.iter().any(|arg| arg == "--format"),
+            "User 'mytool' in format context should resolve to mytool:format, got: {:?}",
+            def.command
+        );
+
+        // In lint context, should fall back to bare "mytool" (no mytool:lint exists)
+        let def = processor
+            .registry
+            .resolve("mytool", ToolSlot::Lint)
+            .expect("Should resolve user tool in lint context via fallback");
+        assert!(
+            def.command.iter().any(|arg| arg == "--lint"),
+            "User 'mytool' in lint context should fall back to bare name, got: {:?}",
+            def.command
+        );
+    }
+
+    /// Nonexistent tool returns None.
+    #[test]
+    fn test_resolve_tool_nonexistent_returns_none() {
+        let config = default_config();
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        assert!(
+            processor
+                .registry
+                .resolve("nonexistent-tool-xyz", ToolSlot::Lint)
+                .is_none(),
+            "Nonexistent tool should return None in lint context"
+        );
+        assert!(
+            processor
+                .registry
+                .resolve("nonexistent-tool-xyz", ToolSlot::Format)
+                .is_none(),
+            "Nonexistent tool should return None in format context"
+        );
+    }
+
+    #[test]
+    fn test_strip_ansi_codes_edge_cases() {
+        // Lone ESC without CSI bracket — non-printable, safely dropped
+        assert_eq!(strip_ansi_codes("before\x1bafter"), "beforeafter");
+        // ESC at end of string
+        assert_eq!(strip_ansi_codes("trailing\x1b"), "trailing");
+        // Nested/consecutive sequences
+        assert_eq!(strip_ansi_codes("\x1b[1m\x1b[31mbold red\x1b[0m"), "bold red");
+        // 256-color and RGB sequences
+        assert_eq!(strip_ansi_codes("\x1b[38;5;196mred\x1b[0m"), "red");
+        assert_eq!(strip_ansi_codes("\x1b[38;2;255;0;0mred\x1b[0m"), "red");
+    }
+
+    /// A linter that enforces a trailing newline (like ryl/yamllint
+    /// `new-line-at-end-of-file`) must not fire on a fenced code block whose
+    /// final newline was stripped during extraction. The content piped to the
+    /// tool should be newline-terminated, matching how the tool sees a real file.
+    #[cfg(unix)]
+    #[test]
+    fn test_lint_yaml_block_no_false_new_line_at_eof() {
+        use super::super::config::{LanguageToolConfig, ToolDefinition};
+
+        let mut config = default_config();
+        config.normalize_language = NormalizeLanguage::Exact;
+        config.languages.insert(
+            "yaml".to_string(),
+            LanguageToolConfig {
+                lint: vec!["eof-newline-linter".to_string()],
+                ..Default::default()
+            },
+        );
+        // Emits a diagnostic only when stdin's last byte is not a newline.
+        // `$(tail -c1)` strips trailing newlines, so it is empty iff the input
+        // already ends in a newline.
+        config.tools.insert(
+            "eof-newline-linter".to_string(),
+            ToolDefinition {
+                command: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "if [ -n \"$(tail -c1)\" ]; then echo '1:1: no newline at end of file'; fi".to_string(),
+                ],
+                ..Default::default()
+            },
+        );
+
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let content = "```yaml\nfoo: bar\n```\n";
+        let diagnostics = processor.lint(content).expect("lint should succeed");
+
+        assert!(
+            diagnostics.is_empty(),
+            "EOF-newline linter should not fire on an extracted code block, got: {diagnostics:?}"
+        );
+    }
+
+    /// Format mode should also feed tools newline-terminated input, so a
+    /// formatter that enforces an end-of-file newline sees the content as a
+    /// complete file rather than re-adding a newline rumdl would then have to
+    /// strip. The formatter here reports whether its stdin ended in a newline.
+    #[cfg(unix)]
+    #[test]
+    fn test_format_feeds_newline_terminated_input() {
+        use super::super::config::{LanguageToolConfig, ToolDefinition};
+
+        let mut config = default_config();
+        config.normalize_language = NormalizeLanguage::Exact;
+        config.languages.insert(
+            "yaml".to_string(),
+            LanguageToolConfig {
+                format: vec!["newline-probe".to_string()],
+                ..Default::default()
+            },
+        );
+        config.tools.insert(
+            "newline-probe".to_string(),
+            ToolDefinition {
+                command: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "if [ -z \"$(tail -c1)\" ]; then echo HAD_NEWLINE; else echo NO_NEWLINE; fi".to_string(),
+                ],
+                ..Default::default()
+            },
+        );
+
+        let processor = CodeBlockToolProcessor::new(&config, MarkdownFlavor::default());
+
+        let content = "```yaml\nfoo: bar\n```\n";
+        let output = processor.format(content).expect("format should succeed");
+
+        assert!(
+            output.content.contains("HAD_NEWLINE"),
+            "Formatter should receive newline-terminated stdin, got: {:?}",
+            output.content
+        );
+    }
+
+    #[test]
+    fn test_ensure_trailing_newline() {
+        // Non-empty content without a trailing newline gets one appended.
+        assert_eq!(ensure_trailing_newline("foo: bar"), "foo: bar\n");
+        // Multi-line content gets a single newline appended to the last line.
+        assert_eq!(ensure_trailing_newline("a: 1\nb: 2"), "a: 1\nb: 2\n");
+        // Content already ending in a newline is returned unchanged.
+        assert_eq!(ensure_trailing_newline("foo: bar\n"), "foo: bar\n");
+        // A trailing blank line (already newline-terminated) is left alone.
+        assert_eq!(ensure_trailing_newline("foo: bar\n\n"), "foo: bar\n\n");
+        // Genuinely empty content is left empty — no newline synthesized.
+        assert_eq!(ensure_trailing_newline(""), "");
+    }
+}

@@ -1,0 +1,122 @@
+use crate::rule_config_serde::RuleConfig;
+use serde::{Deserialize, Serialize};
+
+/// How to handle absolute links (paths starting with /)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AbsoluteLinksOption {
+    /// Ignore absolute links (don't validate them) - this is the default
+    #[default]
+    Ignore,
+    /// Warn about absolute links (they can't be validated as local paths)
+    Warn,
+    /// Resolve absolute links relative to MkDocs docs_dir and validate
+    RelativeToDocs,
+    /// Resolve absolute links relative to one or more explicit root directories.
+    /// First match wins; reports broken only when all roots miss.
+    RelativeToRoots,
+}
+
+/// Configuration for MD057 (relative link validation)
+///
+/// This rule validates that relative links point to existing files.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct MD057Config {
+    /// How to handle absolute links (paths starting with /)
+    /// - "ignore" (default): Skip validation for absolute links
+    /// - "warn": Report a warning for absolute links
+    /// - "relative_to_docs": Resolve relative to MkDocs docs_dir and validate
+    /// - "relative_to_roots": Resolve relative to one or more configured root directories
+    #[serde(alias = "absolute_links")]
+    pub absolute_links: AbsoluteLinksOption,
+
+    /// Warn when relative links contain unnecessary path traversal.
+    /// When enabled, `../sub_dir/file.md` from within `sub_dir/` warns
+    /// and suggests the shorter equivalent `file.md`.
+    #[serde(alias = "compact_paths")]
+    pub compact_paths: bool,
+
+    /// Warn when a relative link points at the file it is written in.
+    ///
+    /// Following such a link reloads the page the reader is already on. When
+    /// the link carries a fragment, `file.md#section` from within `file.md`
+    /// warns and suggests `#section`, which reaches the same heading without
+    /// the reload. A link to the whole file has no equivalent shorter form, so
+    /// it is reported without a fix.
+    #[serde(alias = "self_referential_links")]
+    pub self_referential_links: bool,
+
+    /// Additional directories to search when a relative link is not found
+    /// relative to the file's directory.
+    ///
+    /// Paths are resolved relative to the project root (where `.rumdl.toml` or
+    /// `pyproject.toml` is found), or relative to the current working directory.
+    ///
+    /// For Obsidian users: the attachment folder is auto-detected from
+    /// `.obsidian/app.json` when `flavor = "obsidian"` is set, so this option
+    /// is typically not needed. Use it for custom setups or non-Obsidian tools.
+    ///
+    /// Example:
+    /// ```toml
+    /// [MD057]
+    /// search-paths = ["assets", "images", "attachments"]
+    /// ```
+    #[serde(alias = "search_paths")]
+    pub search_paths: Vec<String>,
+
+    /// Root directories used when `absolute-links = "relative_to_roots"`.
+    ///
+    /// Absolute links are resolved against each configured root in order, then
+    /// against the project root as an implicit fallback. The first root under
+    /// which the target file exists passes the check. A warning is emitted only
+    /// when no resolution finds the file.
+    ///
+    /// The implicit project-root fallback supports both link styles in the same
+    /// project without extra configuration: `/foo.md` (relative to a configured
+    /// root) and `/content/en/foo.md` (literal path from the project root).
+    ///
+    /// Paths are resolved relative to the project root when not absolute.
+    /// Trailing slashes are normalized automatically.
+    ///
+    /// When `roots` is empty, absolute links are validated against the project
+    /// root only — useful for single-root projects where every absolute link
+    /// resolves directly from the project root.
+    ///
+    /// Example:
+    /// ```toml
+    /// [MD057]
+    /// absolute-links = "relative_to_roots"
+    /// roots = ["content/en", "content/zh-cn"]
+    /// ```
+    pub roots: Vec<String>,
+
+    /// Also check path-shaped values in the document's frontmatter.
+    ///
+    /// Off by default, because frontmatter has no syntax marking a value as a
+    /// link: a path-shaped value is only a guess at one. Static-site generators
+    /// also resolve frontmatter paths from the site root rather than the
+    /// document's own directory, so checking them like body links reports
+    /// working paths as broken.
+    ///
+    /// Enable it for projects whose frontmatter paths really are relative to
+    /// the document, and use `ignore-frontmatter-fields` for the keys that are
+    /// not.
+    ///
+    /// Example:
+    /// ```toml
+    /// [MD057]
+    /// check-frontmatter = true
+    /// ignore-frontmatter-fields = ["image", "cover"]
+    /// ```
+    pub check_frontmatter: bool,
+
+    /// Top-level frontmatter keys whose values are not checked. Matched
+    /// case-insensitively. A parent key excludes its whole subtree. Applies
+    /// only when `check-frontmatter` is enabled.
+    pub ignore_frontmatter_fields: Vec<String>,
+}
+
+impl RuleConfig for MD057Config {
+    const RULE_NAME: &'static str = "MD057";
+}

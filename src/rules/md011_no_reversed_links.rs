@@ -1,0 +1,499 @@
+/// Rule MD011: No reversed link syntax
+///
+/// See [docs/md011.md](../../docs/md011.md) for full documentation, configuration, and examples.
+use crate::filtered_lines::FilteredLinesExt;
+use crate::rule::{Fix, LintError, LintResult, LintWarning, Rule, RuleCategory, Severity};
+use crate::utils::range_utils::calculate_match_range;
+use crate::utils::skip_context::is_in_math_context;
+use regex::Regex;
+use std::sync::LazyLock;
+
+// Reversed link detection pattern
+const REVERSED_LINK_REGEX_STR: &str = r"(^|[^\\])\(([^()]+)\)\[([^\]]+)\]";
+static REVERSED_LINK_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(REVERSED_LINK_REGEX_STR).unwrap());
+
+/// Classification of a link component
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkComponent {
+    /// Clear URL: has protocol, www., mailto:, or path prefix
+    ClearUrl,
+    /// Multiple words or sentence-like (likely link text, not URL)
+    MultiWord,
+    /// Single word - could be either URL or text
+    Ambiguous,
+}
+
+/// Information about a detected reversed link pattern
+#[derive(Debug, Clone)]
+struct ReversedLinkInfo {
+    /// Content found in parentheses
+    paren_content: String,
+    /// Content found in square brackets
+    bracket_content: String,
+    /// Classification of parentheses content
+    paren_type: LinkComponent,
+    /// Classification of bracket content
+    bracket_type: LinkComponent,
+}
+
+impl ReversedLinkInfo {
+    /// Determine the correct order: returns (text, url)
+    fn correct_order(&self) -> (&str, &str) {
+        use LinkComponent::{Ambiguous, ClearUrl, MultiWord};
+
+        match (self.paren_type, self.bracket_type) {
+            // One side is clearly a URL - that's the URL
+            (ClearUrl, _) => (&self.bracket_content, &self.paren_content),
+            (_, ClearUrl) => (&self.paren_content, &self.bracket_content),
+
+            // One side is multi-word - that's the text, other is URL
+            (MultiWord, _) => (&self.paren_content, &self.bracket_content),
+            (_, MultiWord) => (&self.bracket_content, &self.paren_content),
+
+            // Both ambiguous: assume standard reversed pattern (url)[text]
+            (Ambiguous, Ambiguous) => (&self.bracket_content, &self.paren_content),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct MD011NoReversedLinks;
+
+impl MD011NoReversedLinks {
+    /// Classify a link component as URL, multi-word text, or ambiguous
+    fn classify_component(s: &str) -> LinkComponent {
+        let trimmed = s.trim();
+
+        // Check for clear URL indicators
+        if trimmed.starts_with("http://")
+            || trimmed.starts_with("https://")
+            || trimmed.starts_with("ftp://")
+            || trimmed.starts_with("www.")
+            || (trimmed.starts_with("mailto:") && trimmed.contains('@'))
+            || (trimmed.starts_with('/') && trimmed.len() > 1)
+            || (trimmed.starts_with("./") || trimmed.starts_with("../"))
+            || (trimmed.starts_with('#') && trimmed.len() > 1 && !trimmed[1..].contains(' '))
+        {
+            return LinkComponent::ClearUrl;
+        }
+
+        // Multi-word text is likely a description, not a URL
+        if trimmed.contains(' ') {
+            return LinkComponent::MultiWord;
+        }
+
+        // Single word - could be either
+        LinkComponent::Ambiguous
+    }
+}
+
+impl Rule for MD011NoReversedLinks {
+    fn name(&self) -> &'static str {
+        "MD011"
+    }
+
+    fn description(&self) -> &'static str {
+        "Reversed link syntax"
+    }
+
+    fn category(&self) -> RuleCategory {
+        RuleCategory::Link
+    }
+
+    fn check(&self, ctx: &crate::lint_context::LintContext) -> LintResult {
+        let mut warnings = Vec::new();
+
+        // Use filtered_lines() to automatically skip front-matter and Obsidian comments
+        for filtered_line in ctx
+            .filtered_lines()
+            .skip_front_matter()
+            .skip_jsx_expressions()
+            .skip_mdx_comments()
+            .skip_obsidian_comments()
+        {
+            let line_num = filtered_line.line_num;
+            let line = filtered_line.content;
+
+            let byte_pos = ctx.line_start_byte(line_num).unwrap_or(0);
+
+            let mut last_end = 0;
+
+            while let Some(cap) = REVERSED_LINK_REGEX.captures(&line[last_end..]) {
+                let match_obj = cap.get(0).unwrap();
+                let prechar = &cap[1];
+                let paren_content = cap[2].to_string();
+                let bracket_content = cap[3].to_string();
+
+                // Skip wiki-link patterns: if bracket content starts with [ or ends with ]
+                // This handles cases like (url)[[wiki-link]] being misdetected
+                if bracket_content.starts_with('[') || bracket_content.ends_with(']') {
+                    last_end += match_obj.end();
+                    continue;
+                }
+
+                // Skip footnote references: [^footnote]
+                // This prevents false positives like [link](url)[^footnote]
+                if bracket_content.starts_with('^') {
+                    last_end += match_obj.end();
+                    continue;
+                }
+
+                // Skip Dataview inline fields in Obsidian flavor
+                // Pattern: (field:: value)[text] is valid Obsidian syntax, not a reversed link
+                if ctx.flavor == crate::config::MarkdownFlavor::Obsidian && paren_content.contains("::") {
+                    last_end += match_obj.end();
+                    continue;
+                }
+
+                // Check if the brackets at the end are escaped
+                if bracket_content.ends_with('\\') {
+                    last_end += match_obj.end();
+                    continue;
+                }
+
+                // Manual negative lookahead: skip if followed by (
+                // This prevents matching (text)[ref](url) patterns
+                let end_pos = last_end + match_obj.end();
+                if end_pos < line.len() && line[end_pos..].starts_with('(') {
+                    last_end += match_obj.end();
+                    continue;
+                }
+
+                // Calculate the actual position
+                let match_start = last_end + match_obj.start() + prechar.len();
+                let match_byte_pos = byte_pos + match_start;
+
+                // Skip if in code block, inline code, HTML comments, math contexts, or Jinja templates
+                if ctx.is_in_code_block_or_span(match_byte_pos)
+                    || ctx.is_in_html_comment(match_byte_pos)
+                    || ctx.is_in_mdx_comment(match_byte_pos)
+                    || is_in_math_context(ctx, match_byte_pos)
+                    || ctx.is_in_jinja_range(match_byte_pos)
+                {
+                    last_end += match_obj.end();
+                    continue;
+                }
+
+                // Classify both components and determine correct order
+                let paren_type = Self::classify_component(&paren_content);
+                let bracket_type = Self::classify_component(&bracket_content);
+
+                let info = ReversedLinkInfo {
+                    paren_content,
+                    bracket_content,
+                    paren_type,
+                    bracket_type,
+                };
+
+                let (text, url) = info.correct_order();
+
+                // Calculate the range for the actual reversed link (excluding prechar)
+                let actual_length = match_obj.len() - prechar.len();
+                let (start_line, start_col, end_line, end_col) =
+                    calculate_match_range(line_num, line, match_start, actual_length);
+
+                warnings.push(LintWarning {
+                    rule_name: Some(self.name().to_string()),
+                    message: format!("Reversed link syntax: use [{text}]({url}) instead"),
+                    line: start_line,
+                    column: start_col,
+                    end_line,
+                    end_column: end_col,
+                    severity: Severity::Error,
+                    fix: Some(Fix::new(
+                        {
+                            let match_start_byte = byte_pos + match_start;
+                            let match_end_byte = match_start_byte + actual_length;
+                            match_start_byte..match_end_byte
+                        },
+                        format!("[{text}]({url})"),
+                    )),
+                });
+
+                last_end += match_obj.end();
+            }
+        }
+
+        Ok(warnings)
+    }
+
+    fn fix(&self, ctx: &crate::lint_context::LintContext) -> Result<String, LintError> {
+        let warnings = self.check(ctx)?;
+        let warnings =
+            crate::utils::fix_utils::filter_warnings_by_inline_config(warnings, ctx.inline_config(), self.name());
+        if warnings.is_empty() {
+            return Ok(ctx.content.to_string());
+        }
+
+        let mut content = ctx.content.to_string();
+        // Apply fixes in reverse order to preserve byte offsets
+        let mut fixes: Vec<_> = warnings.iter().filter_map(|w| w.fix.as_ref()).collect();
+        fixes.sort_by_key(|f| std::cmp::Reverse(f.range.start));
+
+        for fix in fixes {
+            if fix.range.start < content.len() && fix.range.end <= content.len() {
+                content.replace_range(fix.range.clone(), &fix.replacement);
+            }
+        }
+        Ok(content)
+    }
+
+    fn should_skip(&self, ctx: &crate::lint_context::LintContext) -> bool {
+        ctx.content.is_empty() || !ctx.likely_has_links_or_images()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn from_config(_config: &crate::config::Config) -> Box<dyn Rule>
+    where
+        Self: Sized,
+    {
+        Box::new(MD011NoReversedLinks)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lint_context::LintContext;
+
+    #[test]
+    fn test_md011_basic() {
+        let rule = MD011NoReversedLinks;
+
+        // Should detect reversed links
+        let content = "(http://example.com)[Example]\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].line, 1);
+
+        // Should not detect correct links
+        let content = "[Example](http://example.com)\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(warnings.len(), 0);
+    }
+
+    #[test]
+    fn test_md011_with_escaped_brackets() {
+        let rule = MD011NoReversedLinks;
+
+        // Should not detect if brackets are escaped
+        let content = "(url)[text\\]\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(warnings.len(), 0);
+    }
+
+    #[test]
+    fn test_md011_no_false_positive_with_reference_link() {
+        let rule = MD011NoReversedLinks;
+
+        // Should not detect (text)[ref](url) as reversed
+        let content = "(text)[ref](url)\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(warnings.len(), 0);
+    }
+
+    #[test]
+    fn test_md011_fix() {
+        let rule = MD011NoReversedLinks;
+
+        let content = "(http://example.com)[Example]\n(another/url)[text]\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, "[Example](http://example.com)\n[text](another/url)\n");
+    }
+
+    #[test]
+    fn test_md011_in_code_block() {
+        let rule = MD011NoReversedLinks;
+
+        let content = "```\n(url)[text]\n```\n(url)[text]\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].line, 4);
+    }
+
+    #[test]
+    fn test_md011_inline_code() {
+        let rule = MD011NoReversedLinks;
+
+        let content = "`(url)[text]` and (url)[text]\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].column, 19);
+    }
+
+    #[test]
+    fn test_md011_no_false_positive_with_footnote() {
+        let rule = MD011NoReversedLinks;
+
+        // Should not detect [link](url)[^footnote] as reversed - this is valid markdown
+        // The [^footnote] is a footnote reference, not part of a reversed link
+        let content = "Some text with [a link](https://example.com/)[^ft].\n\n[^ft]: Note.\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(warnings.len(), 0);
+
+        // Also test with multiple footnotes
+        let content = "[link1](url1)[^1] and [link2](url2)[^2]\n\n[^1]: First\n[^2]: Second\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(warnings.len(), 0);
+
+        // But should still detect actual reversed links
+        let content = "(url)[text] and [link](url)[^footnote]\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].line, 1);
+        assert_eq!(warnings[0].column, 1);
+    }
+
+    #[test]
+    fn test_md011_skip_dataview_inline_fields_obsidian() {
+        let rule = MD011NoReversedLinks;
+
+        // Dataview inline field pattern: (field:: value)[text]
+        // In Obsidian flavor, this should NOT be flagged as a reversed link
+        let content = "(status:: active)[link text]\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Obsidian, None);
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(
+            warnings.len(),
+            0,
+            "Should not flag Dataview inline field in Obsidian flavor"
+        );
+
+        // Multiple inline fields
+        let content = "(author:: John)[read more] and (date:: 2024-01-01)[link]\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Obsidian, None);
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(warnings.len(), 0, "Should not flag multiple Dataview inline fields");
+
+        // Mixed content: Dataview field and actual reversed link
+        let content = "(status:: done)[info] (url)[text]\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Obsidian, None);
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(warnings.len(), 1, "Should flag reversed link but not Dataview field");
+        assert_eq!(warnings[0].column, 23);
+    }
+
+    #[test]
+    fn test_md011_flag_dataview_in_standard_flavor() {
+        let rule = MD011NoReversedLinks;
+
+        // In Standard flavor, (field:: value)[text] is treated as a reversed link
+        // because Dataview is Obsidian-specific
+        let content = "(status:: active)[link text]\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "Should flag Dataview-like pattern in Standard flavor"
+        );
+    }
+
+    #[test]
+    fn test_md011_reversed_link_in_jsx_nested_fence_not_flagged() {
+        // A reversed link inside a fenced code block nested in a JSX component is
+        // code, not prose. pulldown-cmark classifies the component as one HTML
+        // block and emits no code-block range for the fence, so MD011's
+        // byte-range code check would flag it (and `fmt` would corrupt the code)
+        // unless the JSX fence range is added to ctx.code_blocks.
+        let rule = MD011NoReversedLinks;
+        let content =
+            "<Steps>\n  <Step>\n```text\nsee (this)[https://example.com] reversed\n```\n  </Step>\n</Steps>\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::MDX, None);
+        let warnings = rule.check(&ctx).unwrap();
+        assert!(
+            warnings.is_empty(),
+            "reversed link inside a JSX-nested fence must not be flagged: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_md011_dataview_bracket_syntax_obsidian() {
+        let rule = MD011NoReversedLinks;
+
+        // Dataview also supports [field:: value] syntax inside brackets
+        // The pattern (field:: value)[text] should be skipped in Obsidian
+        let content = "Task has (priority:: high)[see details]\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Obsidian, None);
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(warnings.len(), 0, "Should skip Dataview field with spaces");
+
+        // Field with no value (just key::)
+        let content = "(completed::)[marker]\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Obsidian, None);
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(warnings.len(), 0, "Should skip Dataview field with empty value");
+    }
+
+    #[test]
+    fn test_md011_fix_skips_obsidian_comments() {
+        let rule = MD011NoReversedLinks;
+
+        // Reversed link inside Obsidian comment block should not be modified by fix()
+        let content = "%%\n(http://example.com)[hidden link]\n%%\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Obsidian, None);
+
+        // check() should produce no warnings (Obsidian comment is skipped)
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(warnings.len(), 0, "check() should skip Obsidian comment content");
+
+        // fix() should not modify content inside Obsidian comments
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(
+            fixed, content,
+            "fix() should not modify reversed links inside Obsidian comments"
+        );
+    }
+
+    #[test]
+    fn test_md011_fix_skips_obsidian_comments_with_surrounding_content() {
+        let rule = MD011NoReversedLinks;
+
+        // Mix of Obsidian comment and real reversed link
+        let content = "%%\n(http://example.com)[hidden]\n%%\n\n(http://real.com)[visible]\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Obsidian, None);
+
+        // check() should only flag the visible one
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(warnings.len(), 1, "check() should only flag visible reversed link");
+        assert_eq!(warnings[0].line, 5);
+
+        // fix() should only fix the visible one, leaving comment content untouched
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(
+            fixed, "%%\n(http://example.com)[hidden]\n%%\n\n[visible](http://real.com)\n",
+            "fix() should only modify visible reversed links"
+        );
+    }
+
+    #[test]
+    fn test_md011_fix_skips_dataview_fields_obsidian() {
+        let rule = MD011NoReversedLinks;
+
+        // Dataview inline field should not be modified by fix()
+        let content = "(status:: active)[link text]\n(http://example.com)[real link]\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Obsidian, None);
+
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(warnings.len(), 1, "check() should only flag the real reversed link");
+
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(
+            fixed, "(status:: active)[link text]\n[real link](http://example.com)\n",
+            "fix() should not modify Dataview inline fields"
+        );
+    }
+}

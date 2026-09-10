@@ -1,0 +1,126 @@
+# Nextest configuration
+# https://nexte.st/book/configuration
+
+[profile.default]
+# Detect flaky tests and retry them
+retries = { backoff = "exponential", count = 2, delay = "1s", max-delay = "10s" }
+
+# Run tests with 2x the number of CPUs
+test-threads = "num-cpus"
+
+# Fail fast on first failure in CI
+fail-fast = false
+
+# Show failed tests immediately
+failure-output = "immediate"
+
+# Show successful tests at the end
+success-output = "final"
+
+# Status output level
+status-level = "pass"
+
+[profile.ci]
+
+# Skip performance and memory tests in CI (they're flaky due to resource variability)
+default-filter = 'not test(/^perf::/) and not test(/performance|benchmark|memory|linear_complexity|scaling/)'
+
+# More conservative in CI
+test-threads = "num-cpus"
+
+# Minimal output - only show failures
+failure-output = "immediate"
+success-output = "never"
+status-level = "fail"
+
+# No retries in CI to catch flaky tests
+retries = 0
+
+# Fail fast on first failure to save CI time
+fail-fast = true
+
+# Quick profile for development
+[profile.quick]
+
+# Skip slow tests and performance tests
+default-filter = 'not test(/memory/) and not test(/stress/) and not test(/large/) and not test(/error_propagation/) and not test(/performance/) and not test(/comprehensive/) and not test(/deeply_nested/)'
+
+# Even more parallel execution locally
+test-threads = "num-cpus"
+
+# Less verbose output
+status-level = "fail"
+
+# Development profile - balance between speed and coverage
+[profile.dev]
+
+# Skip the slowest tests but include integration tests
+# Perf module tests are excluded because timing-based assertions are inherently flaky
+# under parallel execution - they run in the performance profile
+default-filter = 'not test(/^perf::/) and not test(/error_propagation/) and not test(/deeply_nested/) and not test(/memory/) and not test(/stress/) and not test(/large/) and not test(/performance/) and not test(/linear_complexity/)'
+
+# Good parallelization for dev machines
+test-threads = "num-cpus"
+
+# Show failures immediately
+failure-output = "immediate"
+status-level = "fail"
+
+# No retries for faster feedback
+retries = 0
+
+# Ultra-fast profile for prek hooks
+[profile.prek]
+
+# Only run unit tests in lib, skip all integration tests and binaries
+default-filter = 'package(rumdl) and kind(lib) and not test(/slow|stress|large|integration|comprehensive|cli|config|advanced|commonmark|consistency|performance|benchmark|parity|error_propagation|deeply_nested|memory/)'
+
+# Maximum parallelism for speed
+test-threads = "num-cpus"
+
+# Minimal output for speed
+status-level = "fail"
+failure-output = "immediate"
+success-output = "never"
+
+# No retries to save time
+retries = 0
+
+# Fail fast on first failure
+fail-fast = true
+
+# Performance testing profile - for scheduled/manual runs
+[profile.performance]
+
+# Only run performance, benchmark, memory, and complexity regression tests
+default-filter = 'test(performance) or test(benchmark) or test(deeply_nested) or test(memory) or test(linear_complexity)'
+
+# Run tests serially to reduce noise
+test-threads = 1
+
+# Show detailed output
+failure-output = "immediate"
+success-output = "immediate"
+status-level = "all"
+
+# Allow retries for flaky tests
+retries = { backoff = "exponential", count = 3, delay = "1s", max-delay = "10s" }
+
+# Don't fail fast - run all performance tests
+fail-fast = false
+
+# Smoke testing profile - lighter, stable test runs suitable for package managers
+[profile.smoke]
+# Run integration-style tests, excluding heavy/flaky ones
+# Note: exclusion patterns must not inadvertently match module names (e.g. "regression" would match "regressions::")
+default-filter = 'test(/^(cli|config|integration|formats|output|lsp|regressions|unicode)::/) and not test(/performance|benchmark|memory|linear_complexity|scaling|stress|large|comprehensive|deeply_nested|error_propagation|proptest|property_based|perf_/)'
+
+test-threads = "num-cpus"
+failure-output = "immediate"
+success-output = "final"
+status-level = "pass"
+retries = 0
+
+# Don't fail fast to see all failed results
+# Useful as Nix requires rebuilds for checkPhase failures, and these tests are light
+fail-fast = false

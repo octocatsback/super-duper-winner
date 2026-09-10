@@ -1,0 +1,11572 @@
+use super::*;
+use crate::lsp::types::{warning_to_code_actions, warning_to_diagnostic};
+use crate::rule::LintWarning;
+use indoc::indoc;
+use tower_lsp::LspService;
+
+/// Spell a path the way the server spells it.
+///
+/// A test that sets `workspace_roots` or seeds the workspace index by hand builds
+/// paths the server would otherwise build itself, so it has to build them the same
+/// way or it creates a state the server cannot reach. A bare `canonicalize` is not
+/// the same way: on Windows it returns the `\\?\` verbatim form, which no document
+/// URI carries, so an index keyed on it can never be looked up by an open document
+/// and every cross-file test would pass on Unix while going silently dead there.
+trait ResolveLikeServer {
+    fn resolve_like_server(&self) -> std::path::PathBuf;
+}
+
+impl ResolveLikeServer for std::path::Path {
+    fn resolve_like_server(&self) -> std::path::PathBuf {
+        crate::lsp::resolve_workspace_root(self)
+    }
+}
+
+fn create_test_server() -> RumdlLanguageServer {
+    let (service, _socket) = LspService::new(|client| RumdlLanguageServer::new(client, None));
+    service.inner().clone()
+}
+
+/// Build an absolute, cross-platform path for navigation/hover/rename tests.
+///
+/// A hardcoded `/tmp/...` literal is not an absolute path on Windows (it lacks a
+/// drive letter), so `Url::from_file_path` rejects it and the test panics during
+/// setup. Routing the suffix through `std::env::temp_dir()` yields a valid
+/// absolute path on every platform. These paths are used only as in-memory
+/// document and workspace-index keys; no files are created on disk.
+fn test_temp_path(suffix: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(suffix)
+}
+
+#[test]
+fn test_is_valid_rule_name() {
+    // Valid rule names - canonical MDxxx format
+    assert!(is_valid_rule_name("MD001"));
+    assert!(is_valid_rule_name("md001")); // lowercase
+    assert!(is_valid_rule_name("Md001")); // mixed case
+    assert!(is_valid_rule_name("mD001")); // mixed case
+    assert!(is_valid_rule_name("MD003"));
+    assert!(is_valid_rule_name("MD005"));
+    assert!(is_valid_rule_name("MD007"));
+    assert!(is_valid_rule_name("MD009"));
+    assert!(is_valid_rule_name("MD041"));
+    assert!(is_valid_rule_name("MD060"));
+    assert!(is_valid_rule_name("MD061"));
+
+    // Valid rule names - special "all" value
+    assert!(is_valid_rule_name("all"));
+    assert!(is_valid_rule_name("ALL"));
+    assert!(is_valid_rule_name("All"));
+
+    // Valid rule names - aliases (new in shared implementation)
+    assert!(is_valid_rule_name("line-length")); // alias for MD013
+    assert!(is_valid_rule_name("LINE-LENGTH")); // case insensitive
+    assert!(is_valid_rule_name("heading-increment")); // alias for MD001
+    assert!(is_valid_rule_name("no-bare-urls")); // alias for MD034
+    assert!(is_valid_rule_name("ul-style")); // alias for MD004
+    assert!(is_valid_rule_name("ul_style")); // underscore variant
+
+    // Invalid rule names - not in alias map
+    assert!(!is_valid_rule_name("MD000")); // doesn't exist
+    assert!(!is_valid_rule_name("MD999")); // doesn't exist
+    assert!(!is_valid_rule_name("MD100")); // doesn't exist
+    assert!(!is_valid_rule_name("INVALID"));
+    assert!(!is_valid_rule_name("not-a-rule"));
+    assert!(!is_valid_rule_name(""));
+    assert!(!is_valid_rule_name("random-text"));
+}
+
+#[tokio::test]
+async fn test_server_creation() {
+    let server = create_test_server();
+
+    // Verify default configuration
+    let config = server.config.read().await;
+    assert!(config.enable_linting);
+    assert!(!config.enable_auto_fix);
+}
+
+#[tokio::test]
+async fn test_lint_document() {
+    let server = create_test_server();
+
+    // Test linting with a simple markdown document
+    let uri = Url::parse("file:///test.md").unwrap();
+    let text = "# Test\n\nThis is a test  \nWith trailing spaces  ";
+
+    let diagnostics = server.lint_document(&uri, text, true).await.unwrap();
+
+    // Should find trailing spaces violations
+    assert!(!diagnostics.is_empty());
+    assert!(diagnostics.iter().any(|d| d.message.contains("trailing")));
+}
+
+#[tokio::test]
+async fn test_lint_document_disabled() {
+    let server = create_test_server();
+
+    // Disable linting
+    server.config.write().await.enable_linting = false;
+
+    let uri = Url::parse("file:///test.md").unwrap();
+    let text = "# Test\n\nThis is a test  \nWith trailing spaces  ";
+
+    let diagnostics = server.lint_document(&uri, text, true).await.unwrap();
+
+    // Should return empty diagnostics when disabled
+    assert!(diagnostics.is_empty());
+}
+
+/// An inline directive naming a rule rumdl does not know silently does nothing.
+/// The CLI prints that on stderr; an editor only shows diagnostics, so the server
+/// reports it as one on the line that holds the comment.
+#[tokio::test]
+async fn test_inline_config_typo_is_a_diagnostic() {
+    let server = create_test_server();
+    let uri = Url::parse("file:///test.md").unwrap();
+    let text = "# Title\n\nSome text.<!-- rumdl-disable-line asdf -->\n";
+
+    let diagnostics = server.lint_document(&uri, text, false).await.unwrap();
+
+    let inline: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.code == Some(NumberOrString::String("inline-config".to_string())))
+        .collect();
+    assert_eq!(
+        inline.len(),
+        1,
+        "the unknown rule name should raise exactly one diagnostic, got: {diagnostics:?}"
+    );
+
+    let diagnostic = inline[0];
+    assert!(
+        diagnostic
+            .message
+            .contains("Unknown rule in inline disable-line comment: asdf"),
+        "the diagnostic should name the directive and the unknown rule, got: {}",
+        diagnostic.message
+    );
+    assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
+    assert_eq!(diagnostic.source.as_deref(), Some("rumdl"));
+    // Third line of the document (0-indexed 2), spanning its full width.
+    assert_eq!(diagnostic.range.start, Position { line: 2, character: 0 });
+    assert_eq!(
+        diagnostic.range.end,
+        Position {
+            line: 2,
+            character: "Some text.<!-- rumdl-disable-line asdf -->".chars().count() as u32,
+        }
+    );
+}
+
+/// The same document with the rule name spelled correctly raises nothing, so the
+/// diagnostic above cannot be an artifact of having an inline comment at all.
+#[tokio::test]
+async fn test_valid_inline_config_is_not_a_diagnostic() {
+    let server = create_test_server();
+    let uri = Url::parse("file:///test.md").unwrap();
+    let text = "# Title\n\nSome text.<!-- rumdl-disable-line MD009 -->\n";
+
+    let diagnostics = server.lint_document(&uri, text, false).await.unwrap();
+
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|d| d.code == Some(NumberOrString::String("inline-config".to_string()))),
+        "a correctly spelled directive should raise no inline-config diagnostic, got: {diagnostics:?}"
+    );
+}
+
+/// Configuration decides the rule set, and an inline enable cannot bring back a
+/// rule it disabled. The server reports that no-op the way the CLI does.
+#[tokio::test]
+async fn test_inline_enable_of_a_disabled_rule_is_a_diagnostic() {
+    let server = create_test_server();
+    server.rumdl_config.write().await.global.disable = vec!["MD009".to_string()];
+    let uri = Url::parse("file:///test.md").unwrap();
+    // One trailing space, which MD009 flags; two would be a valid hard break.
+    let text = "# Title\n\n<!-- rumdl-enable MD009 -->\n\nText. \n";
+
+    let diagnostics = server.lint_document(&uri, text, false).await.unwrap();
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("MD009") && d.message.contains("has no effect")),
+        "an inline enable of a config-disabled rule should say it has no effect, got: {diagnostics:?}"
+    );
+}
+
+/// A server whose per-file-ignores are the ones given here, and a URI it can turn
+/// back into a path to match them against.
+///
+/// Both halves matter. `file:///test.md` carries no drive letter, so Windows
+/// cannot resolve it to a path and the server has nothing to match a pattern
+/// against; routing through `test_temp_path` gives an absolute path on every
+/// platform. Declaring the configuration explicit then keeps per-file discovery
+/// from replacing these patterns with whatever config file happens to sit above
+/// the temporary directory.
+async fn server_ignoring_md009(pattern: &str) -> (RumdlLanguageServer, Url) {
+    let server = create_test_server();
+    server.config.write().await.config_path = Some("rumdl.toml".to_string());
+    server
+        .rumdl_config
+        .write()
+        .await
+        .per_file_ignores
+        .insert(pattern.to_string(), vec!["MD009".to_string()]);
+    (server, Url::from_file_path(test_temp_path("test.md")).unwrap())
+}
+
+/// per-file-ignores drops a rule for one file with the same finality, so an
+/// inline enable is equally a no-op there. The diagnostic names that setting
+/// rather than a config-level disable the user does not have set.
+#[tokio::test]
+async fn test_inline_enable_of_a_per_file_ignored_rule_is_a_diagnostic() {
+    let (server, uri) = server_ignoring_md009("*.md").await;
+    // One trailing space, which MD009 flags; two would be a valid hard break.
+    let text = "# Title\n\n<!-- rumdl-enable MD009 -->\n\nText. \n";
+
+    let diagnostics = server.lint_document(&uri, text, false).await.unwrap();
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("MD009") && d.message.contains("per-file-ignores")),
+        "the diagnostic should name per-file-ignores, got: {diagnostics:?}"
+    );
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|d| d.code == Some(NumberOrString::String("MD009".to_string()))),
+        "the ignored rule must not also report findings, got: {diagnostics:?}"
+    );
+}
+
+/// The control for the pattern: one that does not cover this file leaves the
+/// enable alone and lets the rule run.
+#[tokio::test]
+async fn test_inline_enable_under_an_unrelated_ignore_pattern_is_silent() {
+    let (server, uri) = server_ignoring_md009("other.md").await;
+    // One trailing space, which MD009 flags; two would be a valid hard break.
+    let text = "# Title\n\n<!-- rumdl-enable MD009 -->\n\nText. \n";
+
+    let diagnostics = server.lint_document(&uri, text, false).await.unwrap();
+
+    assert!(
+        !diagnostics.iter().any(|d| d.message.contains("has no effect")),
+        "a pattern that does not cover this file must not warn, got: {diagnostics:?}"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.code == Some(NumberOrString::String("MD009".to_string()))),
+        "the rule should still run, got: {diagnostics:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_get_code_actions() {
+    let server = create_test_server();
+
+    let uri = Url::parse("file:///test.md").unwrap();
+    let text = "# Test\n\nThis is a test  \nWith trailing spaces  ";
+
+    // Create a range covering the whole document
+    let range = Range {
+        start: Position { line: 0, character: 0 },
+        end: Position { line: 3, character: 21 },
+    };
+
+    let actions = server.get_code_actions(&uri, text, range).await.unwrap();
+
+    // Should have code actions for fixing trailing spaces
+    assert!(!actions.is_empty());
+    assert!(actions.iter().any(|a| a.title.contains("trailing")));
+}
+
+#[tokio::test]
+async fn test_source_fix_all_with_single_fixable_issue() {
+    let server = create_test_server();
+
+    let uri = Url::parse("file:///test.md").unwrap();
+    // Content with exactly 1 fixable issue: missing final newline (MD047)
+    let text = "# Test";
+
+    let range = Range {
+        start: Position { line: 0, character: 0 },
+        end: Position { line: 0, character: 6 },
+    };
+
+    let actions = server.get_code_actions(&uri, text, range).await.unwrap();
+
+    let fix_all_actions: Vec<_> = actions
+        .iter()
+        .filter(|a| a.kind.as_ref().is_some_and(|k| k.as_str() == "source.fixAll.rumdl"))
+        .collect();
+
+    assert!(
+        !fix_all_actions.is_empty(),
+        "source.fixAll.rumdl should be available even with a single fixable issue"
+    );
+}
+
+#[tokio::test]
+async fn test_get_code_actions_outside_range() {
+    let server = create_test_server();
+
+    let uri = Url::parse("file:///test.md").unwrap();
+    // Lines 2 and 3 (0-indexed LSP line) have hard tabs (MD010, fixable), range only covers line 0.
+    // Tabs are placed mid-line in paragraph text (not at column 0 after a blank line,
+    // which would be an indented code block skipped by default with code_blocks=false).
+    let text = "# Test\n\nThis is\ta test\nWith\ttabs\n";
+
+    // Range that doesn't cover the violations (line 0 only)
+    let range = Range {
+        start: Position { line: 0, character: 0 },
+        end: Position { line: 0, character: 6 },
+    };
+
+    let actions = server.get_code_actions(&uri, text, range).await.unwrap();
+
+    // Per-warning actions should not appear for this range
+    let per_warning_actions: Vec<_> = actions
+        .iter()
+        .filter(|a| a.kind.as_ref().is_some_and(|k| k.as_str() != "source.fixAll.rumdl"))
+        .collect();
+    assert!(
+        per_warning_actions.is_empty(),
+        "No per-warning actions for out-of-range lines"
+    );
+
+    // source.fixAll.rumdl is document-wide, so it should still appear
+    let fix_all_actions: Vec<_> = actions
+        .iter()
+        .filter(|a| a.kind.as_ref().is_some_and(|k| k.as_str() == "source.fixAll.rumdl"))
+        .collect();
+    assert!(
+        !fix_all_actions.is_empty(),
+        "fixAll is document-wide and should appear regardless of requested range"
+    );
+}
+
+#[tokio::test]
+async fn test_document_storage() {
+    let server = create_test_server();
+
+    let uri = Url::parse("file:///test.md").unwrap();
+    let text = "# Test Document";
+
+    // Store document
+    let entry = DocumentEntry {
+        content: text.to_string(),
+        version: Some(1),
+        from_disk: false,
+    };
+    server.documents.write().await.insert(uri.clone(), entry);
+
+    // Verify storage
+    let stored = server.documents.read().await.get(&uri).map(|e| e.content.clone());
+    assert_eq!(stored, Some(text.to_string()));
+
+    // Remove document
+    server.documents.write().await.remove(&uri);
+
+    // Verify removal
+    let stored = server.documents.read().await.get(&uri).cloned();
+    assert_eq!(stored, None);
+}
+
+#[tokio::test]
+async fn test_configuration_loading() {
+    let server = create_test_server();
+
+    // Load configuration with auto-discovery
+    server.load_configuration(false).await;
+
+    // Verify configuration was loaded successfully
+    // The config could be from: .rumdl.toml, pyproject.toml, .markdownlint.json, or default
+    let rumdl_config = server.rumdl_config.read().await;
+    // The loaded config is valid regardless of source
+    drop(rumdl_config); // Just verify we can access it without panic
+}
+
+#[tokio::test]
+async fn test_load_config_for_lsp() {
+    // Test with no config file
+    let result = RumdlLanguageServer::load_config_for_lsp(None, None, None, None);
+    assert!(result.is_ok());
+
+    // Test with non-existent config file
+    let result = RumdlLanguageServer::load_config_for_lsp(Some("/nonexistent/config.toml"), None, None, None);
+    assert!(result.is_err());
+}
+
+/// The LSP workspace-load path (auto-discovery from the workspace root) must carry
+/// the same shadowed-config warning the CLI does, so `load_configuration` can
+/// surface it to editor users. Pins CLI/LSP parity on the shared discovery helper.
+#[test]
+fn test_lsp_discovery_carries_shadowed_config_warning() {
+    use tempfile::tempdir;
+
+    let temp = tempdir().unwrap();
+    std::fs::create_dir_all(temp.path().join(".git")).unwrap(); // bound discovery here
+    std::fs::write(temp.path().join(".rumdl.toml"), "line-length = 11\n").unwrap();
+    std::fs::write(temp.path().join("rumdl.toml"), "line-length = 22\n").unwrap();
+    let root = temp.path().resolve_like_server();
+
+    let sourced = RumdlLanguageServer::load_config_for_lsp(None, Some(&root), None, None).expect("config should load");
+    assert!(
+        sourced
+            .discovery_warnings
+            .iter()
+            .any(|w| w.contains("multiple rumdl config files")),
+        "LSP discovery should record a shadowed-config warning, got: {:?}",
+        sourced.discovery_warnings
+    );
+}
+
+#[tokio::test]
+async fn test_warning_conversion() {
+    let warning = LintWarning {
+        message: "Test warning".to_string(),
+        line: 1,
+        column: 1,
+        end_line: 1,
+        end_column: 10,
+        severity: crate::rule::Severity::Warning,
+        fix: None,
+        rule_name: Some("MD001".to_string()),
+    };
+
+    // Test diagnostic conversion
+    let diagnostic = warning_to_diagnostic(&warning, "Test content");
+    assert_eq!(diagnostic.message, "Test warning");
+    assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
+    assert_eq!(diagnostic.code, Some(NumberOrString::String("MD001".to_string())));
+
+    // Test code action conversion (no fix, but should have ignore action)
+    let uri = Url::parse("file:///test.md").unwrap();
+    let actions = warning_to_code_actions(&warning, &uri, "Test content");
+    // Should have 1 action: ignore-line (no fix available)
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].title, "Ignore heading-increment (MD001) for this line");
+}
+
+#[tokio::test]
+async fn test_multiple_documents() {
+    let server = create_test_server();
+
+    let uri1 = Url::parse("file:///test1.md").unwrap();
+    let uri2 = Url::parse("file:///test2.md").unwrap();
+    let text1 = "# Document 1";
+    let text2 = "# Document 2";
+
+    // Store multiple documents
+    {
+        let mut docs = server.documents.write().await;
+        let entry1 = DocumentEntry {
+            content: text1.to_string(),
+            version: Some(1),
+            from_disk: false,
+        };
+        let entry2 = DocumentEntry {
+            content: text2.to_string(),
+            version: Some(1),
+            from_disk: false,
+        };
+        docs.insert(uri1.clone(), entry1);
+        docs.insert(uri2.clone(), entry2);
+    }
+
+    // Verify both are stored
+    let docs = server.documents.read().await;
+    assert_eq!(docs.len(), 2);
+    assert_eq!(docs.get(&uri1).map(|s| s.content.as_str()), Some(text1));
+    assert_eq!(docs.get(&uri2).map(|s| s.content.as_str()), Some(text2));
+}
+
+#[tokio::test]
+async fn test_auto_fix_on_save() {
+    let server = create_test_server();
+
+    // Enable auto-fix
+    {
+        let mut config = server.config.write().await;
+        config.enable_auto_fix = true;
+    }
+
+    let uri = Url::parse("file:///test.md").unwrap();
+    let text = "#Heading without space"; // MD018 violation
+
+    // Store document
+    let entry = DocumentEntry {
+        content: text.to_string(),
+        version: Some(1),
+        from_disk: false,
+    };
+    server.documents.write().await.insert(uri.clone(), entry);
+
+    // Test apply_all_fixes
+    let fixed = server.apply_all_fixes(&uri, text).await.unwrap();
+    assert!(fixed.is_some());
+    // MD018 adds space, MD047 adds trailing newline
+    assert_eq!(fixed.unwrap(), "# Heading without space\n");
+}
+
+#[tokio::test]
+async fn test_get_end_position() {
+    let server = create_test_server();
+
+    // Single line
+    let pos = server.get_end_position("Hello");
+    assert_eq!(pos.line, 0);
+    assert_eq!(pos.character, 5);
+
+    // Multiple lines
+    let pos = server.get_end_position("Hello\nWorld\nTest");
+    assert_eq!(pos.line, 2);
+    assert_eq!(pos.character, 4);
+
+    // Empty string
+    let pos = server.get_end_position("");
+    assert_eq!(pos.line, 0);
+    assert_eq!(pos.character, 0);
+
+    // Ends with newline - position should be at start of next line
+    let pos = server.get_end_position("Hello\n");
+    assert_eq!(pos.line, 1);
+    assert_eq!(pos.character, 0);
+}
+
+#[tokio::test]
+async fn test_empty_document_handling() {
+    let server = create_test_server();
+
+    let uri = Url::parse("file:///empty.md").unwrap();
+    let text = "";
+
+    // Test linting empty document
+    let diagnostics = server.lint_document(&uri, text, true).await.unwrap();
+    assert!(diagnostics.is_empty());
+
+    // Test code actions on empty document
+    let range = Range {
+        start: Position { line: 0, character: 0 },
+        end: Position { line: 0, character: 0 },
+    };
+    let actions = server.get_code_actions(&uri, text, range).await.unwrap();
+    assert!(actions.is_empty());
+}
+
+#[tokio::test]
+async fn test_config_update() {
+    let server = create_test_server();
+
+    // Update config
+    {
+        let mut config = server.config.write().await;
+        config.enable_auto_fix = true;
+        config.config_path = Some("/custom/path.toml".to_string());
+    }
+
+    // Verify update
+    let config = server.config.read().await;
+    assert!(config.enable_auto_fix);
+    assert_eq!(config.config_path, Some("/custom/path.toml".to_string()));
+}
+
+#[tokio::test]
+async fn test_document_formatting() {
+    let server = create_test_server();
+    let uri = Url::parse("file:///test.md").unwrap();
+    let text = "# Test\n\nThis is a test  \nWith trailing spaces  ";
+
+    // Store document
+    let entry = DocumentEntry {
+        content: text.to_string(),
+        version: Some(1),
+        from_disk: false,
+    };
+    server.documents.write().await.insert(uri.clone(), entry);
+
+    // Create formatting params
+    let params = DocumentFormattingParams {
+        text_document: TextDocumentIdentifier { uri: uri.clone() },
+        options: FormattingOptions {
+            tab_size: 4,
+            insert_spaces: true,
+            properties: HashMap::new(),
+            trim_trailing_whitespace: Some(true),
+            insert_final_newline: Some(true),
+            trim_final_newlines: Some(true),
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+    };
+
+    // Call formatting
+    let result = server.formatting(params).await.unwrap();
+
+    // Should return text edits that fix the trailing spaces
+    assert!(result.is_some());
+    let edits = result.unwrap();
+    assert!(!edits.is_empty());
+
+    // The new text should have trailing spaces removed from ALL lines
+    // because trim_trailing_whitespace: Some(true) is set
+    let edit = &edits[0];
+    // The formatted text should have:
+    // - Trailing spaces removed from ALL lines (trim_trailing_whitespace)
+    // - Exactly one final newline (trim_final_newlines + insert_final_newline)
+    let expected = "# Test\n\nThis is a test\nWith trailing spaces\n";
+    assert_eq!(edit.new_text, expected);
+}
+
+#[tokio::test]
+async fn test_document_symbol_outline() {
+    let server = create_test_server();
+    *server.client_supports_hierarchical_symbols.write().await = true;
+    let uri = Url::parse("file:///outline.md").unwrap();
+    let text = "# Top\n\n## Child A\n\nbody\n\n## Child B\n\n### Grandchild\n";
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: text.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    let params = DocumentSymbolParams {
+        text_document: TextDocumentIdentifier { uri: uri.clone() },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+    };
+    let result = server.document_symbol(params).await.unwrap();
+    let Some(DocumentSymbolResponse::Nested(symbols)) = result else {
+        panic!("expected nested document symbols, got {result:?}");
+    };
+
+    assert_eq!(symbols.len(), 1, "single H1 root");
+    assert_eq!(symbols[0].name, "Top");
+    let children = symbols[0].children.as_ref().expect("Top has children");
+    assert_eq!(children.len(), 2);
+    assert_eq!(children[0].name, "Child A");
+    assert_eq!(children[1].name, "Child B");
+    let grandchildren = children[1].children.as_ref().expect("Child B has a child");
+    assert_eq!(grandchildren[0].name, "Grandchild");
+}
+
+#[tokio::test]
+async fn test_document_symbol_flat_for_non_hierarchical_client() {
+    // A client that does not advertise hierarchical support gets the legacy flat
+    // form, with each heading's parent recorded as its container.
+    let server = create_test_server();
+    assert!(
+        !*server.client_supports_hierarchical_symbols.read().await,
+        "default is the flat form"
+    );
+    let uri = Url::parse("file:///flat.md").unwrap();
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: "# Top\n\n## Child\n".to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    let params = DocumentSymbolParams {
+        text_document: TextDocumentIdentifier { uri: uri.clone() },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+    };
+    let result = server.document_symbol(params).await.unwrap();
+    let Some(DocumentSymbolResponse::Flat(symbols)) = result else {
+        panic!("expected flat document symbols, got {result:?}");
+    };
+
+    assert_eq!(symbols.len(), 2);
+    assert_eq!(symbols[0].name, "Top");
+    assert_eq!(symbols[0].container_name, None, "the top heading has no container");
+    assert_eq!(symbols[1].name, "Child");
+    assert_eq!(
+        symbols[1].container_name.as_deref(),
+        Some("Top"),
+        "Child is contained by Top"
+    );
+}
+
+#[tokio::test]
+async fn test_document_symbol_none_without_headings() {
+    let server = create_test_server();
+    let uri = Url::parse("file:///plain.md").unwrap();
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: "just paragraphs\n\nno headings here\n".to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    let params = DocumentSymbolParams {
+        text_document: TextDocumentIdentifier { uri },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+    };
+    assert!(
+        server.document_symbol(params).await.unwrap().is_none(),
+        "no symbols for a document without headings"
+    );
+}
+
+#[tokio::test]
+async fn test_workspace_symbol_search() {
+    use crate::workspace_index::{FileIndex, HeadingIndex, WorkspaceIndex};
+
+    let server = create_test_server();
+    let doc_path = std::env::temp_dir().join("rumdl-ws-symbol").join("doc.md");
+    {
+        let mut index = server.workspace_index.write().await;
+        *index = WorkspaceIndex::new();
+        let mut fi = FileIndex::default();
+        fi.headings.push(HeadingIndex {
+            text: "Configuration".to_string(),
+            auto_anchor: "configuration".to_string(),
+            custom_anchor: None,
+            line: 3,
+            is_setext: false,
+        });
+        fi.headings.push(HeadingIndex {
+            text: "Usage".to_string(),
+            auto_anchor: "usage".to_string(),
+            custom_anchor: None,
+            line: 10,
+            is_setext: false,
+        });
+        index.insert_file(doc_path.clone(), fi);
+    }
+
+    let params = WorkspaceSymbolParams {
+        query: "config".to_string(),
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+    };
+    let symbols = server
+        .symbol(params)
+        .await
+        .unwrap()
+        .expect("expected workspace symbols");
+    assert_eq!(symbols.len(), 1, "only the matching heading is returned");
+    assert_eq!(symbols[0].name, "Configuration");
+    // Heading on line 3 (1-based) maps to LSP line 2 (0-based).
+    assert_eq!(symbols[0].location.range.start.line, 2);
+    assert!(symbols[0].location.uri.as_str().ends_with("doc.md"));
+}
+
+/// Test that Unfixable rules are excluded from formatting/Fix All but available for Quick Fix
+/// Regression test for issue #158: formatting deleted HTML img tags
+#[tokio::test]
+async fn test_unfixable_rules_excluded_from_formatting() {
+    let server = create_test_server();
+    let uri = Url::parse("file:///test.md").unwrap();
+
+    // Content with both fixable (trailing spaces) and unfixable (HTML) issues
+    let text = "# Test Document\n\n<img src=\"test.png\" alt=\"Test\" />\n\nTrailing spaces  ";
+
+    // Store document
+    let entry = DocumentEntry {
+        content: text.to_string(),
+        version: Some(1),
+        from_disk: false,
+    };
+    server.documents.write().await.insert(uri.clone(), entry);
+
+    // Test 1: Formatting should preserve HTML (Unfixable) but fix trailing spaces (fixable)
+    let format_params = DocumentFormattingParams {
+        text_document: TextDocumentIdentifier { uri: uri.clone() },
+        options: FormattingOptions {
+            tab_size: 4,
+            insert_spaces: true,
+            properties: HashMap::new(),
+            trim_trailing_whitespace: Some(true),
+            insert_final_newline: Some(true),
+            trim_final_newlines: Some(true),
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+    };
+
+    let format_result = server.formatting(format_params).await.unwrap();
+    assert!(format_result.is_some(), "Should return formatting edits");
+
+    let edits = format_result.unwrap();
+    assert!(!edits.is_empty(), "Should have formatting edits");
+
+    let formatted = &edits[0].new_text;
+    assert!(
+        formatted.contains("<img src=\"test.png\" alt=\"Test\" />"),
+        "HTML should be preserved during formatting (Unfixable rule)"
+    );
+    assert!(
+        !formatted.contains("spaces  "),
+        "Trailing spaces should be removed (fixable rule)"
+    );
+
+    // Test 2: Quick Fix actions should still be available for Unfixable rules
+    let range = Range {
+        start: Position { line: 0, character: 0 },
+        end: Position { line: 10, character: 0 },
+    };
+
+    let code_actions = server.get_code_actions(&uri, text, range).await.unwrap();
+
+    // Should have individual Quick Fix actions for each warning
+    let html_fix_actions: Vec<_> = code_actions
+        .iter()
+        .filter(|action| action.title.contains("MD033") || action.title.contains("HTML"))
+        .collect();
+
+    assert!(
+        !html_fix_actions.is_empty(),
+        "Quick Fix actions should be available for HTML (Unfixable rules)"
+    );
+
+    // Test 3: "Fix All" action should exclude Unfixable rules
+    let fix_all_actions: Vec<_> = code_actions
+        .iter()
+        .filter(|action| action.title.contains("Fix all"))
+        .collect();
+
+    if let Some(fix_all_action) = fix_all_actions.first()
+        && let Some(ref edit) = fix_all_action.edit
+        && let Some(ref changes) = edit.changes
+        && let Some(text_edits) = changes.get(&uri)
+        && let Some(text_edit) = text_edits.first()
+    {
+        let fixed_all = &text_edit.new_text;
+        assert!(
+            fixed_all.contains("<img src=\"test.png\" alt=\"Test\" />"),
+            "Fix All should preserve HTML (Unfixable rules)"
+        );
+        assert!(
+            !fixed_all.contains("spaces  "),
+            "Fix All should remove trailing spaces (fixable rules)"
+        );
+    }
+}
+
+/// Test that resolve_config_for_file() finds the correct config in multi-root workspace
+#[tokio::test]
+async fn test_resolve_config_for_file_multi_root() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let temp_path = temp_dir.path();
+
+    // Setup project A with line_length=60
+    let project_a = temp_path.join("project_a");
+    let project_a_docs = project_a.join("docs");
+    fs::create_dir_all(&project_a_docs).unwrap();
+
+    let config_a = project_a.join(".rumdl.toml");
+    fs::write(
+        &config_a,
+        r#"
+[global]
+
+[MD013]
+line_length = 60
+"#,
+    )
+    .unwrap();
+
+    // Setup project B with line_length=120
+    let project_b = temp_path.join("project_b");
+    fs::create_dir(&project_b).unwrap();
+
+    let config_b = project_b.join(".rumdl.toml");
+    fs::write(
+        &config_b,
+        r#"
+[global]
+
+[MD013]
+line_length = 120
+"#,
+    )
+    .unwrap();
+
+    // Create LSP server and initialize with workspace roots
+    let server = create_test_server();
+
+    // Set workspace roots
+    {
+        let mut roots = server.workspace_roots.write().await;
+        roots.push(project_a.clone());
+        roots.push(project_b.clone());
+    }
+
+    // Test file in project A
+    let file_a = project_a_docs.join("test.md");
+    fs::write(&file_a, "# Test A\n").unwrap();
+
+    let config_for_a = server.resolve_config_for_file(&file_a).await;
+    let line_length_a = crate::config::get_rule_config_value::<usize>(&config_for_a, "MD013", "line_length");
+    assert_eq!(line_length_a, Some(60), "File in project_a should get line_length=60");
+
+    // Test file in project B
+    let file_b = project_b.join("test.md");
+    fs::write(&file_b, "# Test B\n").unwrap();
+
+    let config_for_b = server.resolve_config_for_file(&file_b).await;
+    let line_length_b = crate::config::get_rule_config_value::<usize>(&config_for_b, "MD013", "line_length");
+    assert_eq!(line_length_b, Some(120), "File in project_b should get line_length=120");
+}
+
+/// Test that config resolution respects workspace root boundaries
+#[tokio::test]
+async fn test_config_resolution_respects_workspace_boundaries() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let temp_path = temp_dir.path();
+
+    // Create parent config that should NOT be used
+    let parent_config = temp_path.join(".rumdl.toml");
+    fs::write(
+        &parent_config,
+        r#"
+[global]
+
+[MD013]
+line_length = 80
+"#,
+    )
+    .unwrap();
+
+    // Create workspace root with its own config
+    let workspace_root = temp_path.join("workspace");
+    let workspace_subdir = workspace_root.join("subdir");
+    fs::create_dir_all(&workspace_subdir).unwrap();
+
+    let workspace_config = workspace_root.join(".rumdl.toml");
+    fs::write(
+        &workspace_config,
+        r#"
+[global]
+
+[MD013]
+line_length = 100
+"#,
+    )
+    .unwrap();
+
+    let server = create_test_server();
+
+    // Register workspace_root as a workspace root
+    {
+        let mut roots = server.workspace_roots.write().await;
+        roots.push(workspace_root.clone());
+    }
+
+    // Test file deep in subdirectory
+    let test_file = workspace_subdir.join("deep").join("test.md");
+    fs::create_dir_all(test_file.parent().unwrap()).unwrap();
+    fs::write(&test_file, "# Test\n").unwrap();
+
+    let config = server.resolve_config_for_file(&test_file).await;
+    let line_length = crate::config::get_rule_config_value::<usize>(&config, "MD013", "line_length");
+
+    // Should find workspace_root/.rumdl.toml (100), NOT parent config (80)
+    assert_eq!(
+        line_length,
+        Some(100),
+        "Should find workspace config, not parent config outside workspace"
+    );
+}
+
+/// Test that config cache works (cache hit scenario)
+#[tokio::test]
+async fn test_config_cache_hit() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let temp_path = temp_dir.path();
+
+    let project = temp_path.join("project");
+    fs::create_dir(&project).unwrap();
+
+    let config_file = project.join(".rumdl.toml");
+    fs::write(
+        &config_file,
+        r#"
+[global]
+
+[MD013]
+line_length = 75
+"#,
+    )
+    .unwrap();
+
+    let server = create_test_server();
+    {
+        let mut roots = server.workspace_roots.write().await;
+        roots.push(project.clone());
+    }
+
+    let test_file = project.join("test.md");
+    fs::write(&test_file, "# Test\n").unwrap();
+
+    // First call - cache miss
+    let config1 = server.resolve_config_for_file(&test_file).await;
+    let line_length1 = crate::config::get_rule_config_value::<usize>(&config1, "MD013", "line_length");
+    assert_eq!(line_length1, Some(75));
+
+    // Verify cache was populated
+    {
+        let cache = server.config_cache.read().await;
+        let search_dir = test_file.parent().unwrap();
+        assert!(
+            cache.contains_key(search_dir),
+            "Cache should be populated after first call"
+        );
+    }
+
+    // Second call - cache hit (should return same config without filesystem access)
+    let config2 = server.resolve_config_for_file(&test_file).await;
+    let line_length2 = crate::config::get_rule_config_value::<usize>(&config2, "MD013", "line_length");
+    assert_eq!(line_length2, Some(75));
+}
+
+/// Test nested directory config search (file searches upward)
+#[tokio::test]
+async fn test_nested_directory_config_search() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let temp_path = temp_dir.path();
+
+    let project = temp_path.join("project");
+    fs::create_dir(&project).unwrap();
+
+    // Config at project root
+    let config = project.join(".rumdl.toml");
+    fs::write(
+        &config,
+        r#"
+[global]
+
+[MD013]
+line_length = 110
+"#,
+    )
+    .unwrap();
+
+    // File deep in nested structure
+    let deep_dir = project.join("src").join("docs").join("guides");
+    fs::create_dir_all(&deep_dir).unwrap();
+    let deep_file = deep_dir.join("test.md");
+    fs::write(&deep_file, "# Test\n").unwrap();
+
+    let server = create_test_server();
+    {
+        let mut roots = server.workspace_roots.write().await;
+        roots.push(project.clone());
+    }
+
+    let resolved_config = server.resolve_config_for_file(&deep_file).await;
+    let line_length = crate::config::get_rule_config_value::<usize>(&resolved_config, "MD013", "line_length");
+
+    assert_eq!(
+        line_length,
+        Some(110),
+        "Should find config by searching upward from deep directory"
+    );
+}
+
+/// Test fallback to default config when no config file found
+#[tokio::test]
+async fn test_fallback_to_default_config() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let temp_path = temp_dir.path();
+
+    let project = temp_path.join("project");
+    fs::create_dir(&project).unwrap();
+
+    // No config file created!
+
+    let test_file = project.join("test.md");
+    fs::write(&test_file, "# Test\n").unwrap();
+
+    let server = create_test_server();
+    {
+        let mut roots = server.workspace_roots.write().await;
+        roots.push(project.clone());
+    }
+
+    let config = server.resolve_config_for_file(&test_file).await;
+
+    // Default global line_length is 80
+    assert_eq!(
+        config.global.line_length.get(),
+        80,
+        "Should fall back to default config when no config file found"
+    );
+}
+
+/// Test config priority: closer config wins over parent config
+#[tokio::test]
+async fn test_config_priority_closer_wins() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let temp_path = temp_dir.path();
+
+    let project = temp_path.join("project");
+    fs::create_dir(&project).unwrap();
+
+    // Parent config
+    let parent_config = project.join(".rumdl.toml");
+    fs::write(
+        &parent_config,
+        r#"
+[global]
+
+[MD013]
+line_length = 100
+"#,
+    )
+    .unwrap();
+
+    // Subdirectory with its own config (should override parent)
+    let subdir = project.join("subdir");
+    fs::create_dir(&subdir).unwrap();
+
+    let subdir_config = subdir.join(".rumdl.toml");
+    fs::write(
+        &subdir_config,
+        r#"
+[global]
+
+[MD013]
+line_length = 50
+"#,
+    )
+    .unwrap();
+
+    let server = create_test_server();
+    {
+        let mut roots = server.workspace_roots.write().await;
+        roots.push(project.clone());
+    }
+
+    // File in subdirectory
+    let test_file = subdir.join("test.md");
+    fs::write(&test_file, "# Test\n").unwrap();
+
+    let config = server.resolve_config_for_file(&test_file).await;
+    let line_length = crate::config::get_rule_config_value::<usize>(&config, "MD013", "line_length");
+
+    assert_eq!(
+        line_length,
+        Some(50),
+        "Closer config (subdir) should override parent config"
+    );
+}
+
+/// Test for issue #131: LSP should skip pyproject.toml without [tool.rumdl] section
+///
+/// This test verifies the fix in resolve_config_for_file() at lines 574-585 that checks
+/// for [tool.rumdl] presence before loading pyproject.toml. The fix ensures LSP behavior
+/// matches CLI behavior.
+#[tokio::test]
+async fn test_issue_131_pyproject_without_rumdl_section() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    // Create a parent temp dir that we control
+    let parent_dir = tempdir().unwrap();
+
+    // Create a child subdirectory for the project
+    let project_dir = parent_dir.path().join("project");
+    fs::create_dir(&project_dir).unwrap();
+
+    // Create pyproject.toml WITHOUT [tool.rumdl] section in project dir
+    fs::write(
+        project_dir.join("pyproject.toml"),
+        r#"
+[project]
+name = "test-project"
+version = "0.1.0"
+"#,
+    )
+    .unwrap();
+
+    // Create .rumdl.toml in PARENT that SHOULD be found
+    // because pyproject.toml without [tool.rumdl] should be skipped
+    fs::write(
+        parent_dir.path().join(".rumdl.toml"),
+        r#"
+[global]
+disable = ["MD013"]
+"#,
+    )
+    .unwrap();
+
+    let test_file = project_dir.join("test.md");
+    fs::write(&test_file, "# Test\n").unwrap();
+
+    let server = create_test_server();
+
+    // Set workspace root to parent so upward search doesn't stop at project_dir
+    {
+        let mut roots = server.workspace_roots.write().await;
+        roots.push(parent_dir.path().to_path_buf());
+    }
+
+    // Resolve config for file in project_dir
+    let config = server.resolve_config_for_file(&test_file).await;
+
+    // CRITICAL TEST: The pyproject.toml in project_dir should be SKIPPED because it lacks
+    // [tool.rumdl], and the search should continue upward to find parent .rumdl.toml
+    assert!(
+        config.global.disable.contains(&"MD013".to_string()),
+        "Issue #131 regression: LSP must skip pyproject.toml without [tool.rumdl] \
+         and continue upward search. Expected MD013 from parent .rumdl.toml to be disabled."
+    );
+
+    // Verify the config came from the parent directory, not project_dir
+    // (we can check this by looking at the cache)
+    let cache = server.config_cache.read().await;
+    let cache_entry = cache.get(&project_dir).expect("Config should be cached");
+
+    assert!(
+        cache_entry.config_file.is_some(),
+        "Should have found a config file (parent .rumdl.toml)"
+    );
+
+    let found_config_path = cache_entry.config_file.as_ref().unwrap();
+    assert!(
+        found_config_path.ends_with(".rumdl.toml"),
+        "Should have loaded .rumdl.toml, not pyproject.toml. Found: {found_config_path:?}"
+    );
+    assert!(
+        found_config_path.parent().unwrap() == parent_dir.path(),
+        "Should have loaded config from parent directory, not project_dir"
+    );
+}
+
+/// Test for issue #131: LSP should detect and load pyproject.toml WITH [tool.rumdl] section
+///
+/// This test verifies that when pyproject.toml contains [tool.rumdl], the fix at lines 574-585
+/// correctly allows it through and loads the configuration.
+#[tokio::test]
+async fn test_issue_131_pyproject_with_rumdl_section() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    // Create a parent temp dir that we control
+    let parent_dir = tempdir().unwrap();
+
+    // Create a child subdirectory for the project
+    let project_dir = parent_dir.path().join("project");
+    fs::create_dir(&project_dir).unwrap();
+
+    // Create pyproject.toml WITH [tool.rumdl] section in project dir
+    fs::write(
+        project_dir.join("pyproject.toml"),
+        r#"
+[project]
+name = "test-project"
+
+[tool.rumdl.global]
+disable = ["MD033"]
+"#,
+    )
+    .unwrap();
+
+    // Create a parent directory with different config that should NOT be used
+    fs::write(
+        parent_dir.path().join(".rumdl.toml"),
+        r#"
+[global]
+disable = ["MD041"]
+"#,
+    )
+    .unwrap();
+
+    let test_file = project_dir.join("test.md");
+    fs::write(&test_file, "# Test\n").unwrap();
+
+    let server = create_test_server();
+
+    // Set workspace root to parent
+    {
+        let mut roots = server.workspace_roots.write().await;
+        roots.push(parent_dir.path().to_path_buf());
+    }
+
+    // Resolve config for file
+    let config = server.resolve_config_for_file(&test_file).await;
+
+    // CRITICAL TEST: The pyproject.toml should be LOADED (not skipped) because it has [tool.rumdl]
+    assert!(
+        config.global.disable.contains(&"MD033".to_string()),
+        "Issue #131 regression: LSP must load pyproject.toml when it has [tool.rumdl]. \
+         Expected MD033 from project_dir pyproject.toml to be disabled."
+    );
+
+    // Verify we did NOT get the parent config
+    assert!(
+        !config.global.disable.contains(&"MD041".to_string()),
+        "Should use project_dir pyproject.toml, not parent .rumdl.toml"
+    );
+
+    // Verify the config came from pyproject.toml specifically
+    let cache = server.config_cache.read().await;
+    let cache_entry = cache.get(&project_dir).expect("Config should be cached");
+
+    assert!(cache_entry.config_file.is_some(), "Should have found a config file");
+
+    let found_config_path = cache_entry.config_file.as_ref().unwrap();
+    assert!(
+        found_config_path.ends_with("pyproject.toml"),
+        "Should have loaded pyproject.toml. Found: {found_config_path:?}"
+    );
+    assert!(
+        found_config_path.parent().unwrap() == project_dir,
+        "Should have loaded pyproject.toml from project_dir, not parent"
+    );
+}
+
+/// Test for issue #131: Verify pyproject.toml with only "tool.rumdl" (no brackets) is detected
+///
+/// The fix checks for both "[tool.rumdl]" and "tool.rumdl" (line 576), ensuring it catches
+/// any valid TOML structure like [tool.rumdl.global] or [[tool.rumdl.something]].
+#[tokio::test]
+async fn test_issue_131_pyproject_with_tool_rumdl_subsection() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+
+    // Create pyproject.toml with [tool.rumdl.global] but not [tool.rumdl] directly
+    fs::write(
+        temp_dir.path().join("pyproject.toml"),
+        r#"
+[project]
+name = "test-project"
+
+[tool.rumdl.global]
+disable = ["MD022"]
+"#,
+    )
+    .unwrap();
+
+    let test_file = temp_dir.path().join("test.md");
+    fs::write(&test_file, "# Test\n").unwrap();
+
+    let server = create_test_server();
+
+    // Set workspace root
+    {
+        let mut roots = server.workspace_roots.write().await;
+        roots.push(temp_dir.path().to_path_buf());
+    }
+
+    // Resolve config for file
+    let config = server.resolve_config_for_file(&test_file).await;
+
+    // Should detect "tool.rumdl" substring and load the config
+    assert!(
+        config.global.disable.contains(&"MD022".to_string()),
+        "Should detect tool.rumdl substring in [tool.rumdl.global] and load config"
+    );
+
+    // Verify it loaded pyproject.toml
+    let cache = server.config_cache.read().await;
+    let cache_entry = cache.get(temp_dir.path()).expect("Config should be cached");
+    assert!(
+        cache_entry.config_file.as_ref().unwrap().ends_with("pyproject.toml"),
+        "Should have loaded pyproject.toml"
+    );
+}
+
+/// Test for issue #182: Client pull diagnostics capability detection
+///
+/// When a client supports pull diagnostics (textDocument/diagnostic), the server
+/// should skip pushing diagnostics via publishDiagnostics to avoid duplicates.
+#[tokio::test]
+async fn test_issue_182_pull_diagnostics_capability_default() {
+    let server = create_test_server();
+
+    // By default, client_supports_pull_diagnostics should be false
+    assert!(
+        !*server.client_supports_pull_diagnostics.read().await,
+        "Default should be false - push diagnostics by default"
+    );
+}
+
+/// Test that we can set the pull diagnostics flag
+#[tokio::test]
+async fn test_issue_182_pull_diagnostics_flag_update() {
+    let server = create_test_server();
+
+    // Simulate detecting pull capability
+    *server.client_supports_pull_diagnostics.write().await = true;
+
+    assert!(
+        *server.client_supports_pull_diagnostics.read().await,
+        "Flag should be settable to true"
+    );
+}
+
+/// Test issue #182: Verify capability detection logic matches Ruff's pattern
+///
+/// The detection should check: params.capabilities.text_document.diagnostic.is_some()
+#[tokio::test]
+async fn test_issue_182_capability_detection_with_diagnostic_support() {
+    use tower_lsp::lsp_types::{ClientCapabilities, DiagnosticClientCapabilities, TextDocumentClientCapabilities};
+
+    // Create client capabilities WITH diagnostic support
+    let caps_with_diagnostic = ClientCapabilities {
+        text_document: Some(TextDocumentClientCapabilities {
+            diagnostic: Some(DiagnosticClientCapabilities {
+                dynamic_registration: Some(true),
+                related_document_support: Some(false),
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    // Verify the detection logic (same as in initialize)
+    let supports_pull = caps_with_diagnostic
+        .text_document
+        .as_ref()
+        .and_then(|td| td.diagnostic.as_ref())
+        .is_some();
+
+    assert!(supports_pull, "Should detect pull diagnostic support");
+}
+
+/// Test issue #182: Verify capability detection when diagnostic is NOT supported
+#[tokio::test]
+async fn test_issue_182_capability_detection_without_diagnostic_support() {
+    use tower_lsp::lsp_types::{ClientCapabilities, TextDocumentClientCapabilities};
+
+    // Create client capabilities WITHOUT diagnostic support
+    let caps_without_diagnostic = ClientCapabilities {
+        text_document: Some(TextDocumentClientCapabilities {
+            diagnostic: None, // No diagnostic support
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    // Verify the detection logic
+    let supports_pull = caps_without_diagnostic
+        .text_document
+        .as_ref()
+        .and_then(|td| td.diagnostic.as_ref())
+        .is_some();
+
+    assert!(!supports_pull, "Should NOT detect pull diagnostic support");
+}
+
+/// Test issue #182: Verify capability detection with empty text_document
+#[tokio::test]
+async fn test_issue_182_capability_detection_no_text_document() {
+    use tower_lsp::lsp_types::ClientCapabilities;
+
+    // Create client capabilities with no text_document at all
+    let caps_no_text_doc = ClientCapabilities {
+        text_document: None,
+        ..Default::default()
+    };
+
+    // Verify the detection logic
+    let supports_pull = caps_no_text_doc
+        .text_document
+        .as_ref()
+        .and_then(|td| td.diagnostic.as_ref())
+        .is_some();
+
+    assert!(
+        !supports_pull,
+        "Should NOT detect pull diagnostic support when text_document is None"
+    );
+}
+
+#[test]
+fn test_resource_limit_constants() {
+    // Verify resource limit constants have expected values
+    assert_eq!(MAX_RULE_LIST_SIZE, 100);
+    assert_eq!(MAX_LINE_LENGTH, 10_000);
+}
+
+#[test]
+fn test_is_valid_rule_name_edge_cases() {
+    // Test malformed MDxxx patterns - not in alias map
+    assert!(!is_valid_rule_name("MD/01")); // invalid character
+    assert!(!is_valid_rule_name("MD:01")); // invalid character
+    assert!(!is_valid_rule_name("ND001")); // 'N' instead of 'M'
+    assert!(!is_valid_rule_name("ME001")); // 'E' instead of 'D'
+
+    // Test non-ASCII characters - not in alias map
+    assert!(!is_valid_rule_name("MD0①1")); // Unicode digit
+    assert!(!is_valid_rule_name("ＭD001")); // Fullwidth M
+
+    // Test special characters - not in alias map
+    assert!(!is_valid_rule_name("MD\x00\x00\x00")); // null bytes
+}
+
+/// Generic parity test: LSP config must produce identical results to TOML config.
+///
+/// This test ensures that ANY config field works identically whether applied via:
+/// 1. LSP settings (JSON -> apply_rule_config)
+/// 2. TOML file parsing (direct RuleConfig construction)
+///
+/// When adding new config fields to RuleConfig, add them to TEST_CONFIGS below.
+/// The test will fail if LSP handling diverges from TOML handling.
+#[test]
+fn test_lsp_toml_config_parity_generic() {
+    use crate::config::RuleConfig;
+    use crate::rule::Severity;
+
+    // Define test configurations covering all field types and combinations.
+    // Each entry: (description, LSP JSON, expected TOML RuleConfig)
+    // When adding new RuleConfig fields, add test cases here.
+    let test_configs: Vec<(&str, serde_json::Value, RuleConfig)> = vec![
+        // Severity alone (the bug from issue #229)
+        (
+            "severity only - error",
+            serde_json::json!({"severity": "error"}),
+            RuleConfig {
+                severity: Some(Severity::Error),
+                values: std::collections::BTreeMap::new(),
+            },
+        ),
+        (
+            "severity only - warning",
+            serde_json::json!({"severity": "warning"}),
+            RuleConfig {
+                severity: Some(Severity::Warning),
+                values: std::collections::BTreeMap::new(),
+            },
+        ),
+        (
+            "severity only - info",
+            serde_json::json!({"severity": "info"}),
+            RuleConfig {
+                severity: Some(Severity::Info),
+                values: std::collections::BTreeMap::new(),
+            },
+        ),
+        // Value types: integer
+        (
+            "integer value",
+            serde_json::json!({"lineLength": 120}),
+            RuleConfig {
+                severity: None,
+                values: [("line_length".to_string(), toml::Value::Integer(120))]
+                    .into_iter()
+                    .collect(),
+            },
+        ),
+        // Value types: boolean
+        (
+            "boolean value",
+            serde_json::json!({"enabled": true}),
+            RuleConfig {
+                severity: None,
+                values: [("enabled".to_string(), toml::Value::Boolean(true))]
+                    .into_iter()
+                    .collect(),
+            },
+        ),
+        // Value types: string
+        (
+            "string value",
+            serde_json::json!({"style": "consistent"}),
+            RuleConfig {
+                severity: None,
+                values: [("style".to_string(), toml::Value::String("consistent".to_string()))]
+                    .into_iter()
+                    .collect(),
+            },
+        ),
+        // Value types: array
+        (
+            "array value",
+            serde_json::json!({"allowedElements": ["div", "span"]}),
+            RuleConfig {
+                severity: None,
+                values: [(
+                    "allowed_elements".to_string(),
+                    toml::Value::Array(vec![
+                        toml::Value::String("div".to_string()),
+                        toml::Value::String("span".to_string()),
+                    ]),
+                )]
+                .into_iter()
+                .collect(),
+            },
+        ),
+        // Mixed: severity + values (critical combination)
+        (
+            "severity + integer",
+            serde_json::json!({"severity": "info", "lineLength": 80}),
+            RuleConfig {
+                severity: Some(Severity::Info),
+                values: [("line_length".to_string(), toml::Value::Integer(80))]
+                    .into_iter()
+                    .collect(),
+            },
+        ),
+        (
+            "severity + multiple values",
+            serde_json::json!({
+                "severity": "warning",
+                "lineLength": 100,
+                "strict": false,
+                "style": "atx"
+            }),
+            RuleConfig {
+                severity: Some(Severity::Warning),
+                values: [
+                    ("line_length".to_string(), toml::Value::Integer(100)),
+                    ("strict".to_string(), toml::Value::Boolean(false)),
+                    ("style".to_string(), toml::Value::String("atx".to_string())),
+                ]
+                .into_iter()
+                .collect(),
+            },
+        ),
+        // camelCase to snake_case conversion
+        (
+            "camelCase conversion",
+            serde_json::json!({"codeBlocks": true, "headingStyle": "setext"}),
+            RuleConfig {
+                severity: None,
+                values: [
+                    ("code_blocks".to_string(), toml::Value::Boolean(true)),
+                    ("heading_style".to_string(), toml::Value::String("setext".to_string())),
+                ]
+                .into_iter()
+                .collect(),
+            },
+        ),
+    ];
+
+    for (description, lsp_json, expected_toml_config) in test_configs {
+        let mut lsp_config = crate::config::Config::default();
+        crate::lsp::configuration::apply_rule_config(&mut lsp_config, "TEST", &lsp_json);
+
+        let lsp_rule = lsp_config.rules.get("TEST").expect("Rule should exist");
+
+        // Compare severity
+        assert_eq!(
+            lsp_rule.severity, expected_toml_config.severity,
+            "Parity failure [{description}]: severity mismatch. \
+             LSP={:?}, TOML={:?}",
+            lsp_rule.severity, expected_toml_config.severity
+        );
+
+        // Compare values
+        assert_eq!(
+            lsp_rule.values, expected_toml_config.values,
+            "Parity failure [{description}]: values mismatch. \
+             LSP={:?}, TOML={:?}",
+            lsp_rule.values, expected_toml_config.values
+        );
+    }
+}
+
+/// Test apply_rule_config_if_absent preserves all existing config
+#[test]
+fn test_lsp_config_if_absent_preserves_existing() {
+    use crate::config::RuleConfig;
+    use crate::rule::Severity;
+
+    // Pre-existing file config with severity AND values
+    let mut config = crate::config::Config::default();
+    config.rules.insert(
+        "MD013".to_string(),
+        RuleConfig {
+            severity: Some(Severity::Error),
+            values: [("line_length".to_string(), toml::Value::Integer(80))]
+                .into_iter()
+                .collect(),
+        },
+    );
+
+    // LSP tries to override with different values
+    let lsp_json = serde_json::json!({
+        "severity": "info",
+        "lineLength": 120
+    });
+    crate::lsp::configuration::apply_rule_config_if_absent(&mut config, "MD013", &lsp_json);
+
+    let rule = config.rules.get("MD013").expect("Rule should exist");
+
+    // Original severity preserved
+    assert_eq!(
+        rule.severity,
+        Some(Severity::Error),
+        "Existing severity should not be overwritten"
+    );
+
+    // Original values preserved
+    assert_eq!(
+        rule.values.get("line_length"),
+        Some(&toml::Value::Integer(80)),
+        "Existing values should not be overwritten"
+    );
+}
+
+// Tests for apply_formatting_options (issue #265)
+
+#[test]
+fn test_apply_formatting_options_insert_final_newline() {
+    let options = FormattingOptions {
+        tab_size: 4,
+        insert_spaces: true,
+        properties: HashMap::new(),
+        trim_trailing_whitespace: None,
+        insert_final_newline: Some(true),
+        trim_final_newlines: None,
+    };
+
+    // Content without final newline should get one added
+    let result = RumdlLanguageServer::apply_formatting_options("hello".to_string(), &options);
+    assert_eq!(result, "hello\n");
+
+    // Content with final newline should stay the same
+    let result = RumdlLanguageServer::apply_formatting_options("hello\n".to_string(), &options);
+    assert_eq!(result, "hello\n");
+}
+
+#[test]
+fn test_apply_formatting_options_trim_final_newlines() {
+    let options = FormattingOptions {
+        tab_size: 4,
+        insert_spaces: true,
+        properties: HashMap::new(),
+        trim_trailing_whitespace: None,
+        insert_final_newline: None,
+        trim_final_newlines: Some(true),
+    };
+
+    // Multiple trailing newlines should be removed
+    let result = RumdlLanguageServer::apply_formatting_options("hello\n\n\n".to_string(), &options);
+    assert_eq!(result, "hello");
+
+    // Single trailing newline should also be removed (trim_final_newlines removes ALL)
+    let result = RumdlLanguageServer::apply_formatting_options("hello\n".to_string(), &options);
+    assert_eq!(result, "hello");
+}
+
+#[test]
+fn test_apply_formatting_options_trim_and_insert_combined() {
+    // This is the common case: trim extra newlines, then ensure exactly one
+    let options = FormattingOptions {
+        tab_size: 4,
+        insert_spaces: true,
+        properties: HashMap::new(),
+        trim_trailing_whitespace: None,
+        insert_final_newline: Some(true),
+        trim_final_newlines: Some(true),
+    };
+
+    // Multiple trailing newlines -> exactly one
+    let result = RumdlLanguageServer::apply_formatting_options("hello\n\n\n".to_string(), &options);
+    assert_eq!(result, "hello\n");
+
+    // No trailing newline -> add one
+    let result = RumdlLanguageServer::apply_formatting_options("hello".to_string(), &options);
+    assert_eq!(result, "hello\n");
+
+    // Already has exactly one -> unchanged
+    let result = RumdlLanguageServer::apply_formatting_options("hello\n".to_string(), &options);
+    assert_eq!(result, "hello\n");
+}
+
+#[test]
+fn test_apply_formatting_options_trim_trailing_whitespace() {
+    let options = FormattingOptions {
+        tab_size: 4,
+        insert_spaces: true,
+        properties: HashMap::new(),
+        trim_trailing_whitespace: Some(true),
+        insert_final_newline: Some(true),
+        trim_final_newlines: None,
+    };
+
+    // Trailing whitespace on lines should be removed
+    let result = RumdlLanguageServer::apply_formatting_options("hello  \nworld\t\n".to_string(), &options);
+    assert_eq!(result, "hello\nworld\n");
+}
+
+#[test]
+fn test_apply_formatting_options_issue_265_scenario() {
+    // Issue #265: MD012 at end of file doesn't work with LSP formatting
+    // The editor (nvim) may strip trailing newlines from buffer before sending to LSP
+    // With proper FormattingOptions handling, we should still get the right result
+
+    let options = FormattingOptions {
+        tab_size: 4,
+        insert_spaces: true,
+        properties: HashMap::new(),
+        trim_trailing_whitespace: None,
+        insert_final_newline: Some(true),
+        trim_final_newlines: Some(true),
+    };
+
+    // Scenario 1: Editor sends content with multiple trailing newlines
+    let result = RumdlLanguageServer::apply_formatting_options("hello foobar hello.\n\n\n".to_string(), &options);
+    assert_eq!(
+        result, "hello foobar hello.\n",
+        "Should have exactly one trailing newline"
+    );
+
+    // Scenario 2: Editor sends content with trailing newlines stripped
+    let result = RumdlLanguageServer::apply_formatting_options("hello foobar hello.".to_string(), &options);
+    assert_eq!(result, "hello foobar hello.\n", "Should add final newline");
+
+    // Scenario 3: Content is already correct
+    let result = RumdlLanguageServer::apply_formatting_options("hello foobar hello.\n".to_string(), &options);
+    assert_eq!(result, "hello foobar hello.\n", "Should remain unchanged");
+}
+
+#[test]
+fn test_apply_formatting_options_no_options() {
+    // When all options are None/false, content should be unchanged
+    let options = FormattingOptions {
+        tab_size: 4,
+        insert_spaces: true,
+        properties: HashMap::new(),
+        trim_trailing_whitespace: None,
+        insert_final_newline: None,
+        trim_final_newlines: None,
+    };
+
+    let content = "hello  \nworld\n\n\n";
+    let result = RumdlLanguageServer::apply_formatting_options(content.to_string(), &options);
+    assert_eq!(result, content, "Content should be unchanged when no options set");
+}
+
+#[test]
+fn test_apply_formatting_options_empty_content() {
+    let options = FormattingOptions {
+        tab_size: 4,
+        insert_spaces: true,
+        properties: HashMap::new(),
+        trim_trailing_whitespace: Some(true),
+        insert_final_newline: Some(true),
+        trim_final_newlines: Some(true),
+    };
+
+    // Empty content should stay empty (no newline added to truly empty documents)
+    let result = RumdlLanguageServer::apply_formatting_options("".to_string(), &options);
+    assert_eq!(result, "");
+
+    // Just newlines should become single newline (content existed, so gets final newline)
+    let result = RumdlLanguageServer::apply_formatting_options("\n\n\n".to_string(), &options);
+    assert_eq!(result, "\n");
+}
+
+#[test]
+fn test_apply_formatting_options_multiline_content() {
+    let options = FormattingOptions {
+        tab_size: 4,
+        insert_spaces: true,
+        properties: HashMap::new(),
+        trim_trailing_whitespace: Some(true),
+        insert_final_newline: Some(true),
+        trim_final_newlines: Some(true),
+    };
+
+    let content = "# Heading  \n\nParagraph  \n- List item  \n\n\n";
+    let result = RumdlLanguageServer::apply_formatting_options(content.to_string(), &options);
+    assert_eq!(result, "# Heading\n\nParagraph\n- List item\n");
+}
+
+/// The formatting options are line-oriented and must leave a CRLF document
+/// CRLF. Each option used to be written for LF alone: trimming trailing
+/// whitespace rebuilt the document with `join("\n")`, trimming final newlines
+/// popped only `\n` (stranding the `\r` of the last `\r\n`), and inserting a
+/// final newline pushed a bare `\n`.
+#[test]
+fn test_apply_formatting_options_keep_crlf_line_endings() {
+    let all = editor_formatting_options();
+    let content = "# Heading  \r\n\r\nParagraph  \r\n- List item  \r\n\r\n\r\n";
+    let result = RumdlLanguageServer::apply_formatting_options(content.to_string(), &all);
+    assert_eq!(result, "# Heading\r\n\r\nParagraph\r\n- List item\r\n");
+
+    let insert_only = FormattingOptions {
+        tab_size: 4,
+        insert_spaces: true,
+        properties: HashMap::new(),
+        trim_trailing_whitespace: Some(false),
+        insert_final_newline: Some(true),
+        trim_final_newlines: Some(false),
+    };
+    let result = RumdlLanguageServer::apply_formatting_options("hello\r\nworld".to_string(), &insert_only);
+    assert_eq!(result, "hello\r\nworld\r\n");
+
+    let trim_final_only = FormattingOptions {
+        tab_size: 4,
+        insert_spaces: true,
+        properties: HashMap::new(),
+        trim_trailing_whitespace: Some(false),
+        insert_final_newline: Some(false),
+        trim_final_newlines: Some(true),
+    };
+    let result = RumdlLanguageServer::apply_formatting_options("hello\r\n\r\n\r\n".to_string(), &trim_final_only);
+    assert_eq!(result, "hello");
+
+    // A document the options leave alone comes back byte-identical.
+    let result = RumdlLanguageServer::apply_formatting_options("hello\r\nworld\r\n".to_string(), &all);
+    assert_eq!(result, "hello\r\nworld\r\n");
+}
+
+#[test]
+fn test_code_action_kind_filtering() {
+    // Test the hierarchical code action kind matching used in code_action handler
+    // LSP spec: source.fixAll.rumdl should match requests for source.fixAll
+
+    let matches = |action_kind: &str, requested: &str| -> bool { action_kind.starts_with(requested) };
+
+    // source.fixAll.rumdl matches source.fixAll (parent kind)
+    assert!(matches("source.fixAll.rumdl", "source.fixAll"));
+
+    // source.fixAll.rumdl matches source.fixAll.rumdl (exact match)
+    assert!(matches("source.fixAll.rumdl", "source.fixAll.rumdl"));
+
+    // source.fixAll.rumdl matches source (grandparent kind)
+    assert!(matches("source.fixAll.rumdl", "source"));
+
+    // quickfix matches quickfix (exact match)
+    assert!(matches("quickfix", "quickfix"));
+
+    // source.fixAll.rumdl does NOT match quickfix
+    assert!(!matches("source.fixAll.rumdl", "quickfix"));
+
+    // quickfix does NOT match source.fixAll
+    assert!(!matches("quickfix", "source.fixAll"));
+
+    // source.fixAll does NOT match source.fixAll.rumdl (child is more specific)
+    assert!(!matches("source.fixAll", "source.fixAll.rumdl"));
+}
+
+#[test]
+fn test_code_action_kind_filter_with_empty_array() {
+    // LSP spec: "If provided with no kinds, all supported kinds are returned"
+    // An empty array should be treated the same as None (return all actions)
+
+    let filter_actions = |kinds: Option<Vec<&str>>| -> bool {
+        // Simulates our filtering logic
+        if let Some(ref k) = kinds
+            && !k.is_empty()
+        {
+            // Would filter
+            false
+        } else {
+            // Return all
+            true
+        }
+    };
+
+    // None returns all actions
+    assert!(filter_actions(None));
+
+    // Empty array returns all actions (per LSP spec)
+    assert!(filter_actions(Some(vec![])));
+
+    // Non-empty array triggers filtering
+    assert!(!filter_actions(Some(vec!["source.fixAll"])));
+}
+
+#[test]
+fn test_code_action_kind_constants() {
+    // Verify our custom code action kind string matches LSP conventions
+    let fix_all_rumdl = CodeActionKind::new("source.fixAll.rumdl");
+    assert_eq!(fix_all_rumdl.as_str(), "source.fixAll.rumdl");
+
+    // Verify it's a sub-kind of SOURCE_FIX_ALL
+    assert!(
+        fix_all_rumdl
+            .as_str()
+            .starts_with(CodeActionKind::SOURCE_FIX_ALL.as_str())
+    );
+}
+
+// ==================== Completion Tests ====================
+
+#[test]
+fn test_detect_code_fence_language_position_basic() {
+    // Basic case: cursor right after ```
+    let text = "```\ncode\n```";
+    let pos = Position { line: 0, character: 3 };
+    let result = RumdlLanguageServer::detect_code_fence_language_position(text, pos);
+    assert!(result.is_some());
+    let (start_col, current_text) = result.unwrap();
+    assert_eq!(start_col, 3);
+    assert_eq!(current_text, "");
+}
+
+#[test]
+fn test_detect_code_fence_language_position_partial_lang() {
+    // Cursor in the middle of typing a language
+    let text = "```py\ncode\n```";
+    let pos = Position { line: 0, character: 5 };
+    let result = RumdlLanguageServer::detect_code_fence_language_position(text, pos);
+    assert!(result.is_some());
+    let (start_col, current_text) = result.unwrap();
+    assert_eq!(start_col, 3);
+    assert_eq!(current_text, "py");
+}
+
+#[test]
+fn test_detect_code_fence_language_position_full_lang() {
+    // Cursor at end of language tag
+    let text = "```python\ncode\n```";
+    let pos = Position { line: 0, character: 9 };
+    let result = RumdlLanguageServer::detect_code_fence_language_position(text, pos);
+    assert!(result.is_some());
+    let (start_col, current_text) = result.unwrap();
+    assert_eq!(start_col, 3);
+    assert_eq!(current_text, "python");
+}
+
+#[test]
+fn test_detect_code_fence_language_position_tilde_fence() {
+    // Using ~~~ instead of ```
+    let text = "~~~rust\ncode\n~~~";
+    let pos = Position { line: 0, character: 7 };
+    let result = RumdlLanguageServer::detect_code_fence_language_position(text, pos);
+    assert!(result.is_some());
+    let (start_col, current_text) = result.unwrap();
+    assert_eq!(start_col, 3);
+    assert_eq!(current_text, "rust");
+}
+
+#[test]
+fn test_detect_code_fence_language_position_indented() {
+    // Indented code fence
+    let text = "  ```js\ncode\n  ```";
+    let pos = Position { line: 0, character: 7 };
+    let result = RumdlLanguageServer::detect_code_fence_language_position(text, pos);
+    assert!(result.is_some());
+    let (start_col, current_text) = result.unwrap();
+    assert_eq!(start_col, 5); // 2 spaces + 3 backticks
+    assert_eq!(current_text, "js");
+}
+
+#[test]
+fn test_detect_code_fence_language_position_not_fence_line() {
+    // Not on a fence line (inside code block content)
+    let text = "```python\ncode\n```";
+    let pos = Position { line: 1, character: 2 };
+    let result = RumdlLanguageServer::detect_code_fence_language_position(text, pos);
+    assert!(result.is_none());
+}
+
+#[test]
+fn test_detect_code_fence_language_position_closing_fence() {
+    // On closing fence - should NOT trigger completion
+    let text = "```python\ncode\n```";
+    let pos = Position { line: 2, character: 3 };
+    let result = RumdlLanguageServer::detect_code_fence_language_position(text, pos);
+    // Closing fence should return None (no completion on closing fences)
+    assert!(result.is_none(), "Should not offer completion on closing fence");
+}
+
+#[test]
+fn test_detect_code_fence_language_position_extended_fence() {
+    // Extended fence with 4 backticks
+    let text = "````python\ncode\n````";
+    let pos = Position { line: 0, character: 10 };
+    let result = RumdlLanguageServer::detect_code_fence_language_position(text, pos);
+    assert!(result.is_some());
+    let (start_col, current_text) = result.unwrap();
+    assert_eq!(start_col, 4); // 4 backticks
+    assert_eq!(current_text, "python");
+}
+
+#[test]
+fn test_detect_code_fence_language_position_extended_fence_5_backticks() {
+    // Extended fence with 5 backticks
+    let text = "`````js\ncode\n`````";
+    let pos = Position { line: 0, character: 7 };
+    let result = RumdlLanguageServer::detect_code_fence_language_position(text, pos);
+    assert!(result.is_some());
+    let (start_col, current_text) = result.unwrap();
+    assert_eq!(start_col, 5);
+    assert_eq!(current_text, "js");
+}
+
+#[test]
+fn test_detect_code_fence_language_position_nested_code_blocks() {
+    // Nested code block (documenting markdown in markdown)
+    // Outer: 4 backticks, Inner: 3 backticks
+    let text = "````markdown\n```python\ncode\n```\n````";
+
+    // Opening fence of outer block
+    let pos = Position { line: 0, character: 12 };
+    let result = RumdlLanguageServer::detect_code_fence_language_position(text, pos);
+    assert!(result.is_some());
+    let (_, current_text) = result.unwrap();
+    assert_eq!(current_text, "markdown");
+
+    // Inner opening fence - should be treated as content (we're inside outer block)
+    // Note: This is actually content of the outer block, not a real code fence
+    // The detection is line-based and doesn't have full context, so it will detect it
+    // This is acceptable behavior - editors typically don't complete inside code blocks anyway
+}
+
+#[test]
+fn test_detect_code_fence_language_position_extended_closing_fence() {
+    // Extended closing fence should not trigger completion
+    let text = "````python\ncode here\n````";
+    let pos = Position { line: 2, character: 4 };
+    let result = RumdlLanguageServer::detect_code_fence_language_position(text, pos);
+    assert!(
+        result.is_none(),
+        "Should not offer completion on extended closing fence"
+    );
+}
+
+#[test]
+fn test_detect_code_fence_language_position_cursor_before_fence() {
+    // Cursor before the fence characters
+    let text = "```python\ncode\n```";
+    let pos = Position { line: 0, character: 2 };
+    let result = RumdlLanguageServer::detect_code_fence_language_position(text, pos);
+    assert!(result.is_none());
+}
+
+#[test]
+fn test_detect_code_fence_language_position_with_info_string() {
+    // Info string with space (should not complete after space)
+    let text = "```python filename.py\ncode\n```";
+    let pos = Position { line: 0, character: 15 };
+    let result = RumdlLanguageServer::detect_code_fence_language_position(text, pos);
+    // Should return None because cursor is after a space
+    assert!(result.is_none());
+}
+
+#[test]
+fn test_detect_code_fence_language_position_regular_text() {
+    // Regular markdown text (not a code fence)
+    let text = "# Heading\n\nSome text.";
+    let pos = Position { line: 0, character: 5 };
+    let result = RumdlLanguageServer::detect_code_fence_language_position(text, pos);
+    assert!(result.is_none());
+}
+
+#[test]
+fn test_detect_code_fence_language_position_non_ascii_language() {
+    // "é" is U+00E9: 2 UTF-8 bytes, 1 UTF-16 code unit.
+    // "```résumé" — fence ends at byte/UTF-16 col 3.
+    // "résumé" = r(1)+é(1)+s(1)+u(1)+m(1)+é(1) = 6 UTF-16 units, 8 UTF-8 bytes.
+    // UTF-16 cursor at 9 (3 + 6); byte offset is 11 (3 + 8).
+    // Old code: &line[3..9] slices into the middle of the second é → panic.
+    // Fixed code: converts UTF-16 9 → byte 11 first.
+    let text = "```résumé";
+    let pos = Position { line: 0, character: 9 }; // UTF-16 cursor at end of "résumé"
+    let result = RumdlLanguageServer::detect_code_fence_language_position(text, pos);
+    assert!(result.is_some(), "should detect fence language with non-ASCII text");
+    let (start_col, current_text) = result.unwrap();
+    assert_eq!(start_col, 3); // fence_end is always ASCII, so col == byte offset
+    assert_eq!(current_text, "résumé");
+}
+
+#[test]
+fn test_detect_code_fence_language_position_inline_code() {
+    // Inline code (not a fenced block)
+    let text = "Use `code` here.";
+    let pos = Position { line: 0, character: 5 };
+    let result = RumdlLanguageServer::detect_code_fence_language_position(text, pos);
+    assert!(result.is_none());
+}
+
+#[tokio::test]
+async fn test_completion_provides_language_items() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let test_file = temp_dir.path().join("test.md");
+    fs::write(&test_file, "```py\ncode\n```").unwrap();
+
+    let server = create_test_server();
+    let uri = Url::from_file_path(&test_file).unwrap();
+
+    // Open the document
+    let content = "```py\ncode\n```".to_string();
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: content.clone(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    // Get completions at position after ```
+    let items = server
+        .get_language_completions(&uri, "py", 3, Position { line: 0, character: 5 })
+        .await;
+
+    // Should have python-related items
+    assert!(!items.is_empty(), "Should return completion items");
+
+    // Check that python is in the results
+    let has_python = items.iter().any(|item| item.label.to_lowercase() == "python");
+    assert!(has_python, "Should include 'python' as a completion item");
+}
+
+#[tokio::test]
+async fn test_completion_filters_by_prefix() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let test_file = temp_dir.path().join("test.md");
+    std::fs::write(&test_file, "```ru\ncode\n```").unwrap();
+
+    let server = create_test_server();
+    let uri = Url::from_file_path(&test_file).unwrap();
+
+    // Get completions filtered by "ru"
+    let items = server
+        .get_language_completions(&uri, "ru", 3, Position { line: 0, character: 5 })
+        .await;
+
+    // All items should start with "ru"
+    for item in &items {
+        assert!(
+            item.label.to_lowercase().starts_with("ru"),
+            "Completion '{}' should start with 'ru'",
+            item.label
+        );
+    }
+
+    // Should include rust and ruby
+    let has_rust = items.iter().any(|item| item.label.to_lowercase() == "rust");
+    let has_ruby = items.iter().any(|item| item.label.to_lowercase() == "ruby");
+    assert!(has_rust, "Should include 'rust'");
+    assert!(has_ruby, "Should include 'ruby'");
+}
+
+#[tokio::test]
+async fn test_completion_empty_prefix_returns_all() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let test_file = temp_dir.path().join("test.md");
+    std::fs::write(&test_file, "```\ncode\n```").unwrap();
+
+    let server = create_test_server();
+    let uri = Url::from_file_path(&test_file).unwrap();
+
+    // Get completions with empty prefix
+    let items = server
+        .get_language_completions(&uri, "", 3, Position { line: 0, character: 3 })
+        .await;
+
+    // Should have many items (up to the limit of 100)
+    assert!(items.len() >= 10, "Should return multiple language options");
+    assert!(items.len() <= 100, "Should be limited to 100 items");
+}
+
+#[tokio::test]
+async fn test_completion_respects_md040_allowed_languages() {
+    use std::fs;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let test_file = temp_dir.path().join("test.md");
+    fs::write(&test_file, "```\ncode\n```").unwrap();
+
+    // Create config with allowed_languages
+    let config_file = temp_dir.path().join(".rumdl.toml");
+    fs::write(
+        &config_file,
+        r#"
+[MD040]
+allowed-languages = ["Python", "Rust", "Go"]
+"#,
+    )
+    .unwrap();
+
+    let server = create_test_server();
+
+    // Set workspace root so config is discovered
+    {
+        let mut roots = server.workspace_roots.write().await;
+        roots.push(temp_dir.path().to_path_buf());
+    }
+
+    let uri = Url::from_file_path(&test_file).unwrap();
+
+    // Get completions
+    let items = server
+        .get_language_completions(&uri, "", 3, Position { line: 0, character: 3 })
+        .await;
+
+    // Should only have items for Python, Rust, Go and their aliases
+    for item in &items {
+        let label_lower = item.label.to_lowercase();
+        let detail = item.detail.as_ref().map(|d| d.to_lowercase()).unwrap_or_default();
+
+        // Check that the canonical language (in detail) is one of the allowed ones
+        let is_allowed = detail.contains("python") || detail.contains("rust") || detail.contains("go");
+        assert!(
+            is_allowed,
+            "Completion '{label_lower}' (detail: '{detail}') should be for Python, Rust, or Go"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_completion_respects_md040_disallowed_languages() {
+    use std::fs;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let test_file = temp_dir.path().join("test.md");
+    fs::write(&test_file, "```py\ncode\n```").unwrap();
+
+    // Create config with disallowed_languages
+    let config_file = temp_dir.path().join(".rumdl.toml");
+    fs::write(
+        &config_file,
+        r#"
+[MD040]
+disallowed-languages = ["Python"]
+"#,
+    )
+    .unwrap();
+
+    let server = create_test_server();
+
+    // Set workspace root so config is discovered
+    {
+        let mut roots = server.workspace_roots.write().await;
+        roots.push(temp_dir.path().to_path_buf());
+    }
+
+    let uri = Url::from_file_path(&test_file).unwrap();
+
+    // Get completions filtered by "py"
+    let items = server
+        .get_language_completions(&uri, "py", 3, Position { line: 0, character: 5 })
+        .await;
+
+    // Should NOT include Python or py
+    for item in &items {
+        let detail = item.detail.as_ref().map(|d| d.to_lowercase()).unwrap_or_default();
+        assert!(
+            !detail.contains("python"),
+            "Completion '{}' should not include Python (disallowed)",
+            item.label
+        );
+    }
+}
+
+/// A server whose config discovery sees `config` in a temp workspace, plus the
+/// URI of a markdown file in it.
+async fn server_with_md040_config(config: &str) -> (RumdlLanguageServer, Url, tempfile::TempDir) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let test_file = temp_dir.path().join("test.md");
+    std::fs::write(&test_file, "```\ncode\n```").unwrap();
+    std::fs::write(temp_dir.path().join(".rumdl.toml"), config).unwrap();
+
+    let server = create_test_server();
+    server.workspace_roots.write().await.push(temp_dir.path().to_path_buf());
+    let uri = Url::from_file_path(&test_file).unwrap();
+    (server, uri, temp_dir)
+}
+
+#[tokio::test]
+async fn test_completion_offers_custom_languages() {
+    let (server, uri, _dir) = server_with_md040_config("[MD040]\ncustom-languages = [\"cddl\"]\n").await;
+    let items = server
+        .get_language_completions(&uri, "cd", 3, Position { line: 0, character: 5 })
+        .await;
+    let cddl = items
+        .iter()
+        .find(|item| item.label == "cddl")
+        .expect("a declared custom language must be offered");
+    assert_eq!(cddl.detail.as_deref(), Some("cddl (custom-languages)"));
+
+    // Control: the same label is not a language without the declaration.
+    let (plain, plain_uri, _plain_dir) = server_with_md040_config("[MD040]\n").await;
+    let items = plain
+        .get_language_completions(&plain_uri, "cd", 3, Position { line: 0, character: 5 })
+        .await;
+    assert!(
+        !items.iter().any(|item| item.label == "cddl"),
+        "an undeclared label must not be offered"
+    );
+}
+
+#[tokio::test]
+async fn test_completion_offers_custom_languages_with_an_empty_prefix() {
+    // The result list is capped, so a custom language must not be pushed past the cap
+    // by the hundreds of Linguist entries.
+    let (server, uri, _dir) = server_with_md040_config("[MD040]\ncustom-languages = [\"cddl\"]\n").await;
+    let items = server
+        .get_language_completions(&uri, "", 3, Position { line: 0, character: 3 })
+        .await;
+    assert!(
+        items.iter().any(|item| item.label == "cddl"),
+        "a custom language must survive the result cap"
+    );
+}
+
+#[tokio::test]
+async fn test_completion_applies_language_lists_to_custom_languages() {
+    let (allowed, allowed_uri, _allowed_dir) = server_with_md040_config(
+        "[MD040]\ncustom-languages = [\"cddl\", \"jsonnet\"]\nallowed-languages = [\"cddl\"]\n",
+    )
+    .await;
+    let items = allowed
+        .get_language_completions(&allowed_uri, "", 3, Position { line: 0, character: 3 })
+        .await;
+    assert!(items.iter().any(|item| item.label == "cddl"));
+    assert!(
+        !items.iter().any(|item| item.label == "jsonnet"),
+        "a custom language outside the allowlist must not be offered"
+    );
+
+    let (denied, denied_uri, _denied_dir) =
+        server_with_md040_config("[MD040]\ncustom-languages = [\"cddl\"]\ndisallowed-languages = [\"cddl\"]\n").await;
+    let items = denied
+        .get_language_completions(&denied_uri, "", 3, Position { line: 0, character: 3 })
+        .await;
+    assert!(
+        !items.iter().any(|item| item.label == "cddl"),
+        "a disallowed custom language must not be offered"
+    );
+}
+
+#[tokio::test]
+async fn test_completion_ignores_an_invalid_preferred_alias() {
+    // A preferred alias the language does not have is a configuration error, so
+    // completing to it would insert a label the linter rejects.
+    let (server, uri, _dir) =
+        server_with_md040_config("[MD040]\npreferred-aliases = { Shell = \"invalid_alias\" }\n").await;
+    let items = server
+        .get_language_completions(&uri, "invalid", 3, Position { line: 0, character: 10 })
+        .await;
+    assert!(
+        !items.iter().any(|item| item.label == "invalid_alias"),
+        "an invalid alias must not be offered"
+    );
+
+    // Control: a valid preference is offered as the label for its language.
+    let (valid, valid_uri, _valid_dir) =
+        server_with_md040_config("[MD040]\npreferred-aliases = { Shell = \"zsh\" }\n").await;
+    let items = valid
+        .get_language_completions(&valid_uri, "zsh", 3, Position { line: 0, character: 6 })
+        .await;
+    assert!(
+        items
+            .iter()
+            .any(|item| item.label == "zsh" && item.detail.as_deref() == Some("Shell (GitHub Linguist)")),
+        "a valid preference is offered"
+    );
+}
+
+#[test]
+fn test_is_closing_fence_basic() {
+    // Opening fence only - the next fence IS a closing fence
+    // (markdown spec: opening fence creates a code block that needs closing)
+    let lines = vec!["```python"];
+    assert!(
+        RumdlLanguageServer::is_closing_fence(&lines, '`', 3),
+        "After opening fence, next fence is closing"
+    );
+}
+
+#[test]
+fn test_is_closing_fence_with_content() {
+    // Opening fence with content - next fence would be closing
+    let lines = vec!["```python", "some code"];
+    assert!(
+        RumdlLanguageServer::is_closing_fence(&lines, '`', 3),
+        "After opening fence with content, next fence is closing"
+    );
+}
+
+#[test]
+fn test_is_closing_fence_no_prior_fence() {
+    // No prior fence - next fence is opening
+    let lines: Vec<&str> = vec!["# Hello", "Some text"];
+    assert!(
+        !RumdlLanguageServer::is_closing_fence(&lines, '`', 3),
+        "With no prior fence, next fence is opening"
+    );
+}
+
+#[test]
+fn test_is_closing_fence_already_closed() {
+    // Closed code block - next fence would be opening
+    let lines = vec!["```python", "some code", "```"];
+    assert!(
+        !RumdlLanguageServer::is_closing_fence(&lines, '`', 3),
+        "After closed code block, next fence is opening"
+    );
+}
+
+#[test]
+fn test_is_closing_fence_extended() {
+    // Extended fence - needs matching or longer fence to close
+    let lines = vec!["````python", "some code"];
+    // 3 backticks won't close 4-backtick fence
+    assert!(
+        !RumdlLanguageServer::is_closing_fence(&lines, '`', 3),
+        "3 backticks cannot close 4-backtick fence"
+    );
+    // 4 backticks will close
+    assert!(
+        RumdlLanguageServer::is_closing_fence(&lines, '`', 4),
+        "4 backticks can close 4-backtick fence"
+    );
+    // 5 backticks will also close (>= rule)
+    assert!(
+        RumdlLanguageServer::is_closing_fence(&lines, '`', 5),
+        "5 backticks can close 4-backtick fence"
+    );
+}
+
+#[test]
+fn test_is_closing_fence_mixed_chars() {
+    // Tilde fence cannot be closed by backtick fence
+    let lines = vec!["~~~python", "some code"];
+    assert!(
+        !RumdlLanguageServer::is_closing_fence(&lines, '`', 3),
+        "Backtick fence cannot close tilde fence"
+    );
+    assert!(
+        RumdlLanguageServer::is_closing_fence(&lines, '~', 3),
+        "Tilde fence can close tilde fence"
+    );
+}
+
+#[tokio::test]
+async fn test_completion_method_integration() {
+    use std::fs;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let test_file = temp_dir.path().join("test.md");
+    let content = "# Hello\n\n```py\nprint('hi')\n```";
+    fs::write(&test_file, content).unwrap();
+
+    let server = create_test_server();
+    let uri = Url::from_file_path(&test_file).unwrap();
+
+    // Open the document
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    // Call completion method directly
+    let params = CompletionParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            position: Position { line: 2, character: 5 }, // After ```py
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+        context: None,
+    };
+
+    let result = server.completion(params).await.unwrap();
+    assert!(result.is_some(), "Completion should return items");
+
+    if let Some(CompletionResponse::Array(items)) = result {
+        assert!(!items.is_empty(), "Should have completion items");
+        // Check python is in the results
+        let has_python = items.iter().any(|i| i.label.to_lowercase() == "python");
+        assert!(has_python, "Should include python as completion");
+    } else {
+        panic!("Expected CompletionResponse::Array");
+    }
+}
+
+#[tokio::test]
+async fn test_completion_not_triggered_on_closing_fence() {
+    use std::fs;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let test_file = temp_dir.path().join("test.md");
+    let content = "```python\nprint('hi')\n```";
+    fs::write(&test_file, content).unwrap();
+
+    let server = create_test_server();
+    let uri = Url::from_file_path(&test_file).unwrap();
+
+    // Open the document
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    // Call completion method on closing fence
+    let params = CompletionParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            position: Position { line: 2, character: 3 }, // On closing ```
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+        context: None,
+    };
+
+    let result = server.completion(params).await.unwrap();
+    assert!(result.is_none(), "Should NOT offer completion on closing fence");
+}
+
+#[tokio::test]
+async fn test_completion_graceful_when_document_not_found() {
+    let server = create_test_server();
+
+    // Use a URI for a document that doesn't exist and isn't opened
+    let uri = Url::parse("file:///nonexistent/path/test.md").unwrap();
+
+    let params = CompletionParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri },
+            position: Position { line: 0, character: 3 },
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+        context: None,
+    };
+
+    // Should return Ok(None), not an error
+    let result = server.completion(params).await;
+    assert!(result.is_ok(), "Completion should not error for missing document");
+    assert!(result.unwrap().is_none(), "Should return None for missing document");
+}
+
+// ==================== Link Target Completion Tests ====================
+
+#[test]
+fn test_detect_link_target_file_path_empty() {
+    // Cursor right after `](` — `](` is at columns 9-10, content starts at column 11
+    let text = "See [text](";
+    let pos = Position { line: 0, character: 11 };
+    let result = RumdlLanguageServer::detect_link_target_position(text, pos);
+    assert!(result.is_some());
+    let info = result.unwrap();
+    assert_eq!(info.file_path, "");
+    assert_eq!(info.path_start_col, 11); // UTF-16 column right after `(`
+    assert!(info.anchor.is_none());
+}
+
+#[test]
+fn test_detect_link_target_file_path_partial() {
+    // Cursor mid-way through a file path
+    // `](` is at columns 9-10; content_start = 11, so path_start_col = 11
+    let text = "See [text](docs/guide";
+    let pos = Position { line: 0, character: 21 };
+    let result = RumdlLanguageServer::detect_link_target_position(text, pos);
+    assert!(result.is_some());
+    let info = result.unwrap();
+    assert_eq!(info.file_path, "docs/guide");
+    assert_eq!(info.path_start_col, 11);
+    assert!(info.anchor.is_none());
+}
+
+#[test]
+fn test_detect_link_target_anchor_empty() {
+    // Cursor right after `#`
+    let text = "See [text](guide.md#";
+    let pos = Position { line: 0, character: 20 };
+    let result = RumdlLanguageServer::detect_link_target_position(text, pos);
+    assert!(result.is_some());
+    let info = result.unwrap();
+    assert_eq!(info.file_path, "guide.md");
+    assert!(info.anchor.is_some());
+    let (partial, start_col) = info.anchor.unwrap();
+    assert_eq!(partial, "");
+    assert_eq!(start_col, 20); // after `#`
+}
+
+#[test]
+fn test_detect_link_target_anchor_partial() {
+    // Cursor mid-way through an anchor
+    let text = "See [text](guide.md#install";
+    let pos = Position { line: 0, character: 27 };
+    let result = RumdlLanguageServer::detect_link_target_position(text, pos);
+    assert!(result.is_some());
+    let info = result.unwrap();
+    assert_eq!(info.file_path, "guide.md");
+    let (partial, start_col) = info.anchor.unwrap();
+    assert_eq!(partial, "install");
+    assert_eq!(start_col, 20);
+}
+
+#[test]
+fn test_detect_link_target_anchor_same_file() {
+    // Fragment-only link `[text](#anchor` — empty file path
+    let text = "[text](#sec";
+    let pos = Position { line: 0, character: 11 };
+    let result = RumdlLanguageServer::detect_link_target_position(text, pos);
+    assert!(result.is_some());
+    let info = result.unwrap();
+    assert_eq!(info.file_path, "");
+    let (partial, _start_col) = info.anchor.unwrap();
+    assert_eq!(partial, "sec");
+}
+
+#[test]
+fn test_detect_link_target_closed_paren_no_completion() {
+    // Cursor AFTER the closing `)` — before_cursor includes `)`, so content
+    // contains `)` and the function returns None.
+    // "See [text](guide.md)" is 21 chars; `)` is at byte 20.
+    // Cursor at 21 → before_cursor = whole string → content = "guide.md)" → None.
+    let text = "See [text](guide.md) more";
+    let pos = Position { line: 0, character: 21 };
+    let result = RumdlLanguageServer::detect_link_target_position(text, pos);
+    assert!(result.is_none(), "Should not complete after a closed link");
+}
+
+#[test]
+fn test_detect_link_target_no_link_syntax() {
+    // Regular text with no link
+    let text = "Just plain text here";
+    let pos = Position { line: 0, character: 10 };
+    let result = RumdlLanguageServer::detect_link_target_position(text, pos);
+    assert!(result.is_none());
+}
+
+#[test]
+fn test_detect_link_target_code_span_skipped() {
+    // `](` inside a code span — should not trigger completion
+    let text = "Use `[text](path` for links";
+    // cursor is after `path` (position 16), which is inside the code span
+    let pos = Position { line: 0, character: 16 };
+    let result = RumdlLanguageServer::detect_link_target_position(text, pos);
+    assert!(result.is_none(), "Should not complete inside a code span");
+}
+
+#[test]
+fn test_detect_link_target_image_link() {
+    // Image links `![alt](` should also trigger completion
+    let text = "![image](imgs/";
+    let pos = Position { line: 0, character: 14 };
+    let result = RumdlLanguageServer::detect_link_target_position(text, pos);
+    // `![image](` contains `](` so the backward scan will find it
+    assert!(result.is_some());
+    let info = result.unwrap();
+    assert_eq!(info.file_path, "imgs/");
+}
+
+#[test]
+fn test_detect_link_target_multiple_links_on_line() {
+    // Two links on the same line — should detect the second one being typed
+    let text = "[first](a.md) and [second](b.md";
+    let pos = Position { line: 0, character: 31 };
+    let result = RumdlLanguageServer::detect_link_target_position(text, pos);
+    assert!(result.is_some());
+    let info = result.unwrap();
+    assert_eq!(info.file_path, "b.md");
+}
+
+#[test]
+fn test_detect_link_target_non_ascii_link_text() {
+    // "é" is U+00E9: 2 UTF-8 bytes, 1 UTF-16 code unit.
+    // "[résumé](" is:  `[` + r(1) + é(1) + s(1) + u(1) + m(1) + é(1) + `]` + `(` = 9 UTF-16 code units
+    // So `](` spans columns 7-8, and content_start is column 9.
+    let text = "[résumé](";
+    let pos = Position { line: 0, character: 9 }; // right after `(`
+    let result = RumdlLanguageServer::detect_link_target_position(text, pos);
+    assert!(result.is_some(), "should detect link in non-ASCII context");
+    let info = result.unwrap();
+    assert_eq!(info.file_path, "");
+    // path_start_col must be the UTF-16 column after `(`, which is 9
+    assert_eq!(info.path_start_col, 9);
+    assert!(info.anchor.is_none());
+}
+
+#[test]
+fn test_detect_link_target_non_ascii_with_path() {
+    // "[café](docs/" — "café" = c(1)+a(1)+f(1)+é(1) = 4 UTF-16 code units
+    // "[café](" spans columns 0-6; content_start is column 7
+    // cursor at 12 (7 + len("docs/") = 7+5 = 12)
+    let text = "[café](docs/";
+    let pos = Position { line: 0, character: 12 };
+    let result = RumdlLanguageServer::detect_link_target_position(text, pos);
+    assert!(result.is_some());
+    let info = result.unwrap();
+    assert_eq!(info.file_path, "docs/");
+    assert_eq!(info.path_start_col, 7); // UTF-16 column after `(`
+}
+
+#[test]
+fn test_detect_link_target_out_of_bounds_position() {
+    let text = "short";
+    let pos = Position {
+        line: 0,
+        character: 100,
+    };
+    let result = RumdlLanguageServer::detect_link_target_position(text, pos);
+    assert!(result.is_none());
+}
+
+#[test]
+fn test_detect_link_target_out_of_bounds_line() {
+    let text = "single line";
+    let pos = Position { line: 5, character: 0 };
+    let result = RumdlLanguageServer::detect_link_target_position(text, pos);
+    assert!(result.is_none());
+}
+
+#[tokio::test]
+async fn test_get_file_completions_returns_workspace_files() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let root = temp_dir.path().resolve_like_server();
+    // Create a few markdown files
+    let current = root.join("current.md");
+    let other = root.join("other.md");
+    let sub_dir = root.join("docs");
+    fs::create_dir(&sub_dir).unwrap();
+    let sub_file = sub_dir.join("guide.md");
+
+    fs::write(&current, "# Current").unwrap();
+    fs::write(&other, "# Other").unwrap();
+    fs::write(&sub_file, "# Guide").unwrap();
+
+    let server = create_test_server();
+    let uri = Url::from_file_path(&current).unwrap();
+
+    // Populate the workspace index manually
+    {
+        use crate::workspace_index::{FileIndex, HeadingIndex, WorkspaceIndex};
+        let mut index = server.workspace_index.write().await;
+        *index = WorkspaceIndex::new();
+        let mut fi = FileIndex::default();
+        fi.headings.push(HeadingIndex {
+            text: "Current".to_string(),
+            auto_anchor: "current".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        index.insert_file(current.clone(), fi);
+
+        let mut fi2 = FileIndex::default();
+        fi2.headings.push(HeadingIndex {
+            text: "Other".to_string(),
+            auto_anchor: "other".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        index.insert_file(other.clone(), fi2);
+
+        let mut fi3 = FileIndex::default();
+        fi3.headings.push(HeadingIndex {
+            text: "Guide".to_string(),
+            auto_anchor: "guide".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        index.insert_file(sub_file.clone(), fi3);
+    }
+
+    // Get all file completions (empty prefix)
+    let items = server
+        .get_file_completions(&uri, "", 10, Position { line: 0, character: 10 })
+        .await
+        .items;
+
+    // Should have 2 completions (other.md and docs/guide.md), NOT current.md
+    assert_eq!(items.len(), 2, "Should return 2 files (excluding current)");
+
+    let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+    assert!(labels.contains(&"other.md"), "Should include other.md");
+    assert!(labels.contains(&"docs/guide.md"), "Should include docs/guide.md");
+    assert!(!labels.contains(&"current.md"), "Should exclude current.md");
+}
+
+#[tokio::test]
+async fn test_get_file_completions_filters_by_prefix() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let root = temp_dir.path().resolve_like_server();
+    let current = root.join("current.md");
+    let docs_dir = root.join("docs");
+    fs::create_dir(&docs_dir).unwrap();
+    let guide = docs_dir.join("guide.md");
+    let ref_doc = docs_dir.join("reference.md");
+
+    fs::write(&current, "").unwrap();
+    fs::write(&guide, "").unwrap();
+    fs::write(&ref_doc, "").unwrap();
+
+    let server = create_test_server();
+    let uri = Url::from_file_path(&current).unwrap();
+
+    {
+        use crate::workspace_index::{FileIndex, WorkspaceIndex};
+        let mut index = server.workspace_index.write().await;
+        *index = WorkspaceIndex::new();
+        index.insert_file(current.clone(), FileIndex::default());
+        index.insert_file(guide.clone(), FileIndex::default());
+        index.insert_file(ref_doc.clone(), FileIndex::default());
+    }
+
+    // Filter by "docs/g" prefix
+    let items = server
+        .get_file_completions(&uri, "docs/g", 10, Position { line: 0, character: 16 })
+        .await
+        .items;
+
+    assert_eq!(items.len(), 1, "Should return only docs/guide.md");
+    assert_eq!(items[0].label, "docs/guide.md");
+}
+
+#[tokio::test]
+async fn test_get_file_completions_ranks_nearer_files_first() {
+    use crate::workspace_index::{FileIndex, WorkspaceIndex};
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    // current file is deep in the tree; a sibling is distance 0, a file at the
+    // root is distance 2 (../../). The nearer file must come first.
+    let current = temp_dir.path().join("a/b/current.md");
+    let sibling = temp_dir.path().join("a/b/sibling.md");
+    let faraway = temp_dir.path().join("faraway.md");
+
+    let server = create_test_server();
+    let uri = Url::from_file_path(&current).unwrap();
+
+    {
+        let mut index = server.workspace_index.write().await;
+        *index = WorkspaceIndex::new();
+        index.insert_file(current.clone(), FileIndex::default());
+        index.insert_file(sibling.clone(), FileIndex::default());
+        index.insert_file(faraway.clone(), FileIndex::default());
+    }
+
+    let items = server
+        .get_file_completions(&uri, "", 10, Position { line: 0, character: 10 })
+        .await
+        .items;
+
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].label, "sibling.md", "nearest file ranks first");
+    assert_eq!(items[1].label, "../../faraway.md", "distant file ranks last");
+
+    // Sort keys must also encode the distance so the editor preserves the order.
+    let sibling_sort = items[0].sort_text.as_deref().unwrap();
+    let faraway_sort = items[1].sort_text.as_deref().unwrap();
+    assert!(
+        sibling_sort < faraway_sort,
+        "nearer file must sort before farther file ({sibling_sort:?} vs {faraway_sort:?})"
+    );
+    assert!(
+        sibling_sort.starts_with("0000"),
+        "distance-0 file sort key: {sibling_sort:?}"
+    );
+    assert!(
+        faraway_sort.starts_with("0002"),
+        "distance-2 file sort key: {faraway_sort:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_get_file_completions_marks_incomplete_when_capped() {
+    use crate::workspace_index::{FileIndex, WorkspaceIndex};
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let current = temp_dir.path().join("current.md");
+
+    let server = create_test_server();
+    let uri = Url::from_file_path(&current).unwrap();
+
+    {
+        let mut index = server.workspace_index.write().await;
+        *index = WorkspaceIndex::new();
+        index.insert_file(current.clone(), FileIndex::default());
+        // 60 candidate files exceeds the 50-item cap.
+        for i in 0..60 {
+            index.insert_file(temp_dir.path().join(format!("file{i:03}.md")), FileIndex::default());
+        }
+    }
+
+    let list = server
+        .get_file_completions(&uri, "", 10, Position { line: 0, character: 10 })
+        .await;
+
+    assert_eq!(list.items.len(), 50, "result set is capped at 50");
+    assert!(
+        list.is_incomplete,
+        "capped result must be marked incomplete so the editor re-queries as the prefix narrows"
+    );
+}
+
+#[tokio::test]
+async fn test_get_file_completions_complete_when_not_capped() {
+    use crate::workspace_index::{FileIndex, WorkspaceIndex};
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let root = temp_dir.path().resolve_like_server();
+    let current = root.join("current.md");
+
+    let server = create_test_server();
+    let uri = Url::from_file_path(&current).unwrap();
+
+    {
+        let mut index = server.workspace_index.write().await;
+        *index = WorkspaceIndex::new();
+        index.insert_file(current.clone(), FileIndex::default());
+        index.insert_file(root.join("other.md"), FileIndex::default());
+    }
+
+    let list = server
+        .get_file_completions(&uri, "", 10, Position { line: 0, character: 10 })
+        .await;
+
+    assert_eq!(list.items.len(), 1);
+    assert!(!list.is_incomplete, "small result set is complete");
+}
+
+#[tokio::test]
+async fn test_get_file_completions_absolute_lists_content_root() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let img_dir = temp_dir.path().join("img");
+    fs::create_dir(&img_dir).unwrap();
+    fs::write(img_dir.join("01.webp"), "").unwrap();
+    fs::write(img_dir.join("02.png"), "").unwrap();
+    fs::create_dir(img_dir.join("icons")).unwrap();
+    let current = temp_dir.path().join("doc.md");
+    fs::write(&current, "").unwrap();
+
+    let server = create_test_server();
+    // No explicit content roots: the workspace root is used.
+    *server.workspace_roots.write().await = vec![temp_dir.path().to_path_buf()];
+    let uri = Url::from_file_path(&current).unwrap();
+
+    // `/img/` lists immediate children of the content root's img directory,
+    // including non-markdown files and subdirectories.
+    let list = server
+        .get_file_completions(&uri, "/img/", 10, Position { line: 0, character: 15 })
+        .await;
+
+    assert!(
+        list.is_incomplete,
+        "absolute completion is always incomplete (drill-in)"
+    );
+    let labels: Vec<&str> = list.items.iter().map(|i| i.label.as_str()).collect();
+    assert!(labels.contains(&"01.webp"), "non-markdown asset offered: {labels:?}");
+    assert!(labels.contains(&"02.png"), "non-markdown asset offered: {labels:?}");
+    assert!(
+        labels.contains(&"icons/"),
+        "subdirectory offered with trailing slash: {labels:?}"
+    );
+
+    // The inserted text is the full absolute path from the leading slash.
+    let webp = list.items.iter().find(|i| i.label == "01.webp").unwrap();
+    let new_text = match webp.text_edit.as_ref().unwrap() {
+        tower_lsp::lsp_types::CompletionTextEdit::Edit(e) => &e.new_text,
+        tower_lsp::lsp_types::CompletionTextEdit::InsertAndReplace(_) => panic!("expected a plain text edit"),
+    };
+    assert_eq!(new_text, "/img/01.webp");
+    // filterText must be the full replacement text so clients that filter against
+    // the replaced range (`/img/01...`) keep the item visible.
+    assert_eq!(
+        webp.filter_text.as_deref(),
+        Some("/img/01.webp"),
+        "filterText should be the full path, not just the child name"
+    );
+}
+
+#[tokio::test]
+async fn test_get_file_completions_absolute_filters_by_prefix() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let img_dir = temp_dir.path().join("img");
+    fs::create_dir(&img_dir).unwrap();
+    fs::write(img_dir.join("01.webp"), "").unwrap();
+    fs::write(img_dir.join("readme.md"), "").unwrap();
+    let current = temp_dir.path().join("doc.md");
+    fs::write(&current, "").unwrap();
+
+    let server = create_test_server();
+    *server.workspace_roots.write().await = vec![temp_dir.path().to_path_buf()];
+    let uri = Url::from_file_path(&current).unwrap();
+
+    let list = server
+        .get_file_completions(&uri, "/img/0", 10, Position { line: 0, character: 16 })
+        .await;
+
+    let labels: Vec<&str> = list.items.iter().map(|i| i.label.as_str()).collect();
+    assert_eq!(
+        labels,
+        vec!["01.webp"],
+        "only entries matching the prefix '0': {labels:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_get_file_completions_absolute_without_content_root_is_empty() {
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let current = temp_dir.path().join("doc.md");
+
+    let server = create_test_server();
+    // No workspace roots and no configured content roots.
+    let uri = Url::from_file_path(&current).unwrap();
+
+    let list = server
+        .get_file_completions(&uri, "/img/", 10, Position { line: 0, character: 15 })
+        .await;
+
+    assert!(list.items.is_empty(), "no content root means no absolute completions");
+}
+
+#[tokio::test]
+async fn test_get_file_completions_absolute_rejects_parent_traversal() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    // A secret directory that sits next to the content root but outside it.
+    let temp_dir = tempdir().unwrap();
+    let root = temp_dir.path().join("site");
+    fs::create_dir(&root).unwrap();
+    let secret = temp_dir.path().join("secret");
+    fs::create_dir(&secret).unwrap();
+    fs::write(secret.join("private.txt"), "").unwrap();
+    let current = root.join("doc.md");
+    fs::write(&current, "").unwrap();
+
+    let server = create_test_server();
+    *server.workspace_roots.write().await = vec![root.clone()];
+    let uri = Url::from_file_path(&current).unwrap();
+
+    // `..` would escape the content root; completion must refuse rather than
+    // list files from the parent directory.
+    let list = server
+        .get_file_completions(&uri, "/../secret/", 10, Position { line: 0, character: 20 })
+        .await;
+
+    assert!(
+        list.items.is_empty(),
+        "parent traversal must not surface files outside the content root: {:?}",
+        list.items.iter().map(|i| &i.label).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn test_get_anchor_completions_returns_headings() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let root = temp_dir.path().resolve_like_server();
+    let current = root.join("index.md");
+    let target = root.join("guide.md");
+
+    fs::write(&current, "").unwrap();
+    fs::write(&target, "# Installation\n\n## Configuration\n\n## Troubleshooting").unwrap();
+
+    let server = create_test_server();
+    let uri = Url::from_file_path(&current).unwrap();
+
+    {
+        use crate::workspace_index::{FileIndex, HeadingIndex, WorkspaceIndex};
+        let mut index = server.workspace_index.write().await;
+        *index = WorkspaceIndex::new();
+        index.insert_file(current.clone(), FileIndex::default());
+
+        let mut fi = FileIndex::default();
+        fi.headings = vec![
+            HeadingIndex {
+                text: "Installation".to_string(),
+                auto_anchor: "installation".to_string(),
+                custom_anchor: None,
+                line: 1,
+                is_setext: false,
+            },
+            HeadingIndex {
+                text: "Configuration".to_string(),
+                auto_anchor: "configuration".to_string(),
+                custom_anchor: None,
+                line: 3,
+                is_setext: false,
+            },
+            HeadingIndex {
+                text: "Troubleshooting".to_string(),
+                auto_anchor: "troubleshooting".to_string(),
+                custom_anchor: None,
+                line: 5,
+                is_setext: false,
+            },
+        ];
+        index.insert_file(target.clone(), fi);
+    }
+
+    // Completions for all anchors in guide.md (empty prefix)
+    let items = server
+        .get_anchor_completions(&uri, "guide.md", "", 27, Position { line: 0, character: 27 })
+        .await;
+
+    assert_eq!(items.len(), 3, "Should return all 3 headings");
+
+    // Items should be in document order (sorted by line number)
+    assert_eq!(items[0].insert_text.as_deref(), Some("installation"));
+    assert_eq!(items[1].insert_text.as_deref(), Some("configuration"));
+    assert_eq!(items[2].insert_text.as_deref(), Some("troubleshooting"));
+}
+
+#[tokio::test]
+async fn test_get_anchor_completions_resolves_absolute_path_against_content_root() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let current = temp_dir.path().join("index.md");
+    let target = temp_dir.path().join("guide.md");
+
+    fs::write(&current, "").unwrap();
+    fs::write(&target, "# Installation").unwrap();
+
+    let server = create_test_server();
+    // The content root is the workspace root, so `/guide.md` maps to it.
+    *server.workspace_roots.write().await = vec![temp_dir.path().to_path_buf()];
+    let uri = Url::from_file_path(&current).unwrap();
+
+    {
+        use crate::workspace_index::{FileIndex, HeadingIndex, WorkspaceIndex};
+        let mut index = server.workspace_index.write().await;
+        *index = WorkspaceIndex::new();
+        index.insert_file(current.clone(), FileIndex::default());
+
+        let mut fi = FileIndex::default();
+        fi.headings = vec![HeadingIndex {
+            text: "Installation".to_string(),
+            auto_anchor: "installation".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        }];
+        index.insert_file(target.clone(), fi);
+    }
+
+    // An absolute-style link `](/guide.md#` must resolve against the content
+    // root, not the OS filesystem root.
+    let items = server
+        .get_anchor_completions(&uri, "/guide.md", "", 27, Position { line: 0, character: 27 })
+        .await;
+
+    assert_eq!(
+        items.iter().map(|i| i.insert_text.as_deref()).collect::<Vec<_>>(),
+        vec![Some("installation")],
+        "absolute anchor target should resolve under the content root"
+    );
+}
+
+#[tokio::test]
+async fn test_get_anchor_completions_absolute_falls_back_to_disk_outside_workspace() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    // The content root lives outside the indexed workspace, so its files are
+    // never added to the workspace index. Anchor completion must still work by
+    // reading the target from disk, matching the file-path completion behavior.
+    let temp_dir = tempdir().unwrap();
+    let workspace = temp_dir.path().join("workspace");
+    let content_root = temp_dir.path().join("site");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&content_root).unwrap();
+
+    let current = workspace.join("index.md");
+    let target = content_root.join("guide.md");
+    fs::write(&current, "").unwrap();
+    fs::write(&target, "# Installation\n\n## Configuration\n").unwrap();
+
+    let server = create_test_server();
+    *server.workspace_roots.write().await = vec![workspace.clone()];
+    server.config.write().await.link_completion_content_roots = vec![content_root.to_string_lossy().into_owned()];
+    let uri = Url::from_file_path(&current).unwrap();
+
+    // Only the current file is indexed; the content root is not.
+    {
+        use crate::workspace_index::{FileIndex, WorkspaceIndex};
+        let mut index = server.workspace_index.write().await;
+        *index = WorkspaceIndex::new();
+        index.insert_file(current.clone(), FileIndex::default());
+    }
+
+    let items = server
+        .get_anchor_completions(&uri, "/guide.md", "", 27, Position { line: 0, character: 27 })
+        .await;
+
+    assert_eq!(
+        items.iter().map(|i| i.insert_text.as_deref()).collect::<Vec<_>>(),
+        vec![Some("installation"), Some("configuration")],
+        "absolute anchor target outside the workspace should resolve via on-disk fallback"
+    );
+}
+
+/// A target parsed from disk generates its anchors from its own configuration.
+///
+/// The workspace index already interprets each document in its own scope, so a
+/// fallback reading the root config would offer an anchor that navigation into
+/// the same file then fails to find. The two anchor styles differ only in how
+/// they treat the punctuation, which is what makes the offered value decide
+/// which config spoke.
+#[tokio::test]
+async fn test_get_anchor_completions_disk_fallback_uses_the_target_scope() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp = tempdir().unwrap();
+    let base = temp.path().resolve_like_server();
+    let workspace = base.join("workspace");
+    let content_root = base.join("site");
+    let user_config_dir = base.join("userconfig");
+    let home_dir = base.join("fakehome");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&content_root).unwrap();
+    fs::create_dir_all(&user_config_dir).unwrap();
+    fs::create_dir_all(&home_dir).unwrap();
+
+    fs::write(
+        workspace.join(".rumdl.toml"),
+        "[global]\nflavor = \"standard\"\n\n[MD051]\nanchor-style = \"python-markdown\"\n",
+    )
+    .unwrap();
+    fs::write(
+        content_root.join(".rumdl.toml"),
+        "[global]\nflavor = \"standard\"\n\n[MD051]\nanchor-style = \"github\"\n",
+    )
+    .unwrap();
+
+    let current = workspace.join("index.md");
+    let target = content_root.join("guide.md");
+    fs::write(&current, "").unwrap();
+    fs::write(&target, "# Getting Started — Advanced\n").unwrap();
+
+    let server = create_test_server();
+    *server.workspace_roots.write().await = vec![workspace.clone()];
+    server
+        .load_configuration_impl(false, Some(&user_config_dir), Some(&home_dir))
+        .await;
+    server.config.write().await.link_completion_content_roots = vec![content_root.to_string_lossy().into_owned()];
+    let uri = Url::from_file_path(&current).unwrap();
+
+    // Only the current file is indexed, so the target is read from disk.
+    {
+        use crate::workspace_index::{FileIndex, WorkspaceIndex};
+        let mut index = server.workspace_index.write().await;
+        *index = WorkspaceIndex::new();
+        index.insert_file(current.clone(), FileIndex::default());
+    }
+
+    let items = server
+        .get_anchor_completions(&uri, "/guide.md", "", 27, Position { line: 0, character: 27 })
+        .await;
+
+    assert_eq!(
+        items.iter().map(|i| i.insert_text.as_deref()).collect::<Vec<_>>(),
+        vec![Some("getting-started--advanced")],
+        "the anchor style of the target's own config must decide what is offered"
+    );
+}
+
+#[tokio::test]
+async fn test_get_anchor_completions_absolute_rejects_parent_traversal() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let root = temp_dir.path().join("site");
+    fs::create_dir(&root).unwrap();
+    let current = root.join("index.md");
+    // A secret file outside the content root but inside the indexed workspace.
+    let secret = temp_dir.path().join("secret.md");
+    fs::write(&current, "").unwrap();
+    fs::write(&secret, "# Secret").unwrap();
+
+    let server = create_test_server();
+    *server.workspace_roots.write().await = vec![root.clone()];
+    let uri = Url::from_file_path(&current).unwrap();
+
+    {
+        use crate::workspace_index::{FileIndex, HeadingIndex, WorkspaceIndex};
+        let mut index = server.workspace_index.write().await;
+        *index = WorkspaceIndex::new();
+        index.insert_file(current.clone(), FileIndex::default());
+
+        let mut fi = FileIndex::default();
+        fi.headings = vec![HeadingIndex {
+            text: "Secret".to_string(),
+            auto_anchor: "secret".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        }];
+        index.insert_file(secret.clone(), fi);
+    }
+
+    // `/../secret.md#` would escape the content root; anchors must not leak.
+    let items = server
+        .get_anchor_completions(&uri, "/../secret.md", "", 27, Position { line: 0, character: 27 })
+        .await;
+
+    assert!(
+        items.is_empty(),
+        "parent traversal must not expose anchors outside the content root: {:?}",
+        items.iter().map(|i| &i.label).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn test_get_anchor_completions_filters_by_prefix() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let root = temp_dir.path().resolve_like_server();
+    let current = root.join("index.md");
+    let target = root.join("guide.md");
+
+    fs::write(&current, "").unwrap();
+    fs::write(&target, "").unwrap();
+
+    let server = create_test_server();
+    let uri = Url::from_file_path(&current).unwrap();
+
+    {
+        use crate::workspace_index::{FileIndex, HeadingIndex, WorkspaceIndex};
+        let mut index = server.workspace_index.write().await;
+        *index = WorkspaceIndex::new();
+        index.insert_file(current.clone(), FileIndex::default());
+
+        let mut fi = FileIndex::default();
+        fi.headings = vec![
+            HeadingIndex {
+                text: "Installation".to_string(),
+                auto_anchor: "installation".to_string(),
+                custom_anchor: None,
+                line: 1,
+                is_setext: false,
+            },
+            HeadingIndex {
+                text: "Introduction".to_string(),
+                auto_anchor: "introduction".to_string(),
+                custom_anchor: None,
+                line: 2,
+                is_setext: false,
+            },
+            HeadingIndex {
+                text: "Configuration".to_string(),
+                auto_anchor: "configuration".to_string(),
+                custom_anchor: None,
+                line: 3,
+                is_setext: false,
+            },
+        ];
+        index.insert_file(target.clone(), fi);
+    }
+
+    let items = server
+        .get_anchor_completions(&uri, "guide.md", "in", 27, Position { line: 0, character: 27 })
+        .await;
+
+    assert_eq!(items.len(), 2, "Should return installation and introduction");
+    let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+    assert!(labels.contains(&"Installation"));
+    assert!(labels.contains(&"Introduction"));
+}
+
+#[tokio::test]
+async fn test_get_anchor_completions_uses_custom_anchor() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let root = temp_dir.path().resolve_like_server();
+    let current = root.join("index.md");
+    let target = root.join("guide.md");
+
+    fs::write(&current, "").unwrap();
+    fs::write(&target, "").unwrap();
+
+    let server = create_test_server();
+    let uri = Url::from_file_path(&current).unwrap();
+
+    {
+        use crate::workspace_index::{FileIndex, HeadingIndex, WorkspaceIndex};
+        let mut index = server.workspace_index.write().await;
+        *index = WorkspaceIndex::new();
+        index.insert_file(current.clone(), FileIndex::default());
+
+        let mut fi = FileIndex::default();
+        fi.headings = vec![HeadingIndex {
+            text: "Getting Started".to_string(),
+            auto_anchor: "getting-started".to_string(),
+            custom_anchor: Some("start".to_string()),
+            line: 1,
+            is_setext: false,
+        }];
+        index.insert_file(target.clone(), fi);
+    }
+
+    let items = server
+        .get_anchor_completions(&uri, "guide.md", "", 10, Position { line: 0, character: 10 })
+        .await;
+
+    assert_eq!(items.len(), 1);
+    // Should use custom_anchor "start", not auto_anchor "getting-started"
+    assert_eq!(items[0].insert_text.as_deref(), Some("start"));
+    assert_eq!(items[0].label, "Getting Started");
+    assert_eq!(items[0].detail.as_deref(), Some("#start"));
+}
+
+#[tokio::test]
+async fn test_get_anchor_completions_empty_file_path_uses_current() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let root = temp_dir.path().resolve_like_server();
+    let current = root.join("page.md");
+    fs::write(&current, "# Section One\n\n# Section Two").unwrap();
+
+    let server = create_test_server();
+    let uri = Url::from_file_path(&current).unwrap();
+
+    {
+        use crate::workspace_index::{FileIndex, HeadingIndex, WorkspaceIndex};
+        let mut index = server.workspace_index.write().await;
+        *index = WorkspaceIndex::new();
+
+        let mut fi = FileIndex::default();
+        fi.headings = vec![
+            HeadingIndex {
+                text: "Section One".to_string(),
+                auto_anchor: "section-one".to_string(),
+                custom_anchor: None,
+                line: 1,
+                is_setext: false,
+            },
+            HeadingIndex {
+                text: "Section Two".to_string(),
+                auto_anchor: "section-two".to_string(),
+                custom_anchor: None,
+                line: 3,
+                is_setext: false,
+            },
+        ];
+        index.insert_file(current.clone(), fi);
+    }
+
+    // Empty file_path means "anchor in the current file"
+    let items = server
+        .get_anchor_completions(&uri, "", "", 8, Position { line: 0, character: 8 })
+        .await;
+
+    assert_eq!(items.len(), 2);
+    let insert_texts: Vec<&str> = items.iter().map(|i| i.insert_text.as_deref().unwrap_or("")).collect();
+    assert!(insert_texts.contains(&"section-one"));
+    assert!(insert_texts.contains(&"section-two"));
+}
+
+#[tokio::test]
+async fn test_get_anchor_completions_unknown_file_returns_empty() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let current = temp_dir.path().join("index.md");
+    std::fs::write(&current, "").unwrap();
+
+    let server = create_test_server();
+    let uri = Url::from_file_path(&current).unwrap();
+
+    // Don't populate the workspace index — file not found should return empty
+    let items = server
+        .get_anchor_completions(&uri, "nonexistent.md", "", 10, Position { line: 0, character: 10 })
+        .await;
+
+    assert!(items.is_empty(), "Unknown file should return no completions");
+}
+
+#[test]
+fn test_detect_link_target_relative_parent_path() {
+    // Cursor inside a `../` relative path
+    let text = "See [link](../other/file";
+    let pos = Position { line: 0, character: 24 };
+    let result = RumdlLanguageServer::detect_link_target_position(text, pos);
+    assert!(result.is_some());
+    let info = result.unwrap();
+    assert_eq!(info.file_path, "../other/file");
+    assert!(info.anchor.is_none());
+}
+
+#[test]
+fn test_detect_link_target_path_and_anchor() {
+    // Full path with anchor: `](../dir/file.md#section`
+    let text = "See [link](../dir/file.md#section";
+    let pos = Position { line: 0, character: 33 };
+    let result = RumdlLanguageServer::detect_link_target_position(text, pos);
+    assert!(result.is_some());
+    let info = result.unwrap();
+    assert_eq!(info.file_path, "../dir/file.md");
+    let (partial, _) = info.anchor.unwrap();
+    assert_eq!(partial, "section");
+}
+
+#[tokio::test]
+async fn test_link_completions_disabled_returns_none() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let test_file = temp_dir.path().join("test.md");
+    let content = "See [text](";
+    fs::write(&test_file, content).unwrap();
+
+    let server = create_test_server();
+
+    // Disable link completions
+    server.config.write().await.enable_link_completions = false;
+
+    let uri = Url::from_file_path(&test_file).unwrap();
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    let params = CompletionParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri },
+            position: Position { line: 0, character: 11 },
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+        context: None,
+    };
+
+    let result = server.completion(params).await.unwrap();
+    assert!(result.is_none(), "Link completions should be suppressed when disabled");
+}
+
+#[tokio::test]
+async fn test_code_fence_completion_works_when_link_completions_disabled() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    // Disabling link completions must NOT disable fenced code-block language
+    // completion - they share one completion capability but are independent.
+    let temp_dir = tempdir().unwrap();
+    let test_file = temp_dir.path().join("test.md");
+    let content = "# Hello\n\n```py\nprint('hi')\n```";
+    fs::write(&test_file, content).unwrap();
+
+    let server = create_test_server();
+    server.config.write().await.enable_link_completions = false;
+
+    let uri = Url::from_file_path(&test_file).unwrap();
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    let params = CompletionParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri },
+            position: Position { line: 2, character: 5 }, // After ```py
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+        context: None,
+    };
+
+    let result = server.completion(params).await.unwrap();
+    let Some(CompletionResponse::Array(items)) = result else {
+        panic!("code-fence completion should still return items when link completions are off");
+    };
+    assert!(
+        items.iter().any(|i| i.label.to_lowercase() == "python"),
+        "python language completion must still work with link completions disabled"
+    );
+}
+
+#[tokio::test]
+async fn test_link_navigation_disabled_hover_returns_none() {
+    let server = create_test_server();
+    server.config.write().await.enable_link_navigation = false;
+
+    let params = HoverParams {
+        text_document_position_params: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: Url::parse("file:///tmp/test.md").unwrap(),
+            },
+            position: Position { line: 0, character: 5 },
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+    };
+
+    let result = server.hover(params).await.unwrap();
+    assert!(
+        result.is_none(),
+        "Hover should be suppressed when link navigation is disabled"
+    );
+}
+
+#[tokio::test]
+async fn test_link_navigation_disabled_goto_definition_returns_none() {
+    let server = create_test_server();
+    server.config.write().await.enable_link_navigation = false;
+
+    let params = GotoDefinitionParams {
+        text_document_position_params: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: Url::parse("file:///tmp/test.md").unwrap(),
+            },
+            position: Position { line: 0, character: 5 },
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+    };
+
+    let result = server.goto_definition(params).await.unwrap();
+    assert!(
+        result.is_none(),
+        "Go-to-definition should be suppressed when link navigation is disabled"
+    );
+}
+
+#[tokio::test]
+async fn test_link_navigation_disabled_references_returns_none() {
+    let server = create_test_server();
+    server.config.write().await.enable_link_navigation = false;
+
+    let params = ReferenceParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: Url::parse("file:///tmp/test.md").unwrap(),
+            },
+            position: Position { line: 0, character: 5 },
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+        context: ReferenceContext {
+            include_declaration: false,
+        },
+    };
+
+    let result = server.references(params).await.unwrap();
+    assert!(
+        result.is_none(),
+        "References should be suppressed when link navigation is disabled"
+    );
+}
+
+#[tokio::test]
+async fn test_link_navigation_disabled_prepare_rename_returns_none() {
+    let server = create_test_server();
+    server.config.write().await.enable_link_navigation = false;
+
+    let params = TextDocumentPositionParams {
+        text_document: TextDocumentIdentifier {
+            uri: Url::parse("file:///tmp/test.md").unwrap(),
+        },
+        position: Position { line: 0, character: 5 },
+    };
+
+    let result = server.prepare_rename(params).await.unwrap();
+    assert!(
+        result.is_none(),
+        "Prepare-rename should be suppressed when link navigation is disabled"
+    );
+}
+
+#[tokio::test]
+async fn test_link_navigation_disabled_rename_returns_none() {
+    let server = create_test_server();
+    server.config.write().await.enable_link_navigation = false;
+
+    let params = RenameParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: Url::parse("file:///tmp/test.md").unwrap(),
+            },
+            position: Position { line: 0, character: 5 },
+        },
+        new_name: "new-heading".to_string(),
+        work_done_progress_params: WorkDoneProgressParams::default(),
+    };
+
+    let result = server.rename(params).await.unwrap();
+    assert!(
+        result.is_none(),
+        "Rename should be suppressed when link navigation is disabled"
+    );
+}
+
+#[tokio::test]
+async fn test_link_navigation_disabled_via_did_change_configuration() {
+    let server = create_test_server();
+
+    // Default state: navigation is enabled
+    assert!(server.config.read().await.enable_link_navigation);
+
+    // Simulate a live config update with only enableLinkNavigation: false
+    server
+        .did_change_configuration(DidChangeConfigurationParams {
+            settings: serde_json::json!({ "enableLinkNavigation": false }),
+        })
+        .await;
+
+    // Flag must be applied — this is what the did_change_configuration heuristic guards
+    assert!(
+        !server.config.read().await.enable_link_navigation,
+        "did_change_configuration must apply enableLinkNavigation: false"
+    );
+
+    // Confirm the handler respects the updated flag
+    let result = server
+        .hover(HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: Url::parse("file:///tmp/test.md").unwrap(),
+                },
+                position: Position { line: 0, character: 5 },
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        result.is_none(),
+        "Hover should be suppressed after live config disables link navigation"
+    );
+}
+
+#[tokio::test]
+async fn test_content_roots_applied_via_did_change_configuration() {
+    let server = create_test_server();
+
+    // Default state: no configured content roots.
+    assert!(server.config.read().await.link_completion_content_roots.is_empty());
+
+    // A settings payload that only sets linkCompletionContentRoots must still be
+    // recognized as a full config and applied (not dropped as an unknown key).
+    server
+        .did_change_configuration(DidChangeConfigurationParams {
+            settings: serde_json::json!({
+                "linkCompletionContentRoots": ["/site", "docs"]
+            }),
+        })
+        .await;
+
+    assert_eq!(
+        server.config.read().await.link_completion_content_roots,
+        vec!["/site".to_string(), "docs".to_string()],
+        "did_change_configuration must apply linkCompletionContentRoots on its own"
+    );
+
+    // Clearing the list back to [] must also apply, resetting to the
+    // workspace-root default rather than leaving the previous roots active.
+    server
+        .did_change_configuration(DidChangeConfigurationParams {
+            settings: serde_json::json!({ "linkCompletionContentRoots": [] }),
+        })
+        .await;
+
+    assert!(
+        server.config.read().await.link_completion_content_roots.is_empty(),
+        "did_change_configuration must apply an empty linkCompletionContentRoots"
+    );
+}
+
+#[test]
+fn test_link_navigation_config_serde_roundtrip() {
+    // Verify `enableLinkNavigation: false` round-trips correctly through serde
+    let json = r#"{"enableLinkNavigation": false}"#;
+    let config: RumdlLspConfig = serde_json::from_str(json).unwrap();
+    assert!(
+        !config.enable_link_navigation,
+        "enableLinkNavigation should deserialize to false"
+    );
+    // All other fields should use their defaults
+    assert!(config.enable_linting, "enableLinting should default to true");
+    assert!(
+        config.enable_link_completions,
+        "enableLinkCompletions should default to true"
+    );
+
+    // Verify serialization produces camelCase key
+    let serialized = serde_json::to_string(&config).unwrap();
+    assert!(serialized.contains("\"enableLinkNavigation\":false"));
+}
+
+/// Test that MD013 semantic-line-breaks config produces no false positives with CRLF line endings.
+/// The LSP receives content from the editor which may use CRLF line endings on Windows.
+/// The reflow comparison must account for line ending differences.
+/// Regression test for issue #459.
+#[tokio::test]
+async fn test_lsp_md013_semantic_line_breaks_crlf() {
+    use tempfile::tempdir;
+
+    let server = create_test_server();
+
+    // Create a temp directory with pyproject.toml
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let pyproject_path = temp_dir.path().join("pyproject.toml");
+    std::fs::write(
+        &pyproject_path,
+        r#"
+[tool.rumdl.MD013]
+line-length = 80
+reflow = true
+reflow-mode = "semantic-line-breaks"
+"#,
+    )
+    .expect("Failed to write pyproject.toml");
+
+    // Create a test markdown file with CRLF line endings
+    let test_md_path = temp_dir.path().join("test.md");
+    // This content is properly formatted for semantic line breaks
+    // but uses CRLF line endings (as sent by editors on Windows)
+    let content_crlf = "# Title\r\n\r\nLorem ipsum dolor sit amet, consectetur adipiscing elit.\r\nNullam vehicula commodo lobortis.\r\nDonec a venenatis lorem.\r\n";
+    std::fs::write(&test_md_path, content_crlf).expect("Failed to write test.md");
+
+    let canonical_test_path = test_md_path.resolve_like_server();
+
+    // Add workspace root
+    let canonical_temp = temp_dir.path().resolve_like_server();
+    server.workspace_roots.write().await.push(canonical_temp);
+
+    // Lint via LSP path with CRLF content
+    let uri = Url::from_file_path(&canonical_test_path).unwrap();
+    let diagnostics = server.lint_document(&uri, content_crlf, true).await.unwrap();
+
+    // Filter for MD013 diagnostics
+    let md013_diagnostics: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| {
+            d.code
+                .as_ref()
+                .is_some_and(|c| matches!(c, NumberOrString::String(s) if s == "MD013"))
+        })
+        .collect();
+
+    assert!(
+        md013_diagnostics.is_empty(),
+        "LSP should produce no MD013 warnings for properly formatted semantic-line-break content \
+         with CRLF line endings, but found {} warnings: {:?}",
+        md013_diagnostics.len(),
+        md013_diagnostics
+            .iter()
+            .map(|d| format!("line {}: {}", d.range.start.line, d.message))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Test that MD013 still emits warnings for improperly formatted CRLF content.
+/// The fix for issue #459 must not suppress legitimate warnings.
+#[tokio::test]
+async fn test_lsp_md013_semantic_line_breaks_crlf_still_warns_when_needed() {
+    use tempfile::tempdir;
+
+    let server = create_test_server();
+
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let pyproject_path = temp_dir.path().join("pyproject.toml");
+    std::fs::write(
+        &pyproject_path,
+        r#"
+[tool.rumdl.MD013]
+line-length = 80
+reflow = true
+reflow-mode = "semantic-line-breaks"
+"#,
+    )
+    .expect("Failed to write pyproject.toml");
+
+    let test_md_path = temp_dir.path().join("test.md");
+    // Content with multiple sentences on one line (needs reflow) using CRLF
+    let content_crlf =
+        "# Title\r\n\r\nLorem ipsum dolor sit amet. Consectetur adipiscing elit. Nullam vehicula commodo lobortis.\r\n";
+    std::fs::write(&test_md_path, content_crlf).expect("Failed to write test.md");
+
+    let canonical_test_path = test_md_path.resolve_like_server();
+    let canonical_temp = temp_dir.path().resolve_like_server();
+    server.workspace_roots.write().await.push(canonical_temp);
+
+    let uri = Url::from_file_path(&canonical_test_path).unwrap();
+    let diagnostics = server.lint_document(&uri, content_crlf, true).await.unwrap();
+
+    let md013_diagnostics: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| {
+            d.code
+                .as_ref()
+                .is_some_and(|c| matches!(c, NumberOrString::String(s) if s == "MD013"))
+        })
+        .collect();
+
+    assert!(
+        !md013_diagnostics.is_empty(),
+        "LSP should produce MD013 warnings for improperly formatted semantic-line-break CRLF content"
+    );
+}
+
+/// Test that MD013 semantic-line-breaks config from pyproject.toml is respected in LSP
+/// This verifies that the LSP and CLI produce the same results for the same config.
+/// Regression test for issue #459.
+#[tokio::test]
+async fn test_lsp_md013_semantic_line_breaks_config_parity() {
+    use tempfile::tempdir;
+
+    let server = create_test_server();
+
+    // Create a temp directory with pyproject.toml
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let pyproject_path = temp_dir.path().join("pyproject.toml");
+    std::fs::write(
+        &pyproject_path,
+        r#"
+[tool.rumdl.MD013]
+line-length = 80
+reflow = true
+reflow-mode = "semantic-line-breaks"
+"#,
+    )
+    .expect("Failed to write pyproject.toml");
+
+    // Create a test markdown file in the same directory
+    let test_md_path = temp_dir.path().join("test.md");
+    let content = "# Title\n\nLorem ipsum dolor sit amet, consectetur adipiscing elit.\nNullam vehicula commodo lobortis.\nDonec a venenatis lorem.\n";
+    std::fs::write(&test_md_path, content).expect("Failed to write test.md");
+
+    let uri = Url::from_file_path(&test_md_path).unwrap();
+
+    // Load the pyproject.toml the way resolve_config_for_file loads a config it
+    // discovered, so this exercises the production loader rather than a lookalike.
+    let sourced =
+        crate::config::SourcedConfig::load_discovered(&pyproject_path, None, None).expect("Should load config");
+    let file_config: crate::config::Config = sourced.into_validated_unchecked().into();
+
+    // Verify the config loaded correctly
+    let md013_rule_config = file_config.rules.get("MD013");
+    assert!(
+        md013_rule_config.is_some(),
+        "MD013 config should be present in loaded config"
+    );
+    let md013_values = &md013_rule_config.unwrap().values;
+    assert!(
+        md013_values.get("reflow-mode").is_some() || md013_values.get("reflow_mode").is_some(),
+        "reflow-mode should be in MD013 config values, got: {:?}",
+        md013_values.keys().collect::<Vec<_>>()
+    );
+
+    // Set the config on the server
+    *server.rumdl_config.write().await = file_config;
+
+    // Lint via LSP path
+    let diagnostics = server.lint_document(&uri, content, true).await.unwrap();
+
+    // Filter for MD013 diagnostics
+    let md013_diagnostics: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| {
+            d.code
+                .as_ref()
+                .is_some_and(|c| matches!(c, NumberOrString::String(s) if s == "MD013"))
+        })
+        .collect();
+
+    assert!(
+        md013_diagnostics.is_empty(),
+        "LSP should produce no MD013 warnings for properly formatted semantic-line-break content, \
+         but found {} warnings: {:?}",
+        md013_diagnostics.len(),
+        md013_diagnostics
+            .iter()
+            .map(|d| format!("line {}: {}", d.range.start.line, d.message))
+            .collect::<Vec<_>>()
+    );
+
+    // Also verify CLI path produces same result
+    let config_path_str2 = pyproject_path.to_str().unwrap();
+    let sourced2 = crate::config::SourcedConfig::load_with_discovery(Some(config_path_str2), None, false)
+        .expect("Should load config");
+    let cli_config: crate::config::Config = sourced2.into_validated_unchecked().into();
+    let all_rules = crate::rules::all_rules(&cli_config);
+    let filtered_rules = crate::rules::filter_rules(&all_rules, &cli_config.global);
+    let cli_warnings = crate::lint(
+        content,
+        &filtered_rules,
+        false,
+        crate::config::MarkdownFlavor::Standard,
+        None,
+        Some(&cli_config),
+    )
+    .expect("CLI lint should succeed");
+
+    let cli_md013: Vec<_> = cli_warnings
+        .iter()
+        .filter(|w| w.rule_name.as_deref() == Some("MD013"))
+        .collect();
+    assert!(cli_md013.is_empty(), "CLI should produce no MD013 warnings either");
+}
+
+/// Test that MD013 semantic-line-breaks config works through the full resolve_config_for_file path.
+/// This tests the actual file discovery path the LSP uses, which is different from directly setting config.
+/// Regression test for issue #459.
+#[tokio::test]
+async fn test_lsp_md013_resolve_config_for_file_path() {
+    use tempfile::tempdir;
+
+    let server = create_test_server();
+
+    // Create a temp directory with pyproject.toml
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let pyproject_path = temp_dir.path().join("pyproject.toml");
+    std::fs::write(
+        &pyproject_path,
+        r#"
+[tool.rumdl]
+
+[tool.rumdl.MD013]
+line-length = 80
+reflow = true
+reflow-mode = "semantic-line-breaks"
+"#,
+    )
+    .expect("Failed to write pyproject.toml");
+
+    // Create a test markdown file in the same directory
+    let test_md_path = temp_dir.path().join("test.md");
+    let content = "# Title\n\nLorem ipsum dolor sit amet, consectetur adipiscing elit.\nNullam vehicula commodo lobortis.\nDonec a venenatis lorem.\n";
+    std::fs::write(&test_md_path, content).expect("Failed to write test.md");
+
+    // Add the temp dir as a workspace root (otherwise resolve_config_for_file walks up forever)
+    let canonical_temp = temp_dir.path().resolve_like_server();
+    server.workspace_roots.write().await.push(canonical_temp.clone());
+
+    // Use the real resolve_config_for_file path
+    let canonical_test_path = test_md_path.resolve_like_server();
+    let resolved_config = server.resolve_config_for_file(&canonical_test_path).await;
+
+    // Verify the config loaded correctly
+    let md013_rule_config = resolved_config.rules.get("MD013");
+    assert!(
+        md013_rule_config.is_some(),
+        "MD013 config should be present after resolve_config_for_file. Rules: {:?}",
+        resolved_config.rules.keys().collect::<Vec<_>>()
+    );
+
+    let md013_values = &md013_rule_config.unwrap().values;
+    let has_reflow_mode = md013_values.get("reflow-mode").is_some() || md013_values.get("reflow_mode").is_some();
+    assert!(
+        has_reflow_mode,
+        "reflow-mode should be in MD013 config values after resolve_config_for_file, got: {:?}",
+        md013_values.keys().collect::<Vec<_>>()
+    );
+
+    let has_reflow = md013_values.get("reflow").is_some();
+    assert!(
+        has_reflow,
+        "reflow should be in MD013 config values after resolve_config_for_file, got: {:?}",
+        md013_values.keys().collect::<Vec<_>>()
+    );
+
+    // Now create rules from this config and check linting result
+    let all_rules = crate::rules::all_rules(&resolved_config);
+    let filtered_rules = crate::rules::filter_rules(&all_rules, &resolved_config.global);
+    let warnings = crate::lint(
+        content,
+        &filtered_rules,
+        false,
+        crate::config::MarkdownFlavor::Standard,
+        None,
+        Some(&resolved_config),
+    )
+    .expect("Lint should succeed");
+
+    let md013_warnings: Vec<_> = warnings
+        .iter()
+        .filter(|w| w.rule_name.as_deref() == Some("MD013"))
+        .collect();
+
+    assert!(
+        md013_warnings.is_empty(),
+        "Should produce no MD013 warnings for semantic-line-break content via resolve_config_for_file path, \
+         but found {} warnings: {:?}",
+        md013_warnings.len(),
+        md013_warnings
+            .iter()
+            .map(|w| format!("line {}: {} - {}", w.line, w.message, w.message))
+            .collect::<Vec<_>>()
+    );
+
+    // Also test the full lint_document path
+    let uri = Url::from_file_path(&canonical_test_path).unwrap();
+    let diagnostics = server.lint_document(&uri, content, true).await.unwrap();
+    let md013_diags: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| {
+            d.code
+                .as_ref()
+                .is_some_and(|c| matches!(c, NumberOrString::String(s) if s == "MD013"))
+        })
+        .collect();
+
+    assert!(
+        md013_diags.is_empty(),
+        "lint_document should produce no MD013 diagnostics for semantic-line-break content, \
+         but found {} diagnostics: {:?}",
+        md013_diags.len(),
+        md013_diags
+            .iter()
+            .map(|d| format!("line {}: {}", d.range.start.line, d.message))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Test that MD007 indent=4 config is respected through the full LSP formatting path.
+/// Verifies that [ul-indent] alias, indent=4, and style="fixed" all propagate correctly
+/// from config file through resolve_config_for_file to the formatted output.
+#[tokio::test]
+async fn test_lsp_md007_formatting_respects_indent_config() {
+    use tempfile::tempdir;
+
+    let server = create_test_server();
+
+    // Create a temp directory with .rumdl.toml using [ul-indent] alias
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join(".rumdl.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[ul-indent]
+indent = 4
+style = "fixed"
+"#,
+    )
+    .expect("Failed to write .rumdl.toml");
+
+    // Create test markdown with 2-space indentation (should be fixed to 4-space)
+    let test_md_path = temp_dir.path().join("test.md");
+    let content = "# Test\n\n- Bullet item\n  - Nested bullet\n";
+    std::fs::write(&test_md_path, content).expect("Failed to write test.md");
+
+    // Set up workspace root
+    let canonical_temp = temp_dir.path().resolve_like_server();
+    server.workspace_roots.write().await.push(canonical_temp.clone());
+
+    // Step 1: Verify config is loaded correctly
+    let canonical_test_path = test_md_path.resolve_like_server();
+    let resolved_config = server.resolve_config_for_file(&canonical_test_path).await;
+
+    let md007_config = resolved_config.rules.get("MD007");
+    assert!(
+        md007_config.is_some(),
+        "MD007 config should be present. Rules: {:?}",
+        resolved_config.rules.keys().collect::<Vec<_>>()
+    );
+
+    let md007_values = &md007_config.unwrap().values;
+    let indent_value = md007_values.get("indent").map(|v| v.as_integer().unwrap_or(0));
+    assert_eq!(indent_value, Some(4), "MD007 indent should be 4, got: {md007_values:?}");
+
+    // Step 2: Verify detection works (should find 2-space indent as violation)
+    let all_rules = crate::rules::all_rules(&resolved_config);
+    let filtered_rules = crate::rules::filter_rules(&all_rules, &resolved_config.global);
+    let warnings = crate::lint(
+        content,
+        &filtered_rules,
+        false,
+        crate::config::MarkdownFlavor::Standard,
+        None,
+        Some(&resolved_config),
+    )
+    .expect("Lint should succeed");
+
+    let md007_warnings: Vec<_> = warnings
+        .iter()
+        .filter(|w| w.rule_name.as_deref() == Some("MD007"))
+        .collect();
+    assert_eq!(
+        md007_warnings.len(),
+        1,
+        "Should find exactly 1 MD007 warning for 2-space indent, found: {:?}",
+        md007_warnings.iter().map(|w| &w.message).collect::<Vec<_>>()
+    );
+    assert!(
+        md007_warnings[0].message.contains("Expected 4 spaces"),
+        "Warning should mention 4 spaces, got: {}",
+        md007_warnings[0].message
+    );
+
+    // Step 3: Verify the fix produces 4-space indent (not 2-space!)
+    assert!(md007_warnings[0].fix.is_some(), "MD007 warning should have a fix");
+    let fix = md007_warnings[0].fix.as_ref().unwrap();
+    assert_eq!(
+        fix.replacement, "    ",
+        "Fix replacement should be 4 spaces, got: {:?}",
+        fix.replacement
+    );
+
+    // Step 4: Exercise the full LSP formatting path
+    let uri = Url::from_file_path(&canonical_test_path).unwrap();
+    let entry = DocumentEntry {
+        content: content.to_string(),
+        version: Some(1),
+        from_disk: false,
+    };
+    server.documents.write().await.insert(uri.clone(), entry);
+
+    let params = DocumentFormattingParams {
+        text_document: TextDocumentIdentifier { uri: uri.clone() },
+        options: FormattingOptions {
+            tab_size: 4,
+            insert_spaces: true,
+            properties: HashMap::new(),
+            trim_trailing_whitespace: Some(true),
+            insert_final_newline: Some(true),
+            trim_final_newlines: Some(true),
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+    };
+
+    let result = server.formatting(params).await.unwrap();
+    assert!(result.is_some(), "Formatting should return edits");
+
+    let edits = result.unwrap();
+    assert!(!edits.is_empty(), "Should have at least one edit");
+
+    let formatted_text = &edits[0].new_text;
+    assert!(
+        formatted_text.contains("    - Nested bullet"),
+        "Formatted text should have 4-space indent, got:\n{formatted_text}",
+    );
+    assert!(
+        !formatted_text.contains("\n  - Nested"),
+        "Formatted text should NOT have 2-space indent, got:\n{formatted_text}",
+    );
+}
+
+/// Test that the source.fixAll.rumdl code action path (used by Zed's code_actions_on_format)
+/// correctly applies MD007 indent=4 config. This is the other path editors can use
+/// besides textDocument/formatting.
+#[tokio::test]
+async fn test_lsp_md007_code_action_fix_all_respects_indent_config() {
+    use tempfile::tempdir;
+
+    let server = create_test_server();
+
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join(".rumdl.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[ul-indent]
+indent = 4
+style = "fixed"
+"#,
+    )
+    .expect("Failed to write .rumdl.toml");
+
+    // User's exact test data from issue #210
+    let content = "- Bullet item\n  - Nested bullet\n  1. Ordered child\n     - Bullet under ordered\n";
+
+    let test_md_path = temp_dir.path().join("test.md");
+    std::fs::write(&test_md_path, content).expect("Failed to write test.md");
+
+    let canonical_temp = temp_dir.path().resolve_like_server();
+    server.workspace_roots.write().await.push(canonical_temp.clone());
+
+    let canonical_test_path = test_md_path.resolve_like_server();
+    let uri = Url::from_file_path(&canonical_test_path).unwrap();
+    let entry = DocumentEntry {
+        content: content.to_string(),
+        version: Some(1),
+        from_disk: false,
+    };
+    server.documents.write().await.insert(uri.clone(), entry);
+
+    // Request code actions for the full document (simulates code_actions_on_format)
+    let range = Range {
+        start: Position { line: 0, character: 0 },
+        end: Position { line: 3, character: 26 },
+    };
+
+    let actions = server.get_code_actions(&uri, content, range).await.unwrap();
+
+    // Find the source.fixAll.rumdl action
+    let fix_all_actions: Vec<_> = actions
+        .iter()
+        .filter(|a| a.kind.as_ref().is_some_and(|k| k.as_str() == "source.fixAll.rumdl"))
+        .collect();
+
+    assert!(
+        !fix_all_actions.is_empty(),
+        "source.fixAll.rumdl action should be created"
+    );
+
+    // Extract the fixed content from the action's workspace edit
+    let fix_all = &fix_all_actions[0];
+    let edit = fix_all.edit.as_ref().expect("fixAll action should have an edit");
+    let changes = edit.changes.as_ref().expect("edit should have changes");
+    let text_edits = changes.get(&uri).expect("changes should include our file");
+    let fixed_text = &text_edits[0].new_text;
+
+    // Verify 4-space indent for nested bullet (depth 1)
+    assert!(
+        fixed_text.contains("\n    - Nested bullet"),
+        "source.fixAll should produce 4-space indent, got:\n{fixed_text}",
+    );
+    assert!(
+        !fixed_text.contains("\n  - Nested"),
+        "source.fixAll should NOT have 2-space indent, got:\n{fixed_text}",
+    );
+}
+
+// =============================================================================
+// Navigation tests: go-to-definition and find-references
+// =============================================================================
+
+#[tokio::test]
+async fn test_goto_definition_file_path_only() {
+    use crate::workspace_index::{FileIndex, HeadingIndex};
+
+    let server = create_test_server();
+
+    // Set up file paths
+    let docs_dir = test_temp_path("rumdl-nav-test/docs");
+    let current_file = docs_dir.join("index.md");
+    let target_file = docs_dir.join("guide.md");
+
+    let current_uri = Url::from_file_path(&current_file).unwrap();
+
+    // Content with a link to guide.md (cursor will be on the link target)
+    let content = "# Index\n\nSee [the guide](guide.md) for details.\n";
+    server.documents.write().await.insert(
+        current_uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    // Populate workspace index with target file
+    {
+        let mut index = server.workspace_index.write().await;
+        let mut fi = FileIndex::default();
+        fi.add_heading(HeadingIndex {
+            text: "Guide".to_string(),
+            auto_anchor: "guide".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        index.insert_file(target_file.clone(), fi);
+    }
+
+    // Position cursor on "guide.md" in `](guide.md)`
+    // Line 2 (0-indexed): "See [the guide](guide.md) for details."
+    // The `](` is at column 15, so "guide.md" starts at column 17
+    let position = Position { line: 2, character: 20 };
+
+    let result = server.handle_goto_definition(&current_uri, position).await;
+    assert!(result.is_some(), "Should return a definition location");
+
+    if let Some(GotoDefinitionResponse::Scalar(location)) = result {
+        assert_eq!(
+            location.uri,
+            Url::from_file_path(&target_file).unwrap(),
+            "Should point to guide.md"
+        );
+        // No anchor, so should target line 0
+        assert_eq!(location.range.start.line, 0, "Should target line 0 (top of file)");
+    } else {
+        panic!("Expected Scalar response");
+    }
+}
+
+#[tokio::test]
+async fn test_goto_definition_root_relative_anchor_resolves_line_from_disk() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    // A root-relative anchor link `](/guide.md#configuration)` into a content
+    // root outside the workspace must land on the heading line, not line 0. The
+    // target is never indexed, so the line is parsed from disk.
+    let temp_dir = tempdir().unwrap();
+    let root = temp_dir.path().resolve_like_server();
+    let workspace = root.join("workspace");
+    let content_root = root.join("site");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&content_root).unwrap();
+
+    let current_file = workspace.join("index.md");
+    let target_file = content_root.join("guide.md");
+    fs::write(&current_file, "").unwrap();
+    fs::write(&target_file, "# Guide\n\n## Configuration\n").unwrap();
+
+    let server = create_test_server();
+    *server.workspace_roots.write().await = vec![workspace.clone()];
+    server.config.write().await.link_completion_content_roots = vec![content_root.to_string_lossy().into_owned()];
+
+    let current_uri = Url::from_file_path(&current_file).unwrap();
+    let content = "See [config](/guide.md#configuration).\n";
+    server.documents.write().await.insert(
+        current_uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    // Cursor on the link target.
+    let position = Position { line: 0, character: 20 };
+    let result = server.handle_goto_definition(&current_uri, position).await;
+
+    match result {
+        Some(GotoDefinitionResponse::Scalar(location)) => {
+            assert_eq!(
+                location.uri,
+                Url::from_file_path(&target_file).unwrap(),
+                "should resolve under the content root"
+            );
+            assert_eq!(
+                location.range.start.line, 2,
+                "anchor must land on the '## Configuration' heading parsed from disk"
+            );
+        }
+        other => panic!("expected a scalar definition, got: {other:?}"),
+    }
+}
+
+/// Navigation into a file the index does not hold parses it in its own scope.
+///
+/// A nested config governs how the workspace index generates that file's
+/// anchors, so a fallback reading the root config looks up an anchor the file
+/// never had and silently lands on line 0 instead of the heading. Hover
+/// previews resolve the same way.
+#[tokio::test]
+async fn test_goto_definition_disk_fallback_uses_the_target_scope() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp = tempdir().unwrap();
+    let root = temp.path().resolve_like_server();
+    let nested = root.join("docs");
+    let user_config_dir = root.join("userconfig");
+    let home_dir = root.join("fakehome");
+    fs::create_dir_all(&nested).unwrap();
+    fs::create_dir_all(&user_config_dir).unwrap();
+    fs::create_dir_all(&home_dir).unwrap();
+
+    fs::write(
+        root.join(".rumdl.toml"),
+        "[global]\nflavor = \"standard\"\n\n[MD051]\nanchor-style = \"python-markdown\"\n",
+    )
+    .unwrap();
+    fs::write(
+        nested.join(".rumdl.toml"),
+        "[global]\nflavor = \"standard\"\n\n[MD051]\nanchor-style = \"github\"\n",
+    )
+    .unwrap();
+
+    // The heading sits below the first line, so resolving it is distinguishable
+    // from the line 0 an unresolved anchor falls back to.
+    let target_file = nested.join("guide.md");
+    fs::write(&target_file, "Intro.\n\n# Getting Started — Advanced\n\nBody.\n").unwrap();
+    let current_file = nested.join("index.md");
+    fs::write(&current_file, "").unwrap();
+
+    let server = create_test_server();
+    *server.workspace_roots.write().await = vec![root.clone()];
+    server
+        .load_configuration_impl(false, Some(&user_config_dir), Some(&home_dir))
+        .await;
+
+    // Control: the nested scope is what interprets this document.
+    let effective = server
+        .resolve_config_for_file_impl(&target_file, Some(&user_config_dir), Some(&home_dir))
+        .await;
+    assert_eq!(
+        effective
+            .rules
+            .get("MD051")
+            .and_then(|rule| rule.values.get("anchor-style"))
+            .map(ToString::to_string),
+        Some("\"github\"".to_string()),
+        "control: per-file resolution must see the nested anchor style"
+    );
+
+    // Control: the target is absent from the index, so navigation reads disk.
+    assert!(
+        server.workspace_index.read().await.get_file(&target_file).is_none(),
+        "control: the target must not be indexed"
+    );
+
+    let current_uri = Url::from_file_path(&current_file).unwrap();
+    server.documents.write().await.insert(
+        current_uri.clone(),
+        DocumentEntry {
+            content: "See [guide](guide.md#getting-started--advanced).\n".to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    let position = Position { line: 0, character: 20 };
+    match server.handle_goto_definition(&current_uri, position).await {
+        Some(GotoDefinitionResponse::Scalar(location)) => {
+            assert_eq!(location.uri, Url::from_file_path(&target_file).unwrap());
+            assert_eq!(
+                location.range.start.line, 2,
+                "the nested config's anchor style must land on the heading, not line 0"
+            );
+        }
+        other => panic!("expected a scalar definition, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_goto_definition_root_relative_resolves_against_content_root() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    // A root-relative link `](/guide.md)` accepted from the absolute completion
+    // must navigate to the content root, not the OS filesystem root. The content
+    // root here lives outside the workspace, so resolution is on-disk only.
+    let temp_dir = tempdir().unwrap();
+    let root = temp_dir.path().resolve_like_server();
+    let workspace = root.join("workspace");
+    let content_root = root.join("site");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&content_root).unwrap();
+
+    let current_file = workspace.join("index.md");
+    let target_file = content_root.join("guide.md");
+    fs::write(&current_file, "").unwrap();
+    fs::write(&target_file, "# Guide\n").unwrap();
+
+    let server = create_test_server();
+    *server.workspace_roots.write().await = vec![workspace.clone()];
+    server.config.write().await.link_completion_content_roots = vec![content_root.to_string_lossy().into_owned()];
+
+    let current_uri = Url::from_file_path(&current_file).unwrap();
+    let content = "See [the guide](/guide.md) for details.\n";
+    server.documents.write().await.insert(
+        current_uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    // Cursor on `/guide.md` inside the link target.
+    let position = Position { line: 0, character: 20 };
+    let result = server.handle_goto_definition(&current_uri, position).await;
+
+    match result {
+        Some(GotoDefinitionResponse::Scalar(location)) => assert_eq!(
+            location.uri,
+            Url::from_file_path(&target_file).unwrap(),
+            "root-relative link should resolve under the content root"
+        ),
+        other => panic!("expected a definition under the content root, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_watched_file_eviction_when_newly_ignored() {
+    use crate::workspace_index::{FileIndex, WorkspaceIndex};
+    use std::fs;
+    use tempfile::tempdir;
+    use tower_lsp::LanguageServer;
+
+    // A file indexed before an ignore rule began matching it must be evicted
+    // when a later filesystem-watch event arrives, so completions and navigation
+    // stop surfacing it without waiting for a full rescan.
+    let temp_dir = tempdir().unwrap();
+    let root = temp_dir.path().resolve_like_server();
+    let draft = root.join("draft.md");
+    fs::write(&draft, "# Draft\n").unwrap();
+    fs::write(root.join(".gitignore"), "draft.md\n").unwrap();
+
+    let server = create_test_server();
+    *server.workspace_roots.write().await = vec![root.clone()];
+    {
+        let mut index = server.workspace_index.write().await;
+        *index = WorkspaceIndex::new();
+        index.insert_file(draft.clone(), FileIndex::default());
+    }
+
+    let params = DidChangeWatchedFilesParams {
+        changes: vec![FileEvent {
+            uri: Url::from_file_path(&draft).unwrap(),
+            typ: FileChangeType::CHANGED,
+        }],
+    };
+    server.did_change_watched_files(params).await;
+
+    // The async index worker applies the eviction; poll until it lands.
+    let mut evicted = false;
+    for _ in 0..50 {
+        if server.workspace_index.read().await.get_file(&draft).is_none() {
+            evicted = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(evicted, "a newly-ignored file must be evicted from the workspace index");
+}
+
+#[tokio::test]
+async fn test_goto_definition_file_with_anchor() {
+    use crate::workspace_index::{FileIndex, HeadingIndex};
+
+    let server = create_test_server();
+
+    let docs_dir = test_temp_path("rumdl-nav-test2/docs");
+    let current_file = docs_dir.join("index.md");
+    let target_file = docs_dir.join("guide.md");
+
+    let current_uri = Url::from_file_path(&current_file).unwrap();
+
+    // Content with a link that has both file and anchor
+    let content = "# Index\n\nSee [install](guide.md#installation) here.\n";
+    server.documents.write().await.insert(
+        current_uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    // Populate workspace index with target file and heading
+    {
+        let mut index = server.workspace_index.write().await;
+        let mut fi = FileIndex::default();
+        fi.add_heading(HeadingIndex {
+            text: "Getting Started".to_string(),
+            auto_anchor: "getting-started".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        fi.add_heading(HeadingIndex {
+            text: "Installation".to_string(),
+            auto_anchor: "installation".to_string(),
+            custom_anchor: None,
+            line: 10,
+            is_setext: false,
+        });
+        fi.add_heading(HeadingIndex {
+            text: "Configuration".to_string(),
+            auto_anchor: "configuration".to_string(),
+            custom_anchor: None,
+            line: 25,
+            is_setext: false,
+        });
+        index.insert_file(target_file.clone(), fi);
+    }
+
+    // Position cursor on "guide.md#installation"
+    // Line 2: "See [install](guide.md#installation) here."
+    let position = Position { line: 2, character: 18 };
+
+    let result = server.handle_goto_definition(&current_uri, position).await;
+    assert!(result.is_some(), "Should return a definition location for file+anchor");
+
+    if let Some(GotoDefinitionResponse::Scalar(location)) = result {
+        assert_eq!(
+            location.uri,
+            Url::from_file_path(&target_file).unwrap(),
+            "Should point to guide.md"
+        );
+        // "Installation" heading is at line 10 (1-indexed) = line 9 (0-indexed)
+        assert_eq!(location.range.start.line, 9, "Should target the Installation heading");
+    } else {
+        panic!("Expected Scalar response");
+    }
+}
+
+#[tokio::test]
+async fn test_goto_definition_same_file_anchor() {
+    use crate::workspace_index::{FileIndex, HeadingIndex};
+
+    let server = create_test_server();
+
+    let file = test_temp_path("rumdl-nav-test3/readme.md");
+    let uri = Url::from_file_path(&file).unwrap();
+
+    // Content with a same-file anchor link
+    let content = "# Title\n\nSee [below](#configuration) for config.\n\n## Configuration\n\nSettings here.\n";
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    // Populate workspace index with the file's headings
+    {
+        let mut index = server.workspace_index.write().await;
+        let mut fi = FileIndex::default();
+        fi.add_heading(HeadingIndex {
+            text: "Title".to_string(),
+            auto_anchor: "title".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        fi.add_heading(HeadingIndex {
+            text: "Configuration".to_string(),
+            auto_anchor: "configuration".to_string(),
+            custom_anchor: None,
+            line: 5,
+            is_setext: false,
+        });
+        index.insert_file(file.clone(), fi);
+    }
+
+    // Position cursor on "#configuration" in `](#configuration)`
+    // Line 2: "See [below](#configuration) for config."
+    let position = Position { line: 2, character: 16 };
+
+    let result = server.handle_goto_definition(&uri, position).await;
+    assert!(result.is_some(), "Should return a definition for same-file anchor");
+
+    if let Some(GotoDefinitionResponse::Scalar(location)) = result {
+        assert_eq!(location.uri, uri, "Should point to the same file");
+        // "Configuration" heading is at line 5 (1-indexed) = line 4 (0-indexed)
+        assert_eq!(location.range.start.line, 4, "Should target the Configuration heading");
+    } else {
+        panic!("Expected Scalar response");
+    }
+}
+
+#[tokio::test]
+async fn test_goto_definition_cursor_not_on_link() {
+    let server = create_test_server();
+
+    let file = test_temp_path("rumdl-nav-test4/readme.md");
+    let uri = Url::from_file_path(&file).unwrap();
+
+    let content = "# Title\n\nJust some plain text here.\n";
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    // Position cursor on plain text (no link)
+    let position = Position { line: 2, character: 5 };
+
+    let result = server.handle_goto_definition(&uri, position).await;
+    assert!(result.is_none(), "Should return None when cursor is not on a link");
+}
+
+#[tokio::test]
+async fn test_find_references_heading_with_incoming_links() {
+    use crate::workspace_index::{CrossFileLinkIndex, FileIndex, HeadingIndex, LinkOrigin};
+
+    let server = create_test_server();
+
+    let docs_dir = test_temp_path("rumdl-nav-test5/docs");
+    let target_file = docs_dir.join("guide.md");
+    let source_file_a = docs_dir.join("index.md");
+    let source_file_b = docs_dir.join("faq.md");
+
+    let target_uri = Url::from_file_path(&target_file).unwrap();
+
+    // Target file content with the heading
+    let content = "# Installation\n\nHow to install.\n";
+    server.documents.write().await.insert(
+        target_uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    // Populate workspace index: target file has heading, two source files link to it
+    {
+        let mut index = server.workspace_index.write().await;
+
+        // Target file with heading
+        let mut target_fi = FileIndex::default();
+        target_fi.add_heading(HeadingIndex {
+            text: "Installation".to_string(),
+            auto_anchor: "installation".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        index.insert_file(target_file.clone(), target_fi);
+
+        // Source file A links to guide.md#installation
+        let mut source_a_fi = FileIndex::default();
+        source_a_fi.cross_file_links.push(CrossFileLinkIndex {
+            target_path: "guide.md".to_string(),
+            fragment: "installation".to_string(),
+            line: 5,
+            column: 10,
+            origin: LinkOrigin::Body,
+        });
+        index.insert_file(source_file_a.clone(), source_a_fi);
+
+        // Source file B also links to guide.md#installation
+        let mut source_b_fi = FileIndex::default();
+        source_b_fi.cross_file_links.push(CrossFileLinkIndex {
+            target_path: "guide.md".to_string(),
+            fragment: "installation".to_string(),
+            line: 3,
+            column: 15,
+            origin: LinkOrigin::Body,
+        });
+        index.insert_file(source_file_b.clone(), source_b_fi);
+    }
+
+    // Position cursor on the heading "# Installation" (line 0, any column)
+    let position = Position { line: 0, character: 5 };
+
+    let result = server.handle_references(&target_uri, position).await;
+    assert!(result.is_some(), "Should find references to the heading");
+
+    let locations = result.unwrap();
+    assert_eq!(locations.len(), 2, "Should find 2 references from two files");
+
+    let uris: Vec<_> = locations.iter().map(|l| l.uri.clone()).collect();
+    assert!(
+        uris.contains(&Url::from_file_path(&source_file_a).unwrap()),
+        "Should include reference from index.md"
+    );
+    assert!(
+        uris.contains(&Url::from_file_path(&source_file_b).unwrap()),
+        "Should include reference from faq.md"
+    );
+
+    // Verify line/column conversion (1-indexed to 0-indexed)
+    let a_loc = locations
+        .iter()
+        .find(|l| l.uri == Url::from_file_path(&source_file_a).unwrap())
+        .unwrap();
+    assert_eq!(
+        a_loc.range.start.line, 4,
+        "Line 5 (1-indexed) should become 4 (0-indexed)"
+    );
+    assert_eq!(
+        a_loc.range.start.character, 9,
+        "Column 10 (1-indexed) should become 9 (0-indexed)"
+    );
+}
+
+/// A frontmatter value pointing at a heading is indexed so MD051 can validate
+/// it on request, but it is not Markdown link syntax, so rename cannot rewrite
+/// it. Listing it here would hand the editor a location a later rename leaves
+/// silently stale, so find-references reports only the body link.
+#[tokio::test]
+async fn test_find_references_excludes_frontmatter_links() {
+    use crate::workspace_index::{CrossFileLinkIndex, FileIndex, HeadingIndex, LinkOrigin};
+
+    let server = create_test_server();
+
+    let docs_dir = test_temp_path("rumdl-nav-frontmatter-refs/docs");
+    let target_file = docs_dir.join("guide.md");
+    let body_source = docs_dir.join("index.md");
+    let frontmatter_source = docs_dir.join("faq.md");
+
+    let target_uri = Url::from_file_path(&target_file).unwrap();
+
+    let content = "# Installation\n\nHow to install.\n";
+    server.documents.write().await.insert(
+        target_uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+
+        let mut target_fi = FileIndex::default();
+        target_fi.add_heading(HeadingIndex {
+            text: "Installation".to_string(),
+            auto_anchor: "installation".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        index.insert_file(target_file.clone(), target_fi);
+
+        // The positive control: an ordinary body link to the same anchor is
+        // listed under every configuration, so an empty result would be a
+        // broken fixture rather than the frontmatter filter.
+        let mut body_fi = FileIndex::default();
+        body_fi.cross_file_links.push(CrossFileLinkIndex {
+            target_path: "guide.md".to_string(),
+            fragment: "installation".to_string(),
+            line: 5,
+            column: 10,
+            origin: LinkOrigin::Body,
+        });
+        index.insert_file(body_source.clone(), body_fi);
+
+        let mut frontmatter_fi = FileIndex::default();
+        frontmatter_fi.cross_file_links.push(CrossFileLinkIndex {
+            target_path: "guide.md".to_string(),
+            fragment: "installation".to_string(),
+            line: 2,
+            column: 7,
+            origin: LinkOrigin::FrontMatter {
+                field: Some("link".to_string()),
+            },
+        });
+        index.insert_file(frontmatter_source.clone(), frontmatter_fi);
+    }
+
+    let position = Position { line: 0, character: 5 };
+    let locations = server
+        .handle_references(&target_uri, position)
+        .await
+        .expect("the body link is a reference, so the query resolves");
+
+    let uris: Vec<_> = locations.iter().map(|l| l.uri.clone()).collect();
+    assert!(
+        uris.contains(&Url::from_file_path(&body_source).unwrap()),
+        "the body link must be listed"
+    );
+    assert!(
+        !uris.contains(&Url::from_file_path(&frontmatter_source).unwrap()),
+        "the frontmatter value must not be listed, got {uris:?}"
+    );
+}
+
+/// The same exclusion on the fallback path, which matches by file rather than
+/// by anchor and is reached when the cursor is on neither a heading nor a link.
+#[tokio::test]
+async fn test_find_references_fallback_excludes_frontmatter_links() {
+    use crate::workspace_index::{CrossFileLinkIndex, FileIndex, LinkOrigin};
+
+    let server = create_test_server();
+
+    let docs_dir = test_temp_path("rumdl-nav-frontmatter-fallback/docs");
+    let target_file = docs_dir.join("file-to-link-to.md");
+    let body_source = docs_dir.join("body-source.md");
+    let frontmatter_source = docs_dir.join("frontmatter-source.md");
+
+    let target_uri = Url::from_file_path(&target_file).unwrap();
+
+    let content = "---\ntitle: Heading\n---\n\nWe are linking to this file.\n";
+    server.documents.write().await.insert(
+        target_uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+        index.insert_file(target_file.clone(), FileIndex::default());
+
+        let mut body_fi = FileIndex::default();
+        body_fi.cross_file_links.push(CrossFileLinkIndex {
+            target_path: "file-to-link-to.md".to_string(),
+            fragment: String::new(),
+            line: 5,
+            column: 22,
+            origin: LinkOrigin::Body,
+        });
+        index.insert_file(body_source.clone(), body_fi);
+
+        let mut frontmatter_fi = FileIndex::default();
+        frontmatter_fi.cross_file_links.push(CrossFileLinkIndex {
+            target_path: "file-to-link-to.md".to_string(),
+            fragment: String::new(),
+            line: 2,
+            column: 7,
+            origin: LinkOrigin::FrontMatter { field: None },
+        });
+        index.insert_file(frontmatter_source.clone(), frontmatter_fi);
+    }
+
+    let position = Position { line: 4, character: 10 };
+    let locations = server
+        .handle_references(&target_uri, position)
+        .await
+        .expect("the body link is a reference, so the fallback resolves");
+
+    let uris: Vec<_> = locations.iter().map(|l| l.uri.clone()).collect();
+    assert_eq!(
+        uris,
+        vec![Url::from_file_path(&body_source).unwrap()],
+        "only the body link is a navigable reference"
+    );
+}
+
+#[tokio::test]
+async fn test_find_references_finds_root_relative_links() {
+    use crate::workspace_index::{CrossFileLinkIndex, FileIndex, HeadingIndex, LinkOrigin};
+    use std::fs;
+    use tempfile::tempdir;
+
+    // find-references on a heading must discover root-relative links (`/guide.md`)
+    // that point to it, resolving them against the content roots the same way
+    // go-to-definition does.
+    let temp_dir = tempdir().unwrap();
+    let root = temp_dir.path().resolve_like_server();
+    let target_file = root.join("guide.md");
+    let source_file = root.join("index.md");
+    fs::write(&target_file, "# Installation\n\nHow to install.\n").unwrap();
+    fs::write(&source_file, "See [install](/guide.md#installation).\n").unwrap();
+
+    let server = create_test_server();
+    *server.workspace_roots.write().await = vec![root.clone()];
+
+    let target_uri = Url::from_file_path(&target_file).unwrap();
+    server.documents.write().await.insert(
+        target_uri.clone(),
+        DocumentEntry {
+            content: "# Installation\n\nHow to install.\n".to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+
+        let mut target_fi = FileIndex::default();
+        target_fi.add_heading(HeadingIndex {
+            text: "Installation".to_string(),
+            auto_anchor: "installation".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        index.insert_file(target_file.clone(), target_fi);
+
+        // The source file links via a root-relative path, stored leading-`/`-stripped.
+        let mut source_fi = FileIndex::default();
+        source_fi.add_root_relative_link(CrossFileLinkIndex {
+            target_path: "guide.md".to_string(),
+            fragment: "installation".to_string(),
+            line: 1,
+            column: 15,
+            origin: LinkOrigin::Body,
+        });
+        index.insert_file(source_file.clone(), source_fi);
+    }
+
+    // Cursor on the "# Installation" heading.
+    let position = Position { line: 0, character: 5 };
+    let result = server.handle_references(&target_uri, position).await;
+
+    let locations = result.expect("should find the root-relative reference");
+    assert_eq!(locations.len(), 1, "exactly one root-relative reference");
+    assert_eq!(
+        locations[0].uri,
+        Url::from_file_path(&source_file).unwrap(),
+        "reference should point to the linking file"
+    );
+}
+
+#[tokio::test]
+async fn test_find_references_heading_no_incoming_links() {
+    use crate::workspace_index::{FileIndex, HeadingIndex};
+
+    let server = create_test_server();
+
+    let file = test_temp_path("rumdl-nav-test6/docs/lonely.md");
+    let uri = Url::from_file_path(&file).unwrap();
+
+    let content = "# Lonely Heading\n\nNo one links here.\n";
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+        let mut fi = FileIndex::default();
+        fi.add_heading(HeadingIndex {
+            text: "Lonely Heading".to_string(),
+            auto_anchor: "lonely-heading".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        index.insert_file(file.clone(), fi);
+    }
+
+    // Position cursor on the heading
+    let position = Position { line: 0, character: 5 };
+
+    let result = server.handle_references(&uri, position).await;
+    assert!(result.is_none(), "Should return None when no references exist");
+}
+
+#[tokio::test]
+async fn test_goto_definition_with_custom_anchor() {
+    use crate::workspace_index::{FileIndex, HeadingIndex};
+
+    let server = create_test_server();
+
+    let docs_dir = test_temp_path("rumdl-nav-test7/docs");
+    let current_file = docs_dir.join("index.md");
+    let target_file = docs_dir.join("guide.md");
+
+    let current_uri = Url::from_file_path(&current_file).unwrap();
+
+    // Link uses a custom anchor
+    let content = "# Index\n\nSee [install](guide.md#install) here.\n";
+    server.documents.write().await.insert(
+        current_uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+        let mut fi = FileIndex::default();
+        fi.add_heading(HeadingIndex {
+            text: "Installation Guide".to_string(),
+            auto_anchor: "installation-guide".to_string(),
+            custom_anchor: Some("install".to_string()),
+            line: 15,
+            is_setext: false,
+        });
+        index.insert_file(target_file.clone(), fi);
+    }
+
+    // Position cursor on the link target
+    let position = Position { line: 2, character: 18 };
+
+    let result = server.handle_goto_definition(&current_uri, position).await;
+    assert!(result.is_some(), "Should resolve custom anchor");
+
+    if let Some(GotoDefinitionResponse::Scalar(location)) = result {
+        // Line 15 (1-indexed) = line 14 (0-indexed)
+        assert_eq!(
+            location.range.start.line, 14,
+            "Should target the heading with the custom anchor"
+        );
+    } else {
+        panic!("Expected Scalar response");
+    }
+}
+
+#[tokio::test]
+async fn test_goto_definition_anchor_not_found_falls_back_to_line_zero() {
+    use crate::workspace_index::{FileIndex, HeadingIndex};
+
+    let server = create_test_server();
+
+    let docs_dir = test_temp_path("rumdl-nav-test8/docs");
+    let current_file = docs_dir.join("index.md");
+    let target_file = docs_dir.join("guide.md");
+
+    let current_uri = Url::from_file_path(&current_file).unwrap();
+
+    // Link to a non-existent anchor
+    let content = "# Index\n\nSee [x](guide.md#nonexistent) here.\n";
+    server.documents.write().await.insert(
+        current_uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+        let mut fi = FileIndex::default();
+        fi.add_heading(HeadingIndex {
+            text: "Introduction".to_string(),
+            auto_anchor: "introduction".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        index.insert_file(target_file.clone(), fi);
+    }
+
+    let position = Position { line: 2, character: 15 };
+
+    let result = server.handle_goto_definition(&current_uri, position).await;
+    assert!(result.is_some(), "Should still return a location for unresolved anchor");
+
+    if let Some(GotoDefinitionResponse::Scalar(location)) = result {
+        assert_eq!(
+            location.range.start.line, 0,
+            "Should fall back to line 0 when anchor not found"
+        );
+    } else {
+        panic!("Expected Scalar response");
+    }
+}
+
+#[tokio::test]
+async fn test_find_references_from_link_position() {
+    use crate::workspace_index::{CrossFileLinkIndex, FileIndex, HeadingIndex, LinkOrigin};
+
+    let server = create_test_server();
+
+    let docs_dir = test_temp_path("rumdl-nav-test9/docs");
+    let current_file = docs_dir.join("index.md");
+    let target_file = docs_dir.join("guide.md");
+    let other_file = docs_dir.join("faq.md");
+
+    let current_uri = Url::from_file_path(&current_file).unwrap();
+
+    // Current file contains a link -- find other links to the same target
+    let content = "# Index\n\nSee [guide](guide.md) for info.\n";
+    server.documents.write().await.insert(
+        current_uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+
+        let mut target_fi = FileIndex::default();
+        target_fi.add_heading(HeadingIndex {
+            text: "Guide".to_string(),
+            auto_anchor: "guide".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        index.insert_file(target_file.clone(), target_fi);
+
+        // Current file links to guide.md (no fragment)
+        let mut current_fi = FileIndex::default();
+        current_fi.cross_file_links.push(CrossFileLinkIndex {
+            target_path: "guide.md".to_string(),
+            fragment: "".to_string(),
+            line: 3,
+            column: 12,
+            origin: LinkOrigin::Body,
+        });
+        index.insert_file(current_file.clone(), current_fi);
+
+        // Other file also links to guide.md (no fragment)
+        let mut other_fi = FileIndex::default();
+        other_fi.cross_file_links.push(CrossFileLinkIndex {
+            target_path: "guide.md".to_string(),
+            fragment: "".to_string(),
+            line: 7,
+            column: 5,
+            origin: LinkOrigin::Body,
+        });
+        index.insert_file(other_file.clone(), other_fi);
+    }
+
+    // Position cursor on the link target "guide.md" in ](guide.md)
+    let position = Position { line: 2, character: 16 };
+
+    let result = server.handle_references(&current_uri, position).await;
+    assert!(result.is_some(), "Should find references when cursor is on a link");
+
+    let locations = result.unwrap();
+    assert_eq!(locations.len(), 2, "Should find both links to guide.md");
+
+    let uris: Vec<_> = locations.iter().map(|l| l.uri.clone()).collect();
+    assert!(uris.contains(&Url::from_file_path(&current_file).unwrap()));
+    assert!(uris.contains(&Url::from_file_path(&other_file).unwrap()));
+}
+
+#[tokio::test]
+async fn test_find_references_from_target_file_without_selecting_link() {
+    use crate::workspace_index::{CrossFileLinkIndex, FileIndex, LinkOrigin};
+
+    let server = create_test_server();
+
+    let docs_dir = test_temp_path("rumdl-nav-test9b/docs");
+    let source_file = docs_dir.join("file-to-link-from.md");
+    let target_file = docs_dir.join("file-to-link-to.md");
+
+    let target_uri = Url::from_file_path(&target_file).unwrap();
+
+    // Simulate a target file opened via go-to-definition. Cursor is not on a heading
+    // or link target, but users still expect find-references to discover incoming links.
+    let target_content = "---\ntitle: Heading\n---\n\nTarget file content.\n";
+    server.documents.write().await.insert(
+        target_uri.clone(),
+        DocumentEntry {
+            content: target_content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+
+        let mut source_fi = FileIndex::default();
+        source_fi.cross_file_links.push(CrossFileLinkIndex {
+            target_path: "file-to-link-to.md".to_string(),
+            fragment: "".to_string(),
+            line: 5,
+            column: 24,
+            origin: LinkOrigin::Body,
+        });
+        index.insert_file(source_file.clone(), source_fi);
+    }
+
+    // Cursor at top of target file (typical after go-to-definition opens the file)
+    let position = Position { line: 0, character: 0 };
+
+    let result = server.handle_references(&target_uri, position).await;
+    assert!(
+        result.is_some(),
+        "Should find incoming file-level references even when cursor is not on a link"
+    );
+
+    let locations = result.unwrap();
+    assert_eq!(locations.len(), 1, "Should find one incoming link");
+    assert_eq!(
+        locations[0].uri,
+        Url::from_file_path(&source_file).unwrap(),
+        "Reference should point to the linking source file"
+    );
+    assert_eq!(locations[0].range.start.line, 4);
+}
+
+#[tokio::test]
+async fn test_goto_definition_link_with_title() {
+    use crate::workspace_index::{FileIndex, HeadingIndex};
+
+    let server = create_test_server();
+
+    let docs_dir = test_temp_path("rumdl-nav-test10/docs");
+    let current_file = docs_dir.join("index.md");
+    let target_file = docs_dir.join("guide.md");
+
+    let current_uri = Url::from_file_path(&current_file).unwrap();
+
+    // Link with a title attribute
+    let content = "# Index\n\nSee [guide](guide.md \"The Guide\") for details.\n";
+    server.documents.write().await.insert(
+        current_uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+        let mut fi = FileIndex::default();
+        fi.add_heading(HeadingIndex {
+            text: "Guide".to_string(),
+            auto_anchor: "guide".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        index.insert_file(target_file.clone(), fi);
+    }
+
+    // Position cursor on "guide.md" inside `](guide.md "The Guide")`
+    // Line 2: `See [guide](guide.md "The Guide") for details.`
+    let position = Position { line: 2, character: 16 };
+
+    let result = server.handle_goto_definition(&current_uri, position).await;
+    assert!(result.is_some(), "Should resolve link target even with title attribute");
+
+    if let Some(GotoDefinitionResponse::Scalar(location)) = result {
+        assert_eq!(
+            location.uri,
+            Url::from_file_path(&target_file).unwrap(),
+            "Should point to guide.md despite title in link"
+        );
+        assert_eq!(location.range.start.line, 0, "Should target line 0");
+    } else {
+        panic!("Expected Scalar response");
+    }
+}
+
+#[tokio::test]
+async fn test_goto_definition_angle_bracket_link() {
+    use crate::workspace_index::{FileIndex, HeadingIndex};
+
+    let server = create_test_server();
+
+    let docs_dir = test_temp_path("rumdl-nav-test11/docs");
+    let current_file = docs_dir.join("index.md");
+    let target_file = docs_dir.join("guide.md");
+
+    let current_uri = Url::from_file_path(&current_file).unwrap();
+
+    // Angle-bracket link target
+    let content = "# Index\n\nSee [guide](<guide.md>) for details.\n";
+    server.documents.write().await.insert(
+        current_uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+        let mut fi = FileIndex::default();
+        fi.add_heading(HeadingIndex {
+            text: "Guide".to_string(),
+            auto_anchor: "guide".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        index.insert_file(target_file.clone(), fi);
+    }
+
+    // Position cursor inside `](<guide.md>)`
+    let position = Position { line: 2, character: 16 };
+
+    let result = server.handle_goto_definition(&current_uri, position).await;
+    assert!(result.is_some(), "Should resolve angle-bracket link target");
+
+    if let Some(GotoDefinitionResponse::Scalar(location)) = result {
+        assert_eq!(
+            location.uri,
+            Url::from_file_path(&target_file).unwrap(),
+            "Should point to guide.md despite angle brackets"
+        );
+    } else {
+        panic!("Expected Scalar response");
+    }
+}
+
+#[tokio::test]
+async fn test_find_references_includes_same_file_fragment_links() {
+    use crate::workspace_index::{FileIndex, HeadingIndex};
+
+    let server = create_test_server();
+
+    let file = test_temp_path("rumdl-nav-test12/docs/readme.md");
+    let uri = Url::from_file_path(&file).unwrap();
+
+    // File with a heading and a same-file fragment link to it
+    let content = "# Installation\n\nSee [above](#installation) for details.\n\nMore text here.\n";
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+        let mut fi = FileIndex::default();
+        fi.add_heading(HeadingIndex {
+            text: "Installation".to_string(),
+            auto_anchor: "installation".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        index.insert_file(file.clone(), fi);
+    }
+
+    // Position cursor on the heading (line 0)
+    let position = Position { line: 0, character: 5 };
+
+    let result = server.handle_references(&uri, position).await;
+    assert!(
+        result.is_some(),
+        "Should find same-file fragment references to the heading"
+    );
+
+    let locations = result.unwrap();
+    assert_eq!(locations.len(), 1, "Should find the same-file #installation link");
+    assert_eq!(locations[0].range.start.line, 2, "Reference should be on line 2");
+}
+
+// =============================================================================
+// Navigation: external URL returns None
+// =============================================================================
+
+#[tokio::test]
+async fn test_goto_definition_external_url_returns_none() {
+    let server = create_test_server();
+
+    let file = test_temp_path("rumdl-nav-url-test/readme.md");
+    let uri = Url::from_file_path(&file).unwrap();
+
+    let content = "See [example](https://example.com) for details.\n";
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    // Cursor on "https://example.com"
+    let position = Position { line: 0, character: 18 };
+    let result = server.handle_goto_definition(&uri, position).await;
+    assert!(result.is_none(), "Should return None for external URLs");
+}
+
+#[tokio::test]
+async fn test_goto_definition_mailto_returns_none() {
+    let server = create_test_server();
+
+    let file = test_temp_path("rumdl-nav-mailto-test/readme.md");
+    let uri = Url::from_file_path(&file).unwrap();
+
+    let content = "Email [us](mailto:info@example.com) for help.\n";
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    let position = Position { line: 0, character: 15 };
+    let result = server.handle_goto_definition(&uri, position).await;
+    assert!(result.is_none(), "Should return None for mailto: links");
+}
+
+// =============================================================================
+// Navigation: reference-style links
+// =============================================================================
+
+#[tokio::test]
+async fn test_goto_definition_reference_link() {
+    use crate::workspace_index::{FileIndex, HeadingIndex};
+
+    let server = create_test_server();
+
+    let docs_dir = test_temp_path("rumdl-nav-ref-test/docs");
+    let current_file = docs_dir.join("index.md");
+    let target_file = docs_dir.join("guide.md");
+
+    let current_uri = Url::from_file_path(&current_file).unwrap();
+
+    // Full reference link: [click here][guide]
+    let content = "# Index\n\nSee [click here][guide] for info.\n\n[guide]: guide.md#install\n";
+    server.documents.write().await.insert(
+        current_uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+        let mut fi = FileIndex::default();
+        fi.add_heading(HeadingIndex {
+            text: "Installation".to_string(),
+            auto_anchor: "installation".to_string(),
+            custom_anchor: Some("install".to_string()),
+            line: 10,
+            is_setext: false,
+        });
+        index.insert_file(target_file.clone(), fi);
+    }
+
+    // Cursor on "click here" — inside the first bracket pair
+    let position = Position { line: 2, character: 8 };
+    let result = server.handle_goto_definition(&current_uri, position).await;
+    assert!(result.is_some(), "Should resolve full reference link");
+
+    if let Some(GotoDefinitionResponse::Scalar(location)) = result {
+        assert_eq!(
+            location.uri,
+            Url::from_file_path(&target_file).unwrap(),
+            "Should point to guide.md"
+        );
+        assert_eq!(location.range.start.line, 9, "Should target the install heading");
+    } else {
+        panic!("Expected Scalar response");
+    }
+}
+
+#[tokio::test]
+async fn test_goto_definition_collapsed_reference() {
+    use crate::workspace_index::{FileIndex, HeadingIndex};
+
+    let server = create_test_server();
+
+    let docs_dir = test_temp_path("rumdl-nav-collapsed-test/docs");
+    let current_file = docs_dir.join("index.md");
+    let target_file = docs_dir.join("guide.md");
+
+    let current_uri = Url::from_file_path(&current_file).unwrap();
+
+    // Collapsed reference: [guide][]
+    let content = "# Index\n\nSee [guide][] for info.\n\n[guide]: guide.md\n";
+    server.documents.write().await.insert(
+        current_uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+        let mut fi = FileIndex::default();
+        fi.add_heading(HeadingIndex {
+            text: "Guide".to_string(),
+            auto_anchor: "guide".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        index.insert_file(target_file.clone(), fi);
+    }
+
+    // Cursor on "guide" in [guide][]
+    let position = Position { line: 2, character: 7 };
+    let result = server.handle_goto_definition(&current_uri, position).await;
+    assert!(result.is_some(), "Should resolve collapsed reference link");
+
+    if let Some(GotoDefinitionResponse::Scalar(location)) = result {
+        assert_eq!(
+            location.uri,
+            Url::from_file_path(&target_file).unwrap(),
+            "Should point to guide.md"
+        );
+    } else {
+        panic!("Expected Scalar response");
+    }
+}
+
+#[tokio::test]
+async fn test_goto_definition_reference_definition_line() {
+    use crate::workspace_index::{FileIndex, HeadingIndex};
+
+    let server = create_test_server();
+
+    let docs_dir = test_temp_path("rumdl-nav-refdef-test/docs");
+    let current_file = docs_dir.join("index.md");
+    let target_file = docs_dir.join("guide.md");
+
+    let current_uri = Url::from_file_path(&current_file).unwrap();
+
+    // Cursor on the reference definition line itself
+    let content = "# Index\n\n[guide]: guide.md#install\n";
+    server.documents.write().await.insert(
+        current_uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+        let mut fi = FileIndex::default();
+        fi.add_heading(HeadingIndex {
+            text: "Installation".to_string(),
+            auto_anchor: "installation".to_string(),
+            custom_anchor: Some("install".to_string()),
+            line: 10,
+            is_setext: false,
+        });
+        index.insert_file(target_file.clone(), fi);
+    }
+
+    // Cursor on the definition line
+    let position = Position { line: 2, character: 5 };
+    let result = server.handle_goto_definition(&current_uri, position).await;
+    assert!(result.is_some(), "Should navigate from reference definition line");
+
+    if let Some(GotoDefinitionResponse::Scalar(location)) = result {
+        assert_eq!(location.uri, Url::from_file_path(&target_file).unwrap(),);
+        assert_eq!(location.range.start.line, 9);
+    } else {
+        panic!("Expected Scalar response");
+    }
+}
+
+#[tokio::test]
+async fn test_goto_definition_reference_link_external_url() {
+    let server = create_test_server();
+
+    let file = test_temp_path("rumdl-nav-ref-ext-test/readme.md");
+    let uri = Url::from_file_path(&file).unwrap();
+
+    // Reference link that resolves to an external URL
+    let content = "See [example] for info.\n\n[example]: https://example.com\n";
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    // Cursor on "example" in [example]
+    let position = Position { line: 0, character: 7 };
+    let result = server.handle_goto_definition(&uri, position).await;
+    assert!(
+        result.is_none(),
+        "Should return None for reference link resolving to external URL"
+    );
+}
+
+// =============================================================================
+// Narrow range / Zed code_actions_on_format tests
+// =============================================================================
+
+/// Demonstrates that a narrow range (cursor position) prevents the fixAll action
+/// from being created, even when fixable warnings exist elsewhere in the document.
+/// This is the likely root cause for Zed's code_actions_on_format failing: Zed
+/// sends the cursor position as the range, but fixable_count only counts
+/// in-range warnings.
+#[tokio::test]
+async fn test_fix_all_action_available_regardless_of_range() {
+    let server = create_test_server();
+
+    let uri = Url::parse("file:///test.md").unwrap();
+    // Line 0: "# Title"             -- no fixable issues here
+    // Line 1: ""                    -- blank line
+    // Line 2: "Tabbed\ttext"        -- hard tab (MD010, fixable), mid-line in paragraph
+    // Tab placed mid-line to keep it out of an indented code block position
+    // (column-0 tab after blank line would be skipped with code_blocks=false).
+    let text = "# Title\n\nTabbed\ttext\n";
+
+    // Narrow range: only line 0 (where Zed cursor might be)
+    let narrow_range = Range {
+        start: Position { line: 0, character: 0 },
+        end: Position { line: 0, character: 0 },
+    };
+
+    let actions = server.get_code_actions(&uri, text, narrow_range).await.unwrap();
+
+    let fix_all_actions: Vec<_> = actions
+        .iter()
+        .filter(|a| a.kind.as_ref().is_some_and(|k| k.as_str() == "source.fixAll.rumdl"))
+        .collect();
+
+    // source.fixAll.rumdl counts fixable warnings across the entire document,
+    // so it should appear even when the cursor is on a line without warnings
+    assert!(
+        !fix_all_actions.is_empty(),
+        "fixAll should be created regardless of cursor position when document has fixable issues"
+    );
+
+    // Full document range should also have fixAll
+    let full_range = Range {
+        start: Position { line: 0, character: 0 },
+        end: Position { line: 3, character: 0 },
+    };
+
+    let actions = server.get_code_actions(&uri, text, full_range).await.unwrap();
+
+    let fix_all_actions: Vec<_> = actions
+        .iter()
+        .filter(|a| a.kind.as_ref().is_some_and(|k| k.as_str() == "source.fixAll.rumdl"))
+        .collect();
+
+    assert!(
+        !fix_all_actions.is_empty(),
+        "fixAll should be created with full document range"
+    );
+}
+
+/// Verifies that fixAll fixes ALL document issues, not just those in the requested range.
+#[tokio::test]
+async fn test_fix_all_applies_all_document_fixes_regardless_of_range() {
+    let server = create_test_server();
+
+    let uri = Url::parse("file:///test.md").unwrap();
+    // Two fixable issues on different lines (hard tabs -> MD010).
+    // Tabs placed mid-line in paragraph text to avoid being treated as
+    // indented code blocks (column-0 tab after blank line is skipped with code_blocks=false).
+    // Line 2 (0-indexed LSP line): "First\tissue"
+    // Line 3 (0-indexed LSP line): "Second\tissue"
+    let text = "# Title\n\nFirst\tissue\nSecond\tissue\n";
+
+    // Range covering only line 2 (first issue)
+    let partial_range = Range {
+        start: Position { line: 2, character: 0 },
+        end: Position { line: 2, character: 13 },
+    };
+
+    let actions = server.get_code_actions(&uri, text, partial_range).await.unwrap();
+
+    let fix_all_actions: Vec<_> = actions
+        .iter()
+        .filter(|a| a.kind.as_ref().is_some_and(|k| k.as_str() == "source.fixAll.rumdl"))
+        .collect();
+
+    // fixAll should be created because there are fixable issues in the document
+    assert!(
+        !fix_all_actions.is_empty(),
+        "fixAll should be created when the document has fixable issues"
+    );
+
+    // Verify the fixed content addresses BOTH issues, not just the in-range one
+    let fix_all = &fix_all_actions[0];
+    let edit = fix_all.edit.as_ref().expect("fixAll should have an edit");
+    let changes = edit.changes.as_ref().expect("edit should have changes");
+    let text_edits = changes.get(&uri).expect("changes should include our file");
+    let fixed_text = &text_edits[0].new_text;
+
+    assert!(
+        !fixed_text.contains('\t'),
+        "fixAll should fix all tab issues in the document, not just those in range"
+    );
+}
+
+/// Test issue #210: Config cache serves stale config when config file is created or modified
+///
+/// Scenario:
+/// 1. User opens a project with no .rumdl.toml (default indent=2 for MD007)
+/// 2. Config cache populates with default config (config_file: None, from_global_fallback: true)
+/// 3. User creates/updates .rumdl.toml with [MD007] indent=4
+/// 4. resolve_config_for_file returns cached default (stale!) instead of new config
+///
+/// Root cause: The cache invalidation in did_change_watched_files only removes entries
+/// where config_file matches the changed path. Entries with config_file: None (global
+/// fallback) are never invalidated when a new config file appears.
+///
+/// Additionally, the server only registers file watchers for markdown files, not config
+/// files, so did_change_watched_files may never fire for .rumdl.toml changes.
+#[tokio::test]
+async fn test_config_cache_stale_after_config_file_created() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let project = temp_dir.path().join("project");
+    fs::create_dir(&project).unwrap();
+
+    let test_file = project.join("test.md");
+    fs::write(&test_file, "# Test\n").unwrap();
+
+    let server = create_test_server();
+    {
+        let mut roots = server.workspace_roots.write().await;
+        roots.push(project.clone());
+    }
+
+    // Step 1: Resolve config with NO .rumdl.toml present -> should get default (indent=2)
+    let config_before = server.resolve_config_for_file(&test_file).await;
+    let indent_before = crate::config::get_rule_config_value::<usize>(&config_before, "MD007", "indent");
+    // Default MD007 indent is 2 (or None if not in config, which means default applies)
+    assert!(
+        indent_before.is_none() || indent_before == Some(2),
+        "Before config file exists, MD007 indent should be default (2 or absent). Got: {indent_before:?}"
+    );
+
+    // Verify cache was populated with fallback entry
+    {
+        let cache = server.config_cache.read().await;
+        let entry = cache
+            .get(&project)
+            .expect("Cache should be populated after first resolve");
+        assert!(
+            entry.from_global_fallback,
+            "Cache entry should be from global fallback since no config file exists"
+        );
+        assert!(
+            entry.config_file.is_none(),
+            "Cache entry should have no config_file since it's a global fallback"
+        );
+    }
+
+    // Step 2: Create .rumdl.toml with indent=4
+    let config_path = project.join(".rumdl.toml");
+    fs::write(
+        &config_path,
+        r#"
+[MD007]
+indent = 4
+"#,
+    )
+    .unwrap();
+
+    // Step 3: Resolve config again WITHOUT clearing cache
+    // The cache detects that a config file now exists and re-resolves instead of
+    // serving the stale global fallback entry.
+    let config_after = server.resolve_config_for_file(&test_file).await;
+    let indent_after = crate::config::get_rule_config_value::<usize>(&config_after, "MD007", "indent");
+
+    assert_eq!(
+        indent_after,
+        Some(4),
+        "After .rumdl.toml is created, resolve_config_for_file should pick up the new config. \
+         Expected MD007 indent=4, got {indent_after:?}"
+    );
+
+    // Verify the cache was updated with the new config file entry
+    {
+        let cache = server.config_cache.read().await;
+        let entry = cache.get(&project).expect("Cache entry should exist after re-resolve");
+        assert!(
+            !entry.from_global_fallback,
+            "Cache entry should no longer be a global fallback after config file was discovered"
+        );
+        assert!(
+            entry.config_file.is_some(),
+            "Cache entry should reference the newly discovered config file"
+        );
+    }
+}
+
+/// Test that manually clearing the config cache picks up new config
+///
+/// This verifies the workaround: if the cache is cleared (e.g., via did_change_configuration),
+/// the new config file is correctly discovered.
+#[tokio::test]
+async fn test_config_cache_picks_up_new_config_after_manual_clear() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let project = temp_dir.path().join("project");
+    fs::create_dir(&project).unwrap();
+
+    let test_file = project.join("test.md");
+    fs::write(&test_file, "# Test\n").unwrap();
+
+    let server = create_test_server();
+    {
+        let mut roots = server.workspace_roots.write().await;
+        roots.push(project.clone());
+    }
+
+    // Resolve config with no config file -> populates cache with default
+    let config_before = server.resolve_config_for_file(&test_file).await;
+    let indent_before = crate::config::get_rule_config_value::<usize>(&config_before, "MD007", "indent");
+    assert!(
+        indent_before.is_none() || indent_before == Some(2),
+        "Should start with default indent"
+    );
+
+    // Create config file
+    let config_path = project.join(".rumdl.toml");
+    fs::write(
+        &config_path,
+        r#"
+[MD007]
+indent = 4
+"#,
+    )
+    .unwrap();
+
+    // Manually clear cache (simulates what did_change_configuration does)
+    server.config_cache.write().await.clear();
+
+    // Now resolve again - should pick up the new config
+    let config_after = server.resolve_config_for_file(&test_file).await;
+    let indent_after = crate::config::get_rule_config_value::<usize>(&config_after, "MD007", "indent");
+    assert_eq!(
+        indent_after,
+        Some(4),
+        "After cache clear, should pick up new config with indent=4"
+    );
+}
+
+/// Test that did_change_watched_files retains stale fallback cache entries
+///
+/// When a config file is modified, did_change_watched_files invalidates cache entries
+/// whose config_file path matches. But entries with config_file=None (global fallback)
+/// survive, even though a new config file now exists in that directory.
+#[tokio::test]
+async fn test_config_cache_retain_logic_misses_fallback_entries() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let project = temp_dir.path().join("project");
+    fs::create_dir(&project).unwrap();
+
+    let test_file = project.join("test.md");
+    fs::write(&test_file, "# Test\n").unwrap();
+
+    let server = create_test_server();
+    {
+        let mut roots = server.workspace_roots.write().await;
+        roots.push(project.clone());
+    }
+
+    // Populate cache with fallback entry (no config file)
+    let _ = server.resolve_config_for_file(&test_file).await;
+
+    // Create config file
+    let config_path = project.join(".rumdl.toml");
+    fs::write(
+        &config_path,
+        r#"
+[MD007]
+indent = 4
+"#,
+    )
+    .unwrap();
+
+    // Simulate did_change_watched_files config invalidation logic
+    // This is the retain logic from server.rs lines 844-852
+    {
+        let mut cache = server.config_cache.write().await;
+        cache.retain(|_, entry| {
+            if let Some(config_file) = &entry.config_file {
+                config_file != &config_path
+            } else {
+                true // BUG: fallback entries (config_file=None) are always retained
+            }
+        });
+    }
+
+    // The fallback entry should have been removed, but the retain logic keeps it
+    let cache = server.config_cache.read().await;
+    let entry = cache.get(&project);
+    assert!(
+        entry.is_some(),
+        "BUG: Fallback cache entry survives retain() because config_file is None"
+    );
+    assert!(
+        entry.unwrap().from_global_fallback,
+        "The surviving entry is the stale global fallback"
+    );
+}
+
+// ─── Embedded markdown and code-block-tools integration tests ───
+
+/// Helper to create a code-block-tools config with rumdl enabled for markdown blocks
+fn make_embedded_markdown_config() -> crate::code_block_tools::CodeBlockToolsConfig {
+    let lang = crate::code_block_tools::LanguageToolConfig {
+        enabled: true,
+        lint: vec!["rumdl".to_string()],
+        format: Vec::new(),
+        on_error: None,
+    };
+    let mut languages = std::collections::BTreeMap::new();
+    languages.insert("markdown".to_string(), lang);
+    crate::code_block_tools::CodeBlockToolsConfig {
+        enabled: true,
+        languages,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn test_lint_document_embedded_markdown_when_enabled() {
+    let server = create_test_server();
+
+    // Enable code-block-tools with rumdl for markdown
+    {
+        let mut cfg = server.rumdl_config.write().await;
+        cfg.code_block_tools = make_embedded_markdown_config();
+    }
+
+    let uri = Url::parse("file:///test.md").unwrap();
+    // The embedded markdown block has trailing spaces (MD009 violation)
+    let text = "# Test\n\n```markdown\n# Hello  \n```\n";
+
+    let diagnostics = server.lint_document(&uri, text, true).await.unwrap();
+
+    // Should contain a diagnostic from the embedded block (trailing spaces on line 4)
+    let embedded_diags: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| {
+            // Line 4 (0-indexed: 3) is the "# Hello  " line inside the code block
+            d.range.start.line == 3
+        })
+        .collect();
+
+    assert!(
+        !embedded_diags.is_empty(),
+        "Expected embedded markdown diagnostics for trailing spaces inside code block, got none. All diagnostics: {diagnostics:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_lint_document_no_embedded_markdown_when_disabled() {
+    let server = create_test_server();
+
+    // code_block_tools defaults to disabled
+    let uri = Url::parse("file:///test.md").unwrap();
+    let text = "# Test\n\n```markdown\n# Hello  \n```\n";
+
+    let diagnostics = server.lint_document(&uri, text, true).await.unwrap();
+
+    // No diagnostics should come from the embedded block (line 4, 0-indexed: 3)
+    // since code-block-tools is not enabled
+    let embedded_diags: Vec<_> = diagnostics.iter().filter(|d| d.range.start.line == 3).collect();
+
+    assert!(
+        embedded_diags.is_empty(),
+        "Expected no embedded markdown diagnostics when code-block-tools is disabled, but got: {embedded_diags:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_lint_document_embedded_markdown_empty_block() {
+    let server = create_test_server();
+
+    {
+        let mut cfg = server.rumdl_config.write().await;
+        cfg.code_block_tools = make_embedded_markdown_config();
+    }
+
+    let uri = Url::parse("file:///test.md").unwrap();
+    // Empty embedded markdown block should produce no extra diagnostics
+    let text = "# Test\n\n```markdown\n```\n";
+
+    let diagnostics = server.lint_document(&uri, text, true).await.unwrap();
+
+    // No diagnostics from the embedded block (it's empty)
+    let embedded_diags: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.range.start.line >= 2 && d.range.start.line <= 3)
+        .collect();
+
+    assert!(
+        embedded_diags.is_empty(),
+        "Expected no diagnostics from empty embedded markdown block, got: {embedded_diags:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_lint_document_multiple_embedded_blocks() {
+    let server = create_test_server();
+
+    {
+        let mut cfg = server.rumdl_config.write().await;
+        cfg.code_block_tools = make_embedded_markdown_config();
+    }
+
+    let uri = Url::parse("file:///test.md").unwrap();
+    // Two markdown blocks, each with trailing spaces
+    let text = "# Test\n\n```markdown\n# One  \n```\n\n```markdown\n# Two  \n```\n";
+
+    let diagnostics = server.lint_document(&uri, text, true).await.unwrap();
+
+    // Should have diagnostics from both embedded blocks
+    let block1_diags: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.range.start.line == 3) // "# One  " is line 4 (0-indexed: 3)
+        .collect();
+
+    let block2_diags: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.range.start.line == 7) // "# Two  " is line 8 (0-indexed: 7)
+        .collect();
+
+    assert!(
+        !block1_diags.is_empty(),
+        "Expected diagnostics from first embedded block. All diagnostics: {diagnostics:?}"
+    );
+    assert!(
+        !block2_diags.is_empty(),
+        "Expected diagnostics from second embedded block. All diagnostics: {diagnostics:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_lint_document_embedded_markdown_md_alias() {
+    let server = create_test_server();
+
+    // Enable for "md" alias instead of "markdown"
+    {
+        let mut cfg = server.rumdl_config.write().await;
+        let mut languages = std::collections::BTreeMap::new();
+        languages.insert(
+            "md".to_string(),
+            crate::code_block_tools::LanguageToolConfig {
+                enabled: true,
+                lint: vec!["rumdl".to_string()],
+                format: Vec::new(),
+                on_error: None,
+            },
+        );
+        cfg.code_block_tools = crate::code_block_tools::CodeBlockToolsConfig {
+            enabled: true,
+            languages,
+            ..Default::default()
+        };
+    }
+
+    let uri = Url::parse("file:///test.md").unwrap();
+    let text = "# Test\n\n```md\n# Hello  \n```\n";
+
+    let diagnostics = server.lint_document(&uri, text, true).await.unwrap();
+
+    let embedded_diags: Vec<_> = diagnostics.iter().filter(|d| d.range.start.line == 3).collect();
+
+    assert!(
+        !embedded_diags.is_empty(),
+        "Expected embedded markdown diagnostics for `md` alias. All diagnostics: {diagnostics:?}"
+    );
+}
+
+// =============================================================================
+// find-references fallback: cursor not on heading or link
+// =============================================================================
+
+/// When cursor is in a target file but not on a heading or link,
+/// find-references should return all cross-file links pointing to that file.
+#[tokio::test]
+async fn test_find_references_fallback_to_file_links() {
+    use crate::workspace_index::{CrossFileLinkIndex, FileIndex, LinkOrigin};
+
+    let server = create_test_server();
+
+    let docs_dir = test_temp_path("rumdl-nav-test-fallback/docs");
+    let target_file = docs_dir.join("file-to-link-to.md");
+    let source_file = docs_dir.join("file-to-link-from.md");
+
+    let target_uri = Url::from_file_path(&target_file).unwrap();
+
+    // Target file content: cursor on a plain text line (not heading, not link)
+    let content = "---\ntitle: Heading\n---\n\nWe are linking to this file from `file-to-link-from.md`.\n";
+    server.documents.write().await.insert(
+        target_uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    // Populate workspace index
+    {
+        let mut index = server.workspace_index.write().await;
+
+        // Target file has no headings relevant to the query
+        let target_fi = FileIndex::default();
+        index.insert_file(target_file.clone(), target_fi);
+
+        // Source file links to target file (file-only link, no fragment)
+        let mut source_fi = FileIndex::default();
+        source_fi.cross_file_links.push(CrossFileLinkIndex {
+            target_path: "file-to-link-to.md".to_string(),
+            fragment: "".to_string(),
+            line: 5,
+            column: 22,
+            origin: LinkOrigin::Body,
+        });
+        index.insert_file(source_file.clone(), source_fi);
+    }
+
+    // Cursor on line 4 (0-indexed), plain text - not on a heading or link
+    let position = Position { line: 4, character: 10 };
+
+    let result = server.handle_references(&target_uri, position).await;
+    assert!(result.is_some(), "Should find references to the file via fallback");
+
+    let locations = result.unwrap();
+    assert_eq!(locations.len(), 1, "Should find 1 reference from source file");
+    assert_eq!(
+        locations[0].uri,
+        Url::from_file_path(&source_file).unwrap(),
+        "Reference should come from the source file"
+    );
+}
+
+/// When cursor is in a file with no incoming references and cursor is not on
+/// a heading or link, find-references should return None.
+#[tokio::test]
+async fn test_find_references_fallback_no_references() {
+    use crate::workspace_index::FileIndex;
+
+    let server = create_test_server();
+
+    let file = test_temp_path("rumdl-nav-test-fallback2/docs/lonely.md");
+    let uri = Url::from_file_path(&file).unwrap();
+
+    let content = "Some text without anything special.\n";
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+        let fi = FileIndex::default();
+        index.insert_file(file.clone(), fi);
+    }
+
+    let position = Position { line: 0, character: 5 };
+
+    let result = server.handle_references(&uri, position).await;
+    assert!(result.is_none(), "Should return None when no references exist");
+}
+
+/// When multiple files link to the same target, the fallback should return all of them.
+#[tokio::test]
+async fn test_find_references_fallback_multiple_sources() {
+    use crate::workspace_index::{CrossFileLinkIndex, FileIndex, LinkOrigin};
+
+    let server = create_test_server();
+
+    let docs_dir = test_temp_path("rumdl-nav-test-fallback3/docs");
+    let target_file = docs_dir.join("target.md");
+    let source_a = docs_dir.join("a.md");
+    let source_b = docs_dir.join("b.md");
+    let source_c = docs_dir.join("c.md");
+
+    let target_uri = Url::from_file_path(&target_file).unwrap();
+
+    let content = "This file is referenced by multiple others.\n";
+    server.documents.write().await.insert(
+        target_uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+
+        let target_fi = FileIndex::default();
+        index.insert_file(target_file.clone(), target_fi);
+
+        // Three files link to target.md with various fragments
+        for (source, fragment, line) in [(&source_a, "", 2), (&source_b, "section", 5), (&source_c, "", 10)] {
+            let mut fi = FileIndex::default();
+            fi.cross_file_links.push(CrossFileLinkIndex {
+                target_path: "target.md".to_string(),
+                fragment: fragment.to_string(),
+                line,
+                column: 1,
+                origin: LinkOrigin::Body,
+            });
+            index.insert_file(source.clone(), fi);
+        }
+    }
+
+    // Cursor not on heading or link
+    let position = Position { line: 0, character: 5 };
+
+    let result = server.handle_references(&target_uri, position).await;
+    assert!(result.is_some(), "Should find references from multiple files");
+
+    let locations = result.unwrap();
+    assert_eq!(
+        locations.len(),
+        3,
+        "Should find all 3 references regardless of fragment"
+    );
+
+    let uris: std::collections::HashSet<_> = locations.iter().map(|l| l.uri.clone()).collect();
+    assert!(uris.contains(&Url::from_file_path(&source_a).unwrap()));
+    assert!(uris.contains(&Url::from_file_path(&source_b).unwrap()));
+    assert!(uris.contains(&Url::from_file_path(&source_c).unwrap()));
+}
+
+/// When cursor is on a heading, heading-specific references take priority over
+/// the file-level fallback (ensuring the heading path still works correctly).
+#[tokio::test]
+async fn test_find_references_heading_takes_priority_over_fallback() {
+    use crate::workspace_index::{CrossFileLinkIndex, FileIndex, HeadingIndex, LinkOrigin};
+
+    let server = create_test_server();
+
+    let docs_dir = test_temp_path("rumdl-nav-test-fallback4/docs");
+    let target_file = docs_dir.join("guide.md");
+    let source_with_anchor = docs_dir.join("a.md");
+    let source_without_anchor = docs_dir.join("b.md");
+
+    let target_uri = Url::from_file_path(&target_file).unwrap();
+
+    let content = "# Installation\n\nHow to install.\n";
+    server.documents.write().await.insert(
+        target_uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+
+        let mut target_fi = FileIndex::default();
+        target_fi.add_heading(HeadingIndex {
+            text: "Installation".to_string(),
+            auto_anchor: "installation".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        index.insert_file(target_file.clone(), target_fi);
+
+        // Source A links to guide.md#installation (matches heading anchor)
+        let mut fi_a = FileIndex::default();
+        fi_a.cross_file_links.push(CrossFileLinkIndex {
+            target_path: "guide.md".to_string(),
+            fragment: "installation".to_string(),
+            line: 3,
+            column: 5,
+            origin: LinkOrigin::Body,
+        });
+        index.insert_file(source_with_anchor.clone(), fi_a);
+
+        // Source B links to guide.md (no anchor - only visible in file-level fallback)
+        let mut fi_b = FileIndex::default();
+        fi_b.cross_file_links.push(CrossFileLinkIndex {
+            target_path: "guide.md".to_string(),
+            fragment: "".to_string(),
+            line: 7,
+            column: 10,
+            origin: LinkOrigin::Body,
+        });
+        index.insert_file(source_without_anchor.clone(), fi_b);
+    }
+
+    // Cursor on heading - should only find anchor-specific references
+    let position = Position { line: 0, character: 5 };
+
+    let result = server.handle_references(&target_uri, position).await;
+    assert!(result.is_some(), "Should find heading-specific references");
+
+    let locations = result.unwrap();
+    assert_eq!(
+        locations.len(),
+        1,
+        "Should only find anchor-matching reference, not file-level"
+    );
+    assert_eq!(
+        locations[0].uri,
+        Url::from_file_path(&source_with_anchor).unwrap(),
+        "Should find the anchor-specific reference"
+    );
+}
+
+// =============================================================================
+// Hover preview tests
+// =============================================================================
+
+#[tokio::test]
+async fn test_hover_inline_link_to_file() {
+    use crate::workspace_index::{FileIndex, HeadingIndex};
+
+    let server = create_test_server();
+
+    let docs_dir = test_temp_path("rumdl-hover-test1/docs");
+    let current_file = docs_dir.join("index.md");
+    let target_file = docs_dir.join("guide.md");
+
+    let current_uri = Url::from_file_path(&current_file).unwrap();
+    let target_uri = Url::from_file_path(&target_file).unwrap();
+
+    let content = "# Index\n\nSee [the guide](guide.md) for details.\n";
+    server.documents.write().await.insert(
+        current_uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    // Add target file content to document cache
+    let target_content = "# Guide\n\nThis is the guide.\n\nIt has multiple lines.\n";
+    server.documents.write().await.insert(
+        target_uri.clone(),
+        DocumentEntry {
+            content: target_content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    // Populate workspace index
+    {
+        let mut index = server.workspace_index.write().await;
+        let mut fi = FileIndex::default();
+        fi.add_heading(HeadingIndex {
+            text: "Guide".to_string(),
+            auto_anchor: "guide".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        index.insert_file(target_file.clone(), fi);
+    }
+
+    // Cursor on "guide.md" in `](guide.md)`
+    let position = Position { line: 2, character: 20 };
+
+    let result = server.handle_hover(&current_uri, position).await;
+    assert!(result.is_some(), "Should return hover for file link");
+
+    let hover = result.unwrap();
+    if let HoverContents::Markup(markup) = hover.contents {
+        assert!(markup.value.contains("guide.md"), "Should contain filename");
+        assert!(
+            markup.value.contains("This is the guide"),
+            "Should contain file content"
+        );
+    } else {
+        panic!("Expected Markup hover contents");
+    }
+}
+
+#[tokio::test]
+async fn test_hover_buffer_uri_resolves_via_workspace_root() {
+    // Issue #647: links in unsaved buffers (non-file:// URIs like `buffer:647`)
+    // must still resolve their hover preview, using the first workspace root as
+    // the base directory for relative link targets.
+    let server = create_test_server();
+
+    let workspace = test_temp_path("rumdl-hover-buffer/proj");
+    let target_file = workspace.join("results.md");
+    let target_uri = Url::from_file_path(&target_file).unwrap();
+
+    // Unsaved buffer: a non-file URI with no on-disk path.
+    let buffer_uri = Url::parse("buffer:647").unwrap();
+    let content = "# Notes\n\nSee [results](results.md) for details.\n";
+    server.documents.write().await.insert(
+        buffer_uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    let target_content = "# Results\n\nThe results are good.\n";
+    server.documents.write().await.insert(
+        target_uri.clone(),
+        DocumentEntry {
+            content: target_content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    // Clients like Sublime/VS Code send rootUri/workspaceFolders on initialize.
+    server.workspace_roots.write().await.push(workspace.clone());
+
+    // Cursor on "results.md" inside `](results.md)`
+    let position = Position { line: 2, character: 17 };
+
+    let result = server.handle_hover(&buffer_uri, position).await;
+    assert!(
+        result.is_some(),
+        "Hover on a buffer-URI link should resolve via the workspace root"
+    );
+    if let HoverContents::Markup(markup) = result.unwrap().contents {
+        assert!(
+            markup.value.contains("results.md"),
+            "preview should name the target file: {}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("The results are good"),
+            "preview should include target content: {}",
+            markup.value
+        );
+    } else {
+        panic!("Expected Markup hover contents");
+    }
+}
+
+#[tokio::test]
+async fn test_hover_buffer_uri_without_workspace_root_returns_none() {
+    // Without any workspace root there is no base directory to resolve a relative
+    // link against, so hover degrades gracefully to None (same as before the fix).
+    let server = create_test_server();
+
+    let buffer_uri = Url::parse("buffer:647").unwrap();
+    let content = "See [x](results.md) here.\n";
+    server.documents.write().await.insert(
+        buffer_uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    let position = Position { line: 0, character: 10 };
+    let result = server.handle_hover(&buffer_uri, position).await;
+    assert!(
+        result.is_none(),
+        "A buffer link with no workspace root has no base dir to resolve against"
+    );
+}
+
+#[tokio::test]
+async fn test_hover_non_markdown_file_preview_is_fenced() {
+    // Issue #648: a preview of a non-markdown file is wrapped in a fenced code
+    // block tagged with a language derived from the extension, so editors can
+    // syntax-highlight it.
+    let server = create_test_server();
+
+    let dir = test_temp_path("rumdl-hover-fence/proj");
+    let current_file = dir.join("index.md");
+    let target_file = dir.join("source.py");
+    let current_uri = Url::from_file_path(&current_file).unwrap();
+    let target_uri = Url::from_file_path(&target_file).unwrap();
+
+    let content = "See [src](source.py) here.\n";
+    server.documents.write().await.insert(
+        current_uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    let target_content = "import os\n\ndef main():\n    pass\n";
+    server.documents.write().await.insert(
+        target_uri.clone(),
+        DocumentEntry {
+            content: target_content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    // Cursor on "source.py"
+    let position = Position { line: 0, character: 13 };
+    let result = server.handle_hover(&current_uri, position).await;
+    assert!(result.is_some(), "Should return a hover preview for the file link");
+    if let HoverContents::Markup(markup) = result.unwrap().contents {
+        assert!(
+            markup.value.contains("```python"),
+            "non-markdown preview should open a python code fence: {}",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("import os"),
+            "preview should include the file content: {}",
+            markup.value
+        );
+    } else {
+        panic!("Expected Markup hover contents");
+    }
+}
+
+#[tokio::test]
+async fn test_hover_markdown_file_preview_not_fenced() {
+    // A markdown target keeps rendering as markdown (no code fence), so headings
+    // and emphasis in the preview render natively.
+    let server = create_test_server();
+
+    let dir = test_temp_path("rumdl-hover-md/proj");
+    let current_file = dir.join("index.md");
+    let target_file = dir.join("guide.md");
+    let current_uri = Url::from_file_path(&current_file).unwrap();
+    let target_uri = Url::from_file_path(&target_file).unwrap();
+
+    let content = "See [g](guide.md) here.\n";
+    server.documents.write().await.insert(
+        current_uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    let target_content = "# Guide\n\nSome plain text.\n";
+    server.documents.write().await.insert(
+        target_uri.clone(),
+        DocumentEntry {
+            content: target_content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    // Cursor on "guide.md"
+    let position = Position { line: 0, character: 12 };
+    let result = server.handle_hover(&current_uri, position).await.unwrap();
+    if let HoverContents::Markup(markup) = result.contents {
+        assert!(
+            !markup.value.contains("```"),
+            "markdown preview must not be code-fenced: {}",
+            markup.value
+        );
+        assert!(markup.value.contains("# Guide"), "preview should include the heading");
+    } else {
+        panic!("Expected Markup hover contents");
+    }
+}
+
+// Helper: insert current + target documents and return the configured server.
+async fn setup_line_anchor_hover(link_line: &str, target_content: &str) -> (RumdlLanguageServer, Url) {
+    let server = create_test_server();
+    let dir = test_temp_path("rumdl-hover-lineanchor/proj");
+    let current_file = dir.join("index.md");
+    let target_file = dir.join("sample.py");
+    let current_uri = Url::from_file_path(&current_file).unwrap();
+    let target_uri = Url::from_file_path(&target_file).unwrap();
+
+    server.documents.write().await.insert(
+        current_uri.clone(),
+        DocumentEntry {
+            content: format!("{link_line}\n"),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+    server.documents.write().await.insert(
+        target_uri,
+        DocumentEntry {
+            content: target_content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+    (server, current_uri)
+}
+
+#[tokio::test]
+async fn test_hover_single_line_anchor() {
+    // Issue #648: `#L12` shows the target line with five lines of context on each
+    // side (lines 7-17), fenced with a language hint.
+    let rows = (1..=20).map(|n| format!("row {n:02}")).collect::<Vec<_>>().join("\n") + "\n";
+    let (server, uri) = setup_line_anchor_hover("See [code](sample.py#L12) here.", &rows).await;
+
+    let position = Position { line: 0, character: 18 };
+    let result = server.handle_hover(&uri, position).await.unwrap();
+    if let HoverContents::Markup(markup) = result.contents {
+        let v = &markup.value;
+        assert!(v.contains("```python"), "line preview should be fenced: {v}");
+        assert!(v.contains("row 07"), "should include 5 lines above (line 7): {v}");
+        assert!(v.contains("row 12"), "should include the target line: {v}");
+        assert!(v.contains("row 17"), "should include 5 lines below (line 17): {v}");
+        assert!(!v.contains("row 06"), "should not include line 6: {v}");
+        assert!(!v.contains("row 18"), "should not include line 18: {v}");
+    } else {
+        panic!("Expected Markup hover contents");
+    }
+}
+
+#[tokio::test]
+async fn test_hover_line_range_anchor() {
+    // `#L5-L8` shows exactly that line range.
+    let rows = (1..=20).map(|n| format!("row {n:02}")).collect::<Vec<_>>().join("\n") + "\n";
+    let (server, uri) = setup_line_anchor_hover("See [code](sample.py#L5-L8) here.", &rows).await;
+
+    let position = Position { line: 0, character: 18 };
+    let result = server.handle_hover(&uri, position).await.unwrap();
+    if let HoverContents::Markup(markup) = result.contents {
+        let v = &markup.value;
+        assert!(v.contains("row 05"), "range should include line 5: {v}");
+        assert!(v.contains("row 08"), "range should include line 8: {v}");
+        assert!(!v.contains("row 04"), "range should not include line 4: {v}");
+        assert!(!v.contains("row 09"), "range should not include line 9: {v}");
+    } else {
+        panic!("Expected Markup hover contents");
+    }
+}
+
+#[tokio::test]
+async fn test_hover_line_anchor_out_of_range() {
+    // A line number past EOF returns a graceful note rather than nothing.
+    let (server, uri) = setup_line_anchor_hover("See [c](sample.py#L99) here.", "one\ntwo\nthree\n").await;
+
+    let position = Position { line: 0, character: 16 };
+    let result = server.handle_hover(&uri, position).await;
+    assert!(result.is_some(), "out-of-range line anchor should still return a hover");
+    if let HoverContents::Markup(markup) = result.unwrap().contents {
+        assert!(
+            markup.value.contains("99"),
+            "note should mention the requested line: {}",
+            markup.value
+        );
+    } else {
+        panic!("Expected Markup hover contents");
+    }
+}
+
+#[tokio::test]
+async fn test_goto_definition_single_line_anchor() {
+    // Issue #738: `#L12` must navigate to line 12 (0-indexed 11), not line 1.
+    let rows = (1..=20).map(|n| format!("row {n:02}")).collect::<Vec<_>>().join("\n") + "\n";
+    let (server, uri) = setup_line_anchor_hover("See [code](sample.py#L12) here.", &rows).await;
+
+    let position = Position { line: 0, character: 18 };
+    let result = server.handle_goto_definition(&uri, position).await;
+    if let Some(GotoDefinitionResponse::Scalar(location)) = result {
+        assert!(location.uri.path().ends_with("sample.py"));
+        assert_eq!(location.range.start.line, 11, "#L12 should land on 0-indexed line 11");
+    } else {
+        panic!("Expected Scalar goto-definition response for a line anchor");
+    }
+}
+
+#[tokio::test]
+async fn test_goto_definition_line_range_anchor() {
+    // `#L5-L8` navigates to the start of the range.
+    let rows = (1..=20).map(|n| format!("row {n:02}")).collect::<Vec<_>>().join("\n") + "\n";
+    let (server, uri) = setup_line_anchor_hover("See [code](sample.py#L5-L8) here.", &rows).await;
+
+    let position = Position { line: 0, character: 18 };
+    let result = server.handle_goto_definition(&uri, position).await;
+    if let Some(GotoDefinitionResponse::Scalar(location)) = result {
+        assert_eq!(location.range.start.line, 4, "#L5-L8 should land on 0-indexed line 4");
+    } else {
+        panic!("Expected Scalar goto-definition response for a line-range anchor");
+    }
+}
+
+#[tokio::test]
+async fn test_goto_definition_lowercase_line_anchor() {
+    // The line-anchor parser is case-insensitive; goto definition must agree.
+    let rows = (1..=20).map(|n| format!("row {n:02}")).collect::<Vec<_>>().join("\n") + "\n";
+    let (server, uri) = setup_line_anchor_hover("See [code](sample.py#l7) here.", &rows).await;
+
+    let position = Position { line: 0, character: 17 };
+    let result = server.handle_goto_definition(&uri, position).await;
+    if let Some(GotoDefinitionResponse::Scalar(location)) = result {
+        assert_eq!(location.range.start.line, 6, "#l7 should land on 0-indexed line 6");
+    } else {
+        panic!("Expected Scalar goto-definition response for a lowercase line anchor");
+    }
+}
+
+#[tokio::test]
+async fn test_hover_inline_link_with_anchor() {
+    use crate::workspace_index::{FileIndex, HeadingIndex};
+
+    let server = create_test_server();
+
+    let docs_dir = test_temp_path("rumdl-hover-test2/docs");
+    let current_file = docs_dir.join("index.md");
+    let target_file = docs_dir.join("guide.md");
+
+    let current_uri = Url::from_file_path(&current_file).unwrap();
+    let target_uri = Url::from_file_path(&target_file).unwrap();
+
+    let content = "# Index\n\nSee [install](guide.md#installation) here.\n";
+    server.documents.write().await.insert(
+        current_uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    let target_content = "# Guide\n\nIntro text.\n\n## Installation\n\nRun `cargo install rumdl`.\n\nThen configure.\n\n## Usage\n\nRun it.\n";
+    server.documents.write().await.insert(
+        target_uri.clone(),
+        DocumentEntry {
+            content: target_content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+        let mut fi = FileIndex::default();
+        fi.add_heading(HeadingIndex {
+            text: "Guide".to_string(),
+            auto_anchor: "guide".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        fi.add_heading(HeadingIndex {
+            text: "Installation".to_string(),
+            auto_anchor: "installation".to_string(),
+            custom_anchor: None,
+            line: 5,
+            is_setext: false,
+        });
+        fi.add_heading(HeadingIndex {
+            text: "Usage".to_string(),
+            auto_anchor: "usage".to_string(),
+            custom_anchor: None,
+            line: 11,
+            is_setext: false,
+        });
+        index.insert_file(target_file.clone(), fi);
+    }
+
+    // Cursor on the link target
+    let position = Position { line: 2, character: 18 };
+
+    let result = server.handle_hover(&current_uri, position).await;
+    assert!(result.is_some(), "Should return hover for anchor link");
+
+    let hover = result.unwrap();
+    if let HoverContents::Markup(markup) = hover.contents {
+        assert!(
+            markup.value.contains("## Installation"),
+            "Should contain the heading: got '{}'",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("cargo install rumdl"),
+            "Should contain section content"
+        );
+        // Should NOT contain the next heading's content
+        assert!(
+            !markup.value.contains("## Usage"),
+            "Should stop at next heading of equal level"
+        );
+    } else {
+        panic!("Expected Markup hover contents");
+    }
+}
+
+#[tokio::test]
+async fn test_hover_reference_style_link() {
+    use crate::workspace_index::{FileIndex, HeadingIndex};
+
+    let server = create_test_server();
+
+    let docs_dir = test_temp_path("rumdl-hover-test3/docs");
+    let current_file = docs_dir.join("readme.md");
+    let target_file = docs_dir.join("guide.md");
+
+    let current_uri = Url::from_file_path(&current_file).unwrap();
+    let target_uri = Url::from_file_path(&target_file).unwrap();
+
+    let content = "See [the guide][guide] for details.\n\n[guide]: guide.md\n";
+    server.documents.write().await.insert(
+        current_uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    let target_content = "# Guide\n\nWelcome to the guide.\n";
+    server.documents.write().await.insert(
+        target_uri.clone(),
+        DocumentEntry {
+            content: target_content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+        let mut fi = FileIndex::default();
+        fi.add_heading(HeadingIndex {
+            text: "Guide".to_string(),
+            auto_anchor: "guide".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        index.insert_file(target_file.clone(), fi);
+    }
+
+    // Cursor on "the guide" in [the guide][guide]
+    let position = Position { line: 0, character: 8 };
+
+    let result = server.handle_hover(&current_uri, position).await;
+    assert!(result.is_some(), "Should return hover for reference-style link");
+
+    let hover = result.unwrap();
+    if let HoverContents::Markup(markup) = hover.contents {
+        assert!(markup.value.contains("guide.md"), "Should contain filename");
+        assert!(
+            markup.value.contains("Welcome to the guide"),
+            "Should contain file content"
+        );
+    } else {
+        panic!("Expected Markup hover contents");
+    }
+}
+
+#[tokio::test]
+async fn test_hover_external_url() {
+    let server = create_test_server();
+
+    let file = test_temp_path("rumdl-hover-test4/readme.md");
+    let uri = Url::from_file_path(&file).unwrap();
+
+    let content = "Visit [example](https://example.com) for more.\n";
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    // Cursor on "https://example.com"
+    let position = Position { line: 0, character: 18 };
+
+    let result = server.handle_hover(&uri, position).await;
+    assert!(result.is_some(), "Should return hover for external URL");
+
+    let hover = result.unwrap();
+    if let HoverContents::Markup(markup) = hover.contents {
+        assert!(markup.value.contains("https://example.com"), "Should show the URL");
+        assert!(markup.value.contains("External link"), "Should indicate it's external");
+    } else {
+        panic!("Expected Markup hover contents");
+    }
+}
+
+#[tokio::test]
+async fn test_hover_plain_text_returns_none() {
+    let server = create_test_server();
+
+    let file = test_temp_path("rumdl-hover-test5/readme.md");
+    let uri = Url::from_file_path(&file).unwrap();
+
+    let content = "Just some plain text here.\n";
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    // Cursor on plain text
+    let position = Position { line: 0, character: 5 };
+
+    let result = server.handle_hover(&uri, position).await;
+    assert!(result.is_none(), "Should return None when cursor is not on a link");
+}
+
+#[tokio::test]
+async fn test_hover_nonexistent_file_returns_none() {
+    let server = create_test_server();
+
+    let file = test_temp_path("rumdl-hover-test6/readme.md");
+    let uri = Url::from_file_path(&file).unwrap();
+
+    let content = "See [missing](nonexistent.md) file.\n";
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    // Cursor on the link target
+    let position = Position { line: 0, character: 18 };
+
+    let result = server.handle_hover(&uri, position).await;
+    assert!(result.is_none(), "Should return None for link to nonexistent file");
+}
+
+#[tokio::test]
+async fn test_hover_same_file_anchor() {
+    use crate::workspace_index::{FileIndex, HeadingIndex};
+
+    let server = create_test_server();
+
+    let file = test_temp_path("rumdl-hover-test7/readme.md");
+    let uri = Url::from_file_path(&file).unwrap();
+
+    let content = "# Title\n\nSee [below](#configuration) for config.\n\nSome text.\n\n## Configuration\n\nSet `key = value` in config.\n\nMore config details.\n";
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+        let mut fi = FileIndex::default();
+        fi.add_heading(HeadingIndex {
+            text: "Title".to_string(),
+            auto_anchor: "title".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        fi.add_heading(HeadingIndex {
+            text: "Configuration".to_string(),
+            auto_anchor: "configuration".to_string(),
+            custom_anchor: None,
+            line: 7,
+            is_setext: false,
+        });
+        index.insert_file(file.clone(), fi);
+    }
+
+    // Cursor on "#configuration" in `](#configuration)`
+    let position = Position { line: 2, character: 16 };
+
+    let result = server.handle_hover(&uri, position).await;
+    assert!(result.is_some(), "Should return hover for same-file anchor");
+
+    let hover = result.unwrap();
+    if let HoverContents::Markup(markup) = hover.contents {
+        assert!(markup.value.contains("## Configuration"), "Should contain the heading");
+        assert!(markup.value.contains("key = value"), "Should contain section content");
+    } else {
+        panic!("Expected Markup hover contents");
+    }
+}
+
+#[tokio::test]
+async fn test_hover_file_preview_truncates() {
+    use crate::workspace_index::FileIndex;
+
+    let server = create_test_server();
+
+    let docs_dir = test_temp_path("rumdl-hover-test8/docs");
+    let current_file = docs_dir.join("index.md");
+    let target_file = docs_dir.join("long.md");
+
+    let current_uri = Url::from_file_path(&current_file).unwrap();
+    let target_uri = Url::from_file_path(&target_file).unwrap();
+
+    let content = "See [long file](long.md) here.\n";
+    server.documents.write().await.insert(
+        current_uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    // Create a target file with more than 15 lines
+    let long_content: String = (1..=30).fold(String::new(), |mut acc, i| {
+        use std::fmt::Write;
+        let _ = writeln!(acc, "Line {i}");
+        acc
+    });
+    server.documents.write().await.insert(
+        target_uri.clone(),
+        DocumentEntry {
+            content: long_content.clone(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+        index.insert_file(target_file.clone(), FileIndex::default());
+    }
+
+    let position = Position { line: 0, character: 18 };
+
+    let result = server.handle_hover(&current_uri, position).await;
+    assert!(result.is_some(), "Should return hover for long file");
+
+    let hover = result.unwrap();
+    if let HoverContents::Markup(markup) = hover.contents {
+        assert!(markup.value.contains("Line 1"), "Should contain first line");
+        assert!(markup.value.contains("Line 15"), "Should contain line 15");
+        assert!(!markup.value.contains("Line 16"), "Should not contain line 16");
+        assert!(markup.value.contains("..."), "Should indicate truncation");
+    } else {
+        panic!("Expected Markup hover contents");
+    }
+}
+
+#[tokio::test]
+async fn test_hover_anchor_section_end_no_ellipsis() {
+    use crate::workspace_index::{FileIndex, HeadingIndex};
+
+    let server = create_test_server();
+
+    let docs_dir = test_temp_path("rumdl-hover-test9/docs");
+    let current_file = docs_dir.join("index.md");
+    let target_file = docs_dir.join("guide.md");
+
+    let current_uri = Url::from_file_path(&current_file).unwrap();
+    let target_uri = Url::from_file_path(&target_file).unwrap();
+
+    let content = "See [install](guide.md#install) here.\n";
+    server.documents.write().await.insert(
+        current_uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    // Target has two sections — "Install" is short, "Usage" follows
+    let target_content = "# Guide\n\n## Install\n\nRun `cargo install`.\n\n## Usage\n\nRun the binary.\n\nMore usage info.\n\nEven more.\n\nAnd more.\n\nAnd more.\n\nAnd more.\n\nAnd more.\n\nAnd more.\n\nAnd more.\n\nAnd more.\n\nAnd more.\n";
+    server.documents.write().await.insert(
+        target_uri.clone(),
+        DocumentEntry {
+            content: target_content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+        let mut fi = FileIndex::default();
+        fi.add_heading(HeadingIndex {
+            text: "Guide".to_string(),
+            auto_anchor: "guide".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        fi.add_heading(HeadingIndex {
+            text: "Install".to_string(),
+            auto_anchor: "install".to_string(),
+            custom_anchor: None,
+            line: 3,
+            is_setext: false,
+        });
+        fi.add_heading(HeadingIndex {
+            text: "Usage".to_string(),
+            auto_anchor: "usage".to_string(),
+            custom_anchor: None,
+            line: 7,
+            is_setext: false,
+        });
+        index.insert_file(target_file.clone(), fi);
+    }
+
+    let position = Position { line: 0, character: 18 };
+
+    let result = server.handle_hover(&current_uri, position).await;
+    assert!(result.is_some(), "Should return hover for anchor link");
+
+    let hover = result.unwrap();
+    if let HoverContents::Markup(markup) = hover.contents {
+        assert!(markup.value.contains("## Install"), "Should contain the heading");
+        assert!(markup.value.contains("cargo install"), "Should contain section content");
+        assert!(!markup.value.contains("## Usage"), "Should stop at next heading");
+        assert!(
+            !markup.value.contains("..."),
+            "Should NOT show ellipsis when section ended at heading boundary"
+        );
+    } else {
+        panic!("Expected Markup hover contents");
+    }
+}
+
+#[tokio::test]
+async fn test_hover_anchor_preview_skips_code_block_hashes() {
+    use crate::workspace_index::{FileIndex, HeadingIndex};
+
+    let server = create_test_server();
+
+    let docs_dir = test_temp_path("rumdl-hover-test10/docs");
+    let current_file = docs_dir.join("index.md");
+    let target_file = docs_dir.join("guide.md");
+
+    let current_uri = Url::from_file_path(&current_file).unwrap();
+    let target_uri = Url::from_file_path(&target_file).unwrap();
+
+    let content = "See [config](guide.md#configuration) here.\n";
+    server.documents.write().await.insert(
+        current_uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    // Target has a code block with `# comment` that looks like a heading
+    let target_content = "## Configuration\n\nExample:\n\n```python\n# This is a Python comment\nconfig = True\n```\n\nMore config info.\n";
+    server.documents.write().await.insert(
+        target_uri.clone(),
+        DocumentEntry {
+            content: target_content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+        let mut fi = FileIndex::default();
+        fi.add_heading(HeadingIndex {
+            text: "Configuration".to_string(),
+            auto_anchor: "configuration".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        index.insert_file(target_file.clone(), fi);
+    }
+
+    let position = Position { line: 0, character: 18 };
+
+    let result = server.handle_hover(&current_uri, position).await;
+    assert!(result.is_some(), "Should return hover");
+
+    let hover = result.unwrap();
+    if let HoverContents::Markup(markup) = hover.contents {
+        assert!(
+            markup.value.contains("# This is a Python comment"),
+            "Should include code block content (not treat # as heading): got '{}'",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("More config info"),
+            "Should include content after code block"
+        );
+    } else {
+        panic!("Expected Markup hover contents");
+    }
+}
+
+#[tokio::test]
+async fn test_hover_empty_file() {
+    use crate::workspace_index::FileIndex;
+
+    let server = create_test_server();
+
+    let docs_dir = test_temp_path("rumdl-hover-test11/docs");
+    let current_file = docs_dir.join("index.md");
+    let target_file = docs_dir.join("empty.md");
+
+    let current_uri = Url::from_file_path(&current_file).unwrap();
+    let target_uri = Url::from_file_path(&target_file).unwrap();
+
+    let content = "See [empty](empty.md) here.\n";
+    server.documents.write().await.insert(
+        current_uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    // Empty target file
+    server.documents.write().await.insert(
+        target_uri.clone(),
+        DocumentEntry {
+            content: String::new(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+        index.insert_file(target_file.clone(), FileIndex::default());
+    }
+
+    let position = Position { line: 0, character: 15 };
+
+    let result = server.handle_hover(&current_uri, position).await;
+    assert!(result.is_some(), "Should return hover even for empty file");
+
+    let hover = result.unwrap();
+    if let HoverContents::Markup(markup) = hover.contents {
+        assert!(markup.value.contains("empty.md"), "Should show filename");
+    } else {
+        panic!("Expected Markup hover contents");
+    }
+}
+
+#[tokio::test]
+async fn test_hover_anchor_does_not_stop_at_hashtag_word() {
+    use crate::workspace_index::{FileIndex, HeadingIndex};
+
+    let server = create_test_server();
+
+    let docs_dir = test_temp_path("rumdl-hover-test12/docs");
+    let current_file = docs_dir.join("index.md");
+    let target_file = docs_dir.join("guide.md");
+
+    let current_uri = Url::from_file_path(&current_file).unwrap();
+    let target_uri = Url::from_file_path(&target_file).unwrap();
+
+    let content = "See [tags](guide.md#tags) here.\n";
+    server.documents.write().await.insert(
+        current_uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    // Target has "#hashtag" words that are NOT headings (no space after #)
+    let target_content = "## Tags\n\nUse #markdown and #linting tags.\n\nThey help organize.\n";
+    server.documents.write().await.insert(
+        target_uri.clone(),
+        DocumentEntry {
+            content: target_content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+        let mut fi = FileIndex::default();
+        fi.add_heading(HeadingIndex {
+            text: "Tags".to_string(),
+            auto_anchor: "tags".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        index.insert_file(target_file.clone(), fi);
+    }
+
+    let position = Position { line: 0, character: 15 };
+
+    let result = server.handle_hover(&current_uri, position).await;
+    assert!(result.is_some(), "Should return hover");
+
+    let hover = result.unwrap();
+    if let HoverContents::Markup(markup) = hover.contents {
+        assert!(
+            markup.value.contains("#markdown"),
+            "Should NOT treat #hashtag as a heading and stop: got '{}'",
+            markup.value
+        );
+        assert!(
+            markup.value.contains("They help organize"),
+            "Should include content after hashtag line"
+        );
+    } else {
+        panic!("Expected Markup hover contents");
+    }
+}
+
+#[tokio::test]
+async fn test_hover_anchor_stops_at_indented_heading() {
+    use crate::workspace_index::{FileIndex, HeadingIndex};
+
+    let server = create_test_server();
+
+    let docs_dir = test_temp_path("rumdl-hover-test13/docs");
+    let current_file = docs_dir.join("index.md");
+    let target_file = docs_dir.join("guide.md");
+
+    let current_uri = Url::from_file_path(&current_file).unwrap();
+    let target_uri = Url::from_file_path(&target_file).unwrap();
+
+    let content = "See [intro](guide.md#intro) here.\n";
+    server.documents.write().await.insert(
+        current_uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    // CommonMark allows up to 3 spaces of indentation for ATX headings
+    let target_content = "## Intro\n\nSome intro text.\n\n  ## Next Section\n\nNext content.\n";
+    server.documents.write().await.insert(
+        target_uri.clone(),
+        DocumentEntry {
+            content: target_content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+        let mut fi = FileIndex::default();
+        fi.add_heading(HeadingIndex {
+            text: "Intro".to_string(),
+            auto_anchor: "intro".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        fi.add_heading(HeadingIndex {
+            text: "Next Section".to_string(),
+            auto_anchor: "next-section".to_string(),
+            custom_anchor: None,
+            line: 5,
+            is_setext: false,
+        });
+        index.insert_file(target_file.clone(), fi);
+    }
+
+    let position = Position { line: 0, character: 15 };
+
+    let result = server.handle_hover(&current_uri, position).await;
+    assert!(result.is_some(), "Should return hover");
+
+    let hover = result.unwrap();
+    if let HoverContents::Markup(markup) = hover.contents {
+        assert!(markup.value.contains("Some intro text"), "Should contain intro content");
+        assert!(
+            !markup.value.contains("Next Section"),
+            "Should stop at indented heading of same level"
+        );
+    } else {
+        panic!("Expected Markup hover contents");
+    }
+}
+
+// =========================================================================
+// Rename support tests
+// =========================================================================
+
+#[tokio::test]
+async fn test_prepare_rename_atx_heading() {
+    use crate::workspace_index::{FileIndex, HeadingIndex};
+
+    let server = create_test_server();
+    let file = test_temp_path("rumdl-rename-test1/doc.md");
+    let uri = Url::from_file_path(&file).unwrap();
+
+    let content = "## Installation Guide\n\nSome content.\n";
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+        let mut fi = FileIndex::default();
+        fi.add_heading(HeadingIndex {
+            text: "Installation Guide".to_string(),
+            auto_anchor: "installation-guide".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        index.insert_file(file.clone(), fi);
+    }
+
+    let position = Position { line: 0, character: 5 };
+    let result = server.handle_prepare_rename(&uri, position).await;
+    assert!(result.is_some(), "Should allow renaming ATX heading");
+
+    if let Some(PrepareRenameResponse::Range(range)) = result {
+        // Should cover "Installation Guide" (after "## ")
+        assert_eq!(range.start.line, 0);
+        assert_eq!(range.start.character, 3); // after "## "
+        assert_eq!(range.end.character, 21); // end of "Installation Guide"
+    } else {
+        panic!("Expected Range response");
+    }
+}
+
+#[tokio::test]
+async fn test_prepare_rename_setext_heading() {
+    use crate::workspace_index::{FileIndex, HeadingIndex};
+
+    let server = create_test_server();
+    let file = test_temp_path("rumdl-rename-test2/doc.md");
+    let uri = Url::from_file_path(&file).unwrap();
+
+    let content = "Installation Guide\n==================\n\nContent.\n";
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+        let mut fi = FileIndex::default();
+        fi.add_heading(HeadingIndex {
+            text: "Installation Guide".to_string(),
+            auto_anchor: "installation-guide".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: true,
+        });
+        index.insert_file(file.clone(), fi);
+    }
+
+    let position = Position { line: 0, character: 5 };
+    let result = server.handle_prepare_rename(&uri, position).await;
+    assert!(result.is_some(), "Should allow renaming Setext heading");
+
+    if let Some(PrepareRenameResponse::Range(range)) = result {
+        assert_eq!(range.start.line, 0);
+        assert_eq!(range.start.character, 0);
+        assert_eq!(range.end.character, 18); // "Installation Guide"
+    } else {
+        panic!("Expected Range response");
+    }
+}
+
+#[tokio::test]
+async fn test_prepare_rename_not_heading() {
+    let server = create_test_server();
+    let file = test_temp_path("rumdl-rename-test3/doc.md");
+    let uri = Url::from_file_path(&file).unwrap();
+
+    let content = "Just some text here.\n";
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    let position = Position { line: 0, character: 5 };
+    let result = server.handle_prepare_rename(&uri, position).await;
+    assert!(result.is_none(), "Should not allow renaming non-heading text");
+}
+
+#[tokio::test]
+async fn test_rename_heading_updates_same_file_links() {
+    use crate::workspace_index::{FileIndex, HeadingIndex};
+
+    let server = create_test_server();
+    let file = test_temp_path("rumdl-rename-test4/doc.md");
+    let uri = Url::from_file_path(&file).unwrap();
+
+    let content =
+        "## Getting Started\n\nSee [below](#getting-started) for details.\n\nMore [info](#getting-started).\n";
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+        let mut fi = FileIndex::default();
+        fi.add_heading(HeadingIndex {
+            text: "Getting Started".to_string(),
+            auto_anchor: "getting-started".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        index.insert_file(file.clone(), fi);
+    }
+
+    let position = Position { line: 0, character: 5 };
+    let result = server.handle_rename(&uri, position, "Quick Start").await;
+    assert!(result.is_some(), "Should produce a workspace edit");
+
+    let edit = result.unwrap();
+    let changes = edit.changes.unwrap();
+    let edits = changes.get(&uri).expect("Should have edits for the document");
+
+    // 1 heading rename + 2 link anchor updates
+    assert_eq!(edits.len(), 3, "Should have 3 edits: heading + 2 link anchors");
+
+    // Verify heading edit
+    let heading_edit = edits.iter().find(|e| e.range.start.line == 0).unwrap();
+    assert_eq!(heading_edit.new_text, "Quick Start");
+
+    // Verify link anchor edits
+    let link_edits: Vec<_> = edits.iter().filter(|e| e.new_text == "quick-start").collect();
+    assert_eq!(link_edits.len(), 2, "Should update both link anchors");
+}
+
+#[tokio::test]
+async fn test_rename_heading_with_custom_anchor_only_changes_text() {
+    use crate::workspace_index::{FileIndex, HeadingIndex};
+
+    let server = create_test_server();
+    let file = test_temp_path("rumdl-rename-test5/doc.md");
+    let uri = Url::from_file_path(&file).unwrap();
+
+    let content = "## Guide {#install}\n\nSee [link](#install) for details.\n";
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+        let mut fi = FileIndex::default();
+        fi.add_heading(HeadingIndex {
+            text: "Guide".to_string(),
+            auto_anchor: "guide".to_string(),
+            custom_anchor: Some("install".to_string()),
+            line: 1,
+            is_setext: false,
+        });
+        index.insert_file(file.clone(), fi);
+    }
+
+    let position = Position { line: 0, character: 5 };
+    let result = server.handle_rename(&uri, position, "Tutorial").await;
+    assert!(result.is_some(), "Should produce a workspace edit");
+
+    let edit = result.unwrap();
+    let changes = edit.changes.unwrap();
+    let edits = changes.get(&uri).expect("Should have edits");
+
+    // Only the heading text should change, not the link anchors
+    assert_eq!(edits.len(), 1, "Should only have 1 edit: heading text change");
+    assert_eq!(edits[0].new_text, "Tutorial");
+}
+
+#[tokio::test]
+async fn test_rename_heading_updates_cross_file_links() {
+    use crate::workspace_index::{CrossFileLinkIndex, FileIndex, HeadingIndex, LinkOrigin};
+
+    let server = create_test_server();
+    let docs_dir = test_temp_path("rumdl-rename-test6/docs");
+    let target_file = docs_dir.join("guide.md");
+    let source_file = docs_dir.join("index.md");
+
+    let target_uri = Url::from_file_path(&target_file).unwrap();
+    let source_uri = Url::from_file_path(&source_file).unwrap();
+
+    let target_content = "## API Reference\n\nAPI docs here.\n";
+    server.documents.write().await.insert(
+        target_uri.clone(),
+        DocumentEntry {
+            content: target_content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    let source_content = "See [api](guide.md#api-reference) for details.\n";
+    server.documents.write().await.insert(
+        source_uri.clone(),
+        DocumentEntry {
+            content: source_content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+
+        let mut target_fi = FileIndex::default();
+        target_fi.add_heading(HeadingIndex {
+            text: "API Reference".to_string(),
+            auto_anchor: "api-reference".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        index.insert_file(target_file.clone(), target_fi);
+
+        let mut source_fi = FileIndex::default();
+        source_fi.add_cross_file_link(CrossFileLinkIndex {
+            target_path: "guide.md".to_string(),
+            fragment: "api-reference".to_string(),
+            line: 1,
+            column: 11, // byte column of "guide.md" in the link
+            origin: LinkOrigin::Body,
+        });
+        index.insert_file(source_file.clone(), source_fi);
+    }
+
+    let position = Position { line: 0, character: 5 };
+    let result = server.handle_rename(&target_uri, position, "REST API").await;
+    assert!(result.is_some(), "Should produce workspace edit");
+
+    let edit = result.unwrap();
+    let changes = edit.changes.unwrap();
+
+    // Target file: heading text change
+    let target_edits = changes.get(&target_uri).expect("Should have target edits");
+    assert!(
+        target_edits.iter().any(|e| e.new_text == "REST API"),
+        "Should rename the heading text"
+    );
+
+    // Source file: anchor update
+    let source_edits = changes.get(&source_uri).expect("Should have source edits");
+    assert!(
+        source_edits.iter().any(|e| e.new_text == "rest-api"),
+        "Should update the cross-file link anchor"
+    );
+}
+
+/// A query string is not part of a file name, so `guide.md?raw=true` names
+/// `guide.md`. The index keeps the destination as the document wrote it, which is
+/// the spelling a link's own text has to be edited through, so navigation has to
+/// strip the query when it asks which file a link points at.
+#[tokio::test]
+async fn test_rename_heading_updates_a_cross_file_link_carrying_a_query() {
+    use crate::workspace_index::{CrossFileLinkIndex, FileIndex, HeadingIndex, LinkOrigin};
+
+    let server = create_test_server();
+    let docs_dir = test_temp_path("rumdl-rename-test6-query/docs");
+    let target_file = docs_dir.join("guide.md");
+    let source_file = docs_dir.join("index.md");
+
+    let target_uri = Url::from_file_path(&target_file).unwrap();
+    let source_uri = Url::from_file_path(&source_file).unwrap();
+
+    let target_content = "## API Reference\n\nAPI docs here.\n";
+    server.documents.write().await.insert(
+        target_uri.clone(),
+        DocumentEntry {
+            content: target_content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    let source_content = "See [api](guide.md?raw=true#api-reference) for details.\n";
+    server.documents.write().await.insert(
+        source_uri.clone(),
+        DocumentEntry {
+            content: source_content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+
+        let mut target_fi = FileIndex::default();
+        target_fi.add_heading(HeadingIndex {
+            text: "API Reference".to_string(),
+            auto_anchor: "api-reference".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        index.insert_file(target_file.clone(), target_fi);
+
+        let mut source_fi = FileIndex::default();
+        source_fi.add_cross_file_link(CrossFileLinkIndex {
+            // The spelling production leaves in the index for this link.
+            target_path: "guide.md?raw=true".to_string(),
+            fragment: "api-reference".to_string(),
+            line: 1,
+            column: 11, // byte column of the destination in the link
+            origin: LinkOrigin::Body,
+        });
+        index.insert_file(source_file.clone(), source_fi);
+    }
+
+    let position = Position { line: 0, character: 5 };
+    let result = server.handle_rename(&target_uri, position, "REST API").await;
+    assert!(result.is_some(), "Should produce workspace edit");
+
+    let edit = result.unwrap();
+    let changes = edit.changes.unwrap();
+
+    let target_edits = changes.get(&target_uri).expect("Should have target edits");
+    assert!(
+        target_edits.iter().any(|e| e.new_text == "REST API"),
+        "Should rename the heading text"
+    );
+
+    let source_edits = changes
+        .get(&source_uri)
+        .expect("a link carrying a query still points at the renamed file");
+    assert!(
+        source_edits.iter().any(|e| e.new_text == "rest-api"),
+        "Should update the cross-file link anchor"
+    );
+}
+
+#[tokio::test]
+async fn test_rename_refuses_empty_name() {
+    use crate::workspace_index::{FileIndex, HeadingIndex};
+
+    let server = create_test_server();
+    let file = test_temp_path("rumdl-rename-test7/doc.md");
+    let uri = Url::from_file_path(&file).unwrap();
+
+    let content = "## Heading\n";
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+        let mut fi = FileIndex::default();
+        fi.add_heading(HeadingIndex {
+            text: "Heading".to_string(),
+            auto_anchor: "heading".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        index.insert_file(file.clone(), fi);
+    }
+
+    let position = Position { line: 0, character: 5 };
+    let result = server.handle_rename(&uri, position, "").await;
+    assert!(result.is_none(), "Should refuse empty rename");
+
+    let result = server.handle_rename(&uri, position, "   ").await;
+    assert!(result.is_none(), "Should refuse whitespace-only rename");
+}
+
+#[tokio::test]
+async fn test_rename_refuses_anchor_collision() {
+    use crate::workspace_index::{FileIndex, HeadingIndex};
+
+    let server = create_test_server();
+    let file = test_temp_path("rumdl-rename-test8/doc.md");
+    let uri = Url::from_file_path(&file).unwrap();
+
+    let content = "## Foo\n\n## Bar\n";
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+        let mut fi = FileIndex::default();
+        fi.add_heading(HeadingIndex {
+            text: "Foo".to_string(),
+            auto_anchor: "foo".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        fi.add_heading(HeadingIndex {
+            text: "Bar".to_string(),
+            auto_anchor: "bar".to_string(),
+            custom_anchor: None,
+            line: 3,
+            is_setext: false,
+        });
+        index.insert_file(file.clone(), fi);
+    }
+
+    // Try to rename "Foo" to "Bar" — should be refused due to collision
+    let position = Position { line: 0, character: 5 };
+    let result = server.handle_rename(&uri, position, "Bar").await;
+    assert!(result.is_none(), "Should refuse rename that causes anchor collision");
+}
+
+#[tokio::test]
+async fn test_rename_heading_with_closing_atx() {
+    use crate::workspace_index::{FileIndex, HeadingIndex};
+
+    let server = create_test_server();
+    let file = test_temp_path("rumdl-rename-test9/doc.md");
+    let uri = Url::from_file_path(&file).unwrap();
+
+    let content = "## Hello ##\n";
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+        let mut fi = FileIndex::default();
+        fi.add_heading(HeadingIndex {
+            text: "Hello".to_string(),
+            auto_anchor: "hello".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        index.insert_file(file.clone(), fi);
+    }
+
+    let position = Position { line: 0, character: 5 };
+    let result = server.handle_prepare_rename(&uri, position).await;
+    assert!(result.is_some());
+
+    if let Some(PrepareRenameResponse::Range(range)) = result {
+        // Should cover just "Hello", not the trailing "##"
+        assert_eq!(range.start.character, 3);
+        assert_eq!(range.end.character, 8); // "Hello" is 5 chars, starts at 3
+    } else {
+        panic!("Expected Range response");
+    }
+}
+
+#[tokio::test]
+async fn test_rename_updates_same_file_ref_definitions() {
+    use crate::workspace_index::{FileIndex, HeadingIndex};
+
+    let server = create_test_server();
+    let file = test_temp_path("rumdl-rename-test10/doc.md");
+    let uri = Url::from_file_path(&file).unwrap();
+
+    let content = "## Getting Started\n\nSee [ref] for info.\n\n[ref]: #getting-started\n";
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+        let mut fi = FileIndex::default();
+        fi.add_heading(HeadingIndex {
+            text: "Getting Started".to_string(),
+            auto_anchor: "getting-started".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        index.insert_file(file.clone(), fi);
+    }
+
+    let position = Position { line: 0, character: 5 };
+    let result = server.handle_rename(&uri, position, "Quick Start").await;
+    assert!(result.is_some());
+
+    let edit = result.unwrap();
+    let changes = edit.changes.unwrap();
+    let edits = changes.get(&uri).expect("Should have edits");
+
+    // Should have: heading text change + ref definition anchor update
+    // The [ref] usage text doesn't change — it references by label, not by anchor.
+    // Only the definition line `[ref]: #getting-started` needs its anchor updated.
+    let heading_edits: Vec<_> = edits.iter().filter(|e| e.new_text == "Quick Start").collect();
+    assert_eq!(heading_edits.len(), 1, "Should have 1 heading text edit");
+
+    let anchor_edits: Vec<_> = edits.iter().filter(|e| e.new_text == "quick-start").collect();
+    assert_eq!(
+        anchor_edits.len(),
+        1,
+        "Should update the reference definition anchor. Got {} edits",
+        anchor_edits.len()
+    );
+}
+
+#[tokio::test]
+async fn test_rename_cross_file_multiple_links_same_line() {
+    use crate::workspace_index::{CrossFileLinkIndex, FileIndex, HeadingIndex, LinkOrigin};
+
+    let server = create_test_server();
+    let docs_dir = test_temp_path("rumdl-rename-test11/docs");
+    let target_file = docs_dir.join("guide.md");
+    let source_file = docs_dir.join("index.md");
+
+    let target_uri = Url::from_file_path(&target_file).unwrap();
+    let source_uri = Url::from_file_path(&source_file).unwrap();
+
+    let target_content = "## Getting Started\n\nContent here.\n";
+    server.documents.write().await.insert(
+        target_uri.clone(),
+        DocumentEntry {
+            content: target_content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    // Two links to the same heading on the same line
+    let source_content = "See [a](guide.md#getting-started) and [b](guide.md#getting-started) here.\n";
+    server.documents.write().await.insert(
+        source_uri.clone(),
+        DocumentEntry {
+            content: source_content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    {
+        let mut index = server.workspace_index.write().await;
+
+        let mut target_fi = FileIndex::default();
+        target_fi.add_heading(HeadingIndex {
+            text: "Getting Started".to_string(),
+            auto_anchor: "getting-started".to_string(),
+            custom_anchor: None,
+            line: 1,
+            is_setext: false,
+        });
+        index.insert_file(target_file.clone(), target_fi);
+
+        let mut source_fi = FileIndex::default();
+        // Two cross-file links on the same line
+        source_fi.add_cross_file_link(CrossFileLinkIndex {
+            target_path: "guide.md".to_string(),
+            fragment: "getting-started".to_string(),
+            line: 1,
+            column: 9,
+            origin: LinkOrigin::Body,
+        });
+        source_fi.add_cross_file_link(CrossFileLinkIndex {
+            target_path: "guide.md".to_string(),
+            fragment: "getting-started".to_string(),
+            line: 1,
+            column: 43,
+            origin: LinkOrigin::Body,
+        });
+        index.insert_file(source_file.clone(), source_fi);
+    }
+
+    let position = Position { line: 0, character: 5 };
+    let result = server.handle_rename(&target_uri, position, "Quick Start").await;
+    assert!(result.is_some());
+
+    let edit = result.unwrap();
+    let changes = edit.changes.unwrap();
+
+    // Source file should have 2 anchor edits (one per link), not 1 or duplicates
+    let source_edits = changes.get(&source_uri).expect("Should have source edits");
+    let anchor_edits: Vec<_> = source_edits.iter().filter(|e| e.new_text == "quick-start").collect();
+    assert_eq!(
+        anchor_edits.len(),
+        2,
+        "Should update both cross-file link anchors on the same line"
+    );
+
+    // The two edits should have different character positions
+    assert_ne!(
+        anchor_edits[0].range.start.character, anchor_edits[1].range.start.character,
+        "Edits should target different positions on the line"
+    );
+}
+
+// ── enable_link_navigation tests ────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_link_navigation_enabled_by_default() {
+    let server = create_test_server();
+    let config = server.config.read().await;
+    assert!(
+        config.enable_link_navigation,
+        "enable_link_navigation must default to true"
+    );
+}
+
+#[tokio::test]
+async fn test_link_navigation_config_deserialization() {
+    // Omitting the field must leave it true (backwards-compatible default)
+    let json = r#"{"enableLinting": true}"#;
+    let config: crate::lsp::types::RumdlLspConfig = serde_json::from_str(json).unwrap();
+    assert!(config.enable_link_navigation);
+
+    // Explicitly disabling must be honoured
+    let json = r#"{"enableLinkNavigation": false}"#;
+    let config: crate::lsp::types::RumdlLspConfig = serde_json::from_str(json).unwrap();
+    assert!(!config.enable_link_navigation);
+}
+
+#[tokio::test]
+async fn test_hover_disabled_when_link_navigation_off() {
+    let server = create_test_server();
+    server.config.write().await.enable_link_navigation = false;
+
+    let params = HoverParams {
+        text_document_position_params: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: Url::parse("file:///test.md").unwrap(),
+            },
+            position: Position { line: 0, character: 0 },
+        },
+        work_done_progress_params: WorkDoneProgressParams { work_done_token: None },
+    };
+
+    let result = LanguageServer::hover(&server, params).await.unwrap();
+    assert!(
+        result.is_none(),
+        "hover must return None when enable_link_navigation is false"
+    );
+}
+
+#[tokio::test]
+async fn test_goto_definition_disabled_when_link_navigation_off() {
+    let server = create_test_server();
+    server.config.write().await.enable_link_navigation = false;
+
+    let params = GotoDefinitionParams {
+        text_document_position_params: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: Url::parse("file:///test.md").unwrap(),
+            },
+            position: Position { line: 0, character: 0 },
+        },
+        work_done_progress_params: WorkDoneProgressParams { work_done_token: None },
+        partial_result_params: PartialResultParams {
+            partial_result_token: None,
+        },
+    };
+
+    let result = LanguageServer::goto_definition(&server, params).await.unwrap();
+    assert!(
+        result.is_none(),
+        "goto_definition must return None when enable_link_navigation is false"
+    );
+}
+
+#[tokio::test]
+async fn test_references_disabled_when_link_navigation_off() {
+    let server = create_test_server();
+    server.config.write().await.enable_link_navigation = false;
+
+    let params = ReferenceParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: Url::parse("file:///test.md").unwrap(),
+            },
+            position: Position { line: 0, character: 0 },
+        },
+        work_done_progress_params: WorkDoneProgressParams { work_done_token: None },
+        partial_result_params: PartialResultParams {
+            partial_result_token: None,
+        },
+        context: ReferenceContext {
+            include_declaration: false,
+        },
+    };
+
+    let result = LanguageServer::references(&server, params).await.unwrap();
+    assert!(
+        result.is_none(),
+        "references must return None when enable_link_navigation is false"
+    );
+}
+
+#[tokio::test]
+async fn test_prepare_rename_disabled_when_link_navigation_off() {
+    let server = create_test_server();
+    server.config.write().await.enable_link_navigation = false;
+
+    let params = TextDocumentPositionParams {
+        text_document: TextDocumentIdentifier {
+            uri: Url::parse("file:///test.md").unwrap(),
+        },
+        position: Position { line: 0, character: 0 },
+    };
+
+    let result = LanguageServer::prepare_rename(&server, params).await.unwrap();
+    assert!(
+        result.is_none(),
+        "prepare_rename must return None when enable_link_navigation is false"
+    );
+}
+
+#[tokio::test]
+async fn test_rename_disabled_when_link_navigation_off() {
+    let server = create_test_server();
+    server.config.write().await.enable_link_navigation = false;
+
+    let params = RenameParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: Url::parse("file:///test.md").unwrap(),
+            },
+            position: Position { line: 0, character: 0 },
+        },
+        new_name: "new-name".to_string(),
+        work_done_progress_params: WorkDoneProgressParams { work_done_token: None },
+    };
+
+    let result = LanguageServer::rename(&server, params).await.unwrap();
+    assert!(
+        result.is_none(),
+        "rename must return None when enable_link_navigation is false"
+    );
+}
+
+/// Verify that when `enableLinkNavigation` is false, the server does not advertise
+/// hover, definition, references, or rename capabilities during initialization.
+/// Clients rely on ServerCapabilities to decide whether to send these requests at all;
+/// returning None from the handlers alone is not sufficient.
+#[tokio::test]
+async fn test_initialize_omits_nav_capabilities_when_disabled() {
+    let server = create_test_server();
+
+    let options = serde_json::json!({ "enableLinkNavigation": false });
+    let params = InitializeParams {
+        initialization_options: Some(options),
+        capabilities: ClientCapabilities::default(),
+        ..Default::default()
+    };
+
+    let result = LanguageServer::initialize(&server, params).await.unwrap();
+    let caps = result.capabilities;
+
+    assert!(
+        caps.hover_provider.is_none(),
+        "hover_provider must be None when enableLinkNavigation is false"
+    );
+    assert!(
+        caps.definition_provider.is_none(),
+        "definition_provider must be None when enableLinkNavigation is false"
+    );
+    assert!(
+        caps.references_provider.is_none(),
+        "references_provider must be None when enableLinkNavigation is false"
+    );
+    assert!(
+        caps.rename_provider.is_none(),
+        "rename_provider must be None when enableLinkNavigation is false"
+    );
+}
+
+/// Verify that with `enableLinkNavigation` enabled (the default), all four navigation
+/// capabilities are advertised to the client.
+#[tokio::test]
+async fn test_initialize_advertises_nav_capabilities_when_enabled() {
+    let server = create_test_server();
+
+    let params = InitializeParams {
+        capabilities: ClientCapabilities::default(),
+        ..Default::default()
+    };
+
+    let result = LanguageServer::initialize(&server, params).await.unwrap();
+    let caps = result.capabilities;
+
+    assert!(
+        caps.hover_provider.is_some(),
+        "hover_provider must be advertised by default"
+    );
+    assert!(
+        caps.definition_provider.is_some(),
+        "definition_provider must be advertised by default"
+    );
+    assert!(
+        caps.references_provider.is_some(),
+        "references_provider must be advertised by default"
+    );
+    assert!(
+        caps.rename_provider.is_some(),
+        "rename_provider must be advertised by default"
+    );
+}
+
+#[tokio::test]
+async fn test_initialize_advertises_symbol_capabilities() {
+    // Symbol providers are a standalone feature, advertised regardless of the
+    // link-navigation flag.
+    let server = create_test_server();
+    let params = InitializeParams {
+        capabilities: ClientCapabilities::default(),
+        ..Default::default()
+    };
+    let caps = LanguageServer::initialize(&server, params).await.unwrap().capabilities;
+
+    assert!(
+        matches!(caps.document_symbol_provider, Some(OneOf::Left(true))),
+        "document_symbol_provider must be advertised: {:?}",
+        caps.document_symbol_provider
+    );
+    assert!(
+        matches!(caps.workspace_symbol_provider, Some(OneOf::Left(true))),
+        "workspace_symbol_provider must be advertised: {:?}",
+        caps.workspace_symbol_provider
+    );
+}
+
+// ── enable_symbols tests ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_symbols_enabled_by_default() {
+    let server = create_test_server();
+    assert!(
+        server.config.read().await.enable_symbols,
+        "enable_symbols must default to true"
+    );
+}
+
+#[tokio::test]
+async fn test_symbols_config_deserialization() {
+    // Omitting the field must leave it true (backwards-compatible default)
+    let json = r#"{"enableLinting": true}"#;
+    let config: crate::lsp::types::RumdlLspConfig = serde_json::from_str(json).unwrap();
+    assert!(config.enable_symbols);
+
+    // Explicitly disabling must be honoured
+    let json = r#"{"enableSymbols": false}"#;
+    let config: crate::lsp::types::RumdlLspConfig = serde_json::from_str(json).unwrap();
+    assert!(!config.enable_symbols);
+}
+
+#[tokio::test]
+async fn test_document_symbol_disabled_when_symbols_off() {
+    // A document WITH headings is open, so the handler would return an outline if
+    // it were unguarded. With symbols disabled it must return None instead.
+    let server = create_test_server();
+    *server.client_supports_hierarchical_symbols.write().await = true;
+    server.config.write().await.enable_symbols = false;
+
+    let uri = Url::parse("file:///outline.md").unwrap();
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: "# Top\n\n## Child\n".to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    let params = DocumentSymbolParams {
+        text_document: TextDocumentIdentifier { uri },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+    };
+    assert!(
+        server.document_symbol(params).await.unwrap().is_none(),
+        "document_symbol must return None when enable_symbols is false"
+    );
+}
+
+#[tokio::test]
+async fn test_workspace_symbol_disabled_when_symbols_off() {
+    use crate::workspace_index::{FileIndex, HeadingIndex, WorkspaceIndex};
+
+    // The index has a matching heading, so the handler would return it if it were
+    // unguarded. With symbols disabled it must return None instead.
+    let server = create_test_server();
+    server.config.write().await.enable_symbols = false;
+
+    let doc_path = std::env::temp_dir().join("rumdl-ws-symbol-off").join("doc.md");
+    {
+        let mut index = server.workspace_index.write().await;
+        *index = WorkspaceIndex::new();
+        let mut fi = FileIndex::default();
+        fi.headings.push(HeadingIndex {
+            text: "Configuration".to_string(),
+            auto_anchor: "configuration".to_string(),
+            custom_anchor: None,
+            line: 3,
+            is_setext: false,
+        });
+        index.insert_file(doc_path, fi);
+    }
+
+    let params = WorkspaceSymbolParams {
+        query: "config".to_string(),
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+    };
+    assert!(
+        server.symbol(params).await.unwrap().is_none(),
+        "workspace symbol must return None when enable_symbols is false"
+    );
+}
+
+/// When `enableSymbols` is false, the server must not advertise the document or
+/// workspace symbol capabilities. Clients rely on ServerCapabilities to decide
+/// whether to send these requests; returning None from the handlers is not enough.
+#[tokio::test]
+async fn test_initialize_omits_symbol_capabilities_when_disabled() {
+    let server = create_test_server();
+
+    let options = serde_json::json!({ "enableSymbols": false });
+    let params = InitializeParams {
+        initialization_options: Some(options),
+        capabilities: ClientCapabilities::default(),
+        ..Default::default()
+    };
+
+    let caps = LanguageServer::initialize(&server, params).await.unwrap().capabilities;
+
+    assert!(
+        caps.document_symbol_provider.is_none(),
+        "document_symbol_provider must be None when enableSymbols is false: {:?}",
+        caps.document_symbol_provider
+    );
+    assert!(
+        caps.workspace_symbol_provider.is_none(),
+        "workspace_symbol_provider must be None when enableSymbols is false: {:?}",
+        caps.workspace_symbol_provider
+    );
+}
+
+#[tokio::test]
+async fn test_symbols_disabled_via_did_change_configuration() {
+    let server = create_test_server();
+
+    // Default state: symbols are enabled
+    assert!(server.config.read().await.enable_symbols);
+
+    // A settings payload that only sets enableSymbols: false must be recognized as
+    // a full config and applied (not dropped as an unknown key).
+    server
+        .did_change_configuration(DidChangeConfigurationParams {
+            settings: serde_json::json!({ "enableSymbols": false }),
+        })
+        .await;
+
+    assert!(
+        !server.config.read().await.enable_symbols,
+        "did_change_configuration must apply enableSymbols: false"
+    );
+
+    // Confirm the handler respects the updated flag, even with a heading present.
+    let uri = Url::parse("file:///live.md").unwrap();
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: "# Heading\n".to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+    let params = DocumentSymbolParams {
+        text_document: TextDocumentIdentifier { uri },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+    };
+    assert!(
+        server.document_symbol(params).await.unwrap().is_none(),
+        "document_symbol should be suppressed after live config disables symbols"
+    );
+}
+
+#[tokio::test]
+async fn test_symbols_reenabled_via_did_change_configuration() {
+    // The live-config path must be symmetric: after disabling symbols, a bare
+    // `{"enableSymbols": true}` payload must re-enable them (key-presence
+    // detection), not be dropped as an unknown key.
+    let server = create_test_server();
+    *server.client_supports_hierarchical_symbols.write().await = true;
+
+    server
+        .did_change_configuration(DidChangeConfigurationParams {
+            settings: serde_json::json!({ "enableSymbols": false }),
+        })
+        .await;
+    assert!(!server.config.read().await.enable_symbols, "disable must apply");
+
+    server
+        .did_change_configuration(DidChangeConfigurationParams {
+            settings: serde_json::json!({ "enableSymbols": true }),
+        })
+        .await;
+    assert!(
+        server.config.read().await.enable_symbols,
+        "did_change_configuration must apply a bare enableSymbols: true re-enable"
+    );
+
+    // The handler must respond again once re-enabled.
+    let uri = Url::parse("file:///reenabled.md").unwrap();
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: "# Heading\n".to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+    let params = DocumentSymbolParams {
+        text_document: TextDocumentIdentifier { uri },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+    };
+    assert!(
+        server.document_symbol(params).await.unwrap().is_some(),
+        "document_symbol should respond again after symbols are re-enabled"
+    );
+}
+
+#[tokio::test]
+async fn test_did_change_configuration_partial_payload_does_not_clobber_other_flags() {
+    // A partial didChangeConfiguration payload must merge onto the current config,
+    // not replace it: setting one flag must leave previously-set flags intact
+    // rather than resetting the omitted fields to their defaults.
+    let server = create_test_server();
+
+    // Establish non-default state via one partial payload.
+    server
+        .did_change_configuration(DidChangeConfigurationParams {
+            settings: serde_json::json!({ "enableLinkNavigation": false }),
+        })
+        .await;
+    assert!(
+        !server.config.read().await.enable_link_navigation,
+        "precondition: enableLinkNavigation disabled"
+    );
+
+    // A second, unrelated partial payload must not reset enableLinkNavigation.
+    server
+        .did_change_configuration(DidChangeConfigurationParams {
+            settings: serde_json::json!({ "enableSymbols": false }),
+        })
+        .await;
+
+    let config = server.config.read().await;
+    assert!(!config.enable_symbols, "enableSymbols must be applied");
+    assert!(
+        !config.enable_link_navigation,
+        "a partial enableSymbols payload must NOT clobber the previously-set enableLinkNavigation"
+    );
+}
+
+#[test]
+fn test_merge_lsp_config_overlays_only_present_keys() {
+    // A partial payload changes only its keys; every omitted field keeps its
+    // current value (not its default).
+    let current = RumdlLspConfig {
+        enable_link_navigation: false,
+        config_path: Some("/explicit.toml".to_string()),
+        ..RumdlLspConfig::default()
+    };
+    let merged = merge_lsp_config(&current, &serde_json::json!({ "enableSymbols": false }))
+        .expect("merge of a valid object payload must succeed");
+
+    assert!(!merged.enable_symbols, "the present key is applied");
+    assert!(
+        !merged.enable_link_navigation,
+        "an omitted bool keeps its current (non-default) value"
+    );
+    assert_eq!(
+        merged.config_path.as_deref(),
+        Some("/explicit.toml"),
+        "an omitted configPath is preserved, not reset"
+    );
+}
+
+#[test]
+fn test_merge_lsp_config_full_snapshot_applies_every_key() {
+    // A full snapshot overlays every field, so it fully applies.
+    let current = RumdlLspConfig {
+        enable_symbols: false,
+        enable_linting: false,
+        ..RumdlLspConfig::default()
+    };
+    let merged = merge_lsp_config(
+        &current,
+        &serde_json::json!({ "enableLinting": true, "enableSymbols": true, "enableLinkNavigation": false }),
+    )
+    .unwrap();
+
+    assert!(merged.enable_linting);
+    assert!(merged.enable_symbols);
+    assert!(!merged.enable_link_navigation);
+}
+
+#[test]
+fn test_merge_lsp_config_non_object_payload_returns_none() {
+    // The defensive path: a non-object payload yields None so the caller leaves the
+    // config unchanged rather than clobbering it.
+    let current = RumdlLspConfig::default();
+    assert!(merge_lsp_config(&current, &serde_json::json!("not an object")).is_none());
+    assert!(merge_lsp_config(&current, &serde_json::json!(42)).is_none());
+    assert!(merge_lsp_config(&current, &serde_json::Value::Null).is_none());
+}
+
+#[test]
+fn test_symbols_config_serde_roundtrip() {
+    // Verify `enableSymbols: false` round-trips correctly through serde
+    let json = r#"{"enableSymbols": false}"#;
+    let config: RumdlLspConfig = serde_json::from_str(json).unwrap();
+    assert!(!config.enable_symbols, "enableSymbols should deserialize to false");
+    // All other fields should use their defaults
+    assert!(config.enable_linting, "enableLinting should default to true");
+    assert!(
+        config.enable_link_navigation,
+        "enableLinkNavigation should default to true"
+    );
+
+    // Verify serialization produces camelCase key
+    let serialized = serde_json::to_string(&config).unwrap();
+    assert!(serialized.contains("\"enableSymbols\":false"));
+}
+
+/// Resolve the config file path that the LSP's per-file resolver picked,
+/// by calling `resolve_config_for_file` and then inspecting the cache.
+/// Used by parity tests to compare LSP and CLI resolution on the same tree.
+async fn lsp_resolve_config_path(server: &RumdlLanguageServer, file: &std::path::Path) -> Option<PathBuf> {
+    let _ = server.resolve_config_for_file(file).await;
+    let search_dir = file.parent().unwrap_or(file).to_path_buf();
+    server
+        .config_cache
+        .read()
+        .await
+        .get(&search_dir)
+        .and_then(|e| e.config_file.clone())
+}
+
+/// Verifies that the LSP's per-file resolver and the CLI's
+/// `discover_config_for_dir` pick the same config file on a variety of
+/// layouts (same filename set, same per-directory precedence, same
+/// closer-ancestor-wins behaviour across levels, same pyproject.toml
+/// `[tool.rumdl]` gating). Any future drift between the two paths — the
+/// class of bug behind rumdl-vscode#115 — will fail this test.
+#[tokio::test]
+async fn test_lsp_cli_resolver_parity_on_fixtures() {
+    use crate::config::SourcedConfig;
+    use std::fs;
+    use tempfile::tempdir;
+
+    struct Fixture {
+        name: &'static str,
+        /// (relative_path, contents); empty contents means "create the file empty"
+        files: &'static [(&'static str, &'static str)],
+        /// Relative path to the markdown file whose directory we resolve from
+        from: &'static str,
+    }
+
+    let fixtures = &[
+        Fixture {
+            name: "dotconfig_rumdl_at_root",
+            files: &[(".config/rumdl.toml", "[global]\n"), ("sub/deeper/test.md", "")],
+            from: "sub/deeper/test.md",
+        },
+        Fixture {
+            name: "rumdl_toml_at_root",
+            files: &[("rumdl.toml", "[global]\n"), ("sub/test.md", "")],
+            from: "sub/test.md",
+        },
+        Fixture {
+            name: "closer_wins_rumdl_over_dotconfig",
+            files: &[
+                (".config/rumdl.toml", "[global]\n"),
+                ("sub/rumdl.toml", "[global]\n"),
+                ("sub/deeper/test.md", ""),
+            ],
+            from: "sub/deeper/test.md",
+        },
+        Fixture {
+            name: "closer_markdownlint_beats_farther_rumdl",
+            files: &[
+                (".config/rumdl.toml", "[global]\n"),
+                ("sub/.markdownlint.json", "{}"),
+                ("sub/deeper/test.md", ""),
+            ],
+            from: "sub/deeper/test.md",
+        },
+        Fixture {
+            name: "rumdl_beats_markdownlint_same_dir",
+            files: &[
+                ("sub/.config/rumdl.toml", "[global]\n"),
+                ("sub/.markdownlint.json", "{}"),
+                ("sub/test.md", ""),
+            ],
+            from: "sub/test.md",
+        },
+        Fixture {
+            name: "pyproject_without_tool_rumdl_is_skipped",
+            files: &[
+                ("pyproject.toml", "[tool.black]\nline-length = 100\n"),
+                (".config/rumdl.toml", "[global]\n"),
+                ("sub/test.md", ""),
+            ],
+            from: "sub/test.md",
+        },
+        Fixture {
+            name: "pyproject_with_tool_rumdl_beats_nothing",
+            files: &[("pyproject.toml", "[tool.rumdl]\n"), ("sub/test.md", "")],
+            from: "sub/test.md",
+        },
+        // Issue #588: the markdownlint-cli2 config family must be discovered
+        // identically by both resolvers. Before this fixture was added, the
+        // parity test only covered `.markdownlint.json`, so YAML variants
+        // could drift silently.
+        Fixture {
+            name: "markdownlint_cli2_yaml_at_root",
+            files: &[
+                (".markdownlint-cli2.yaml", "---\nconfig:\n  no-inline-html: false\n"),
+                ("sub/test.md", ""),
+            ],
+            from: "sub/test.md",
+        },
+        Fixture {
+            name: "markdownlint_cli2_jsonc_at_root",
+            files: &[
+                (
+                    ".markdownlint-cli2.jsonc",
+                    "{\n  \"config\": { \"no-inline-html\": false }\n}\n",
+                ),
+                ("sub/test.md", ""),
+            ],
+            from: "sub/test.md",
+        },
+    ];
+
+    for fx in fixtures {
+        let temp = tempdir().unwrap();
+        let project = std::fs::canonicalize(temp.path()).unwrap();
+
+        for (rel, contents) in fx.files {
+            let path = project.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, contents).unwrap();
+        }
+
+        let md_file = project.join(fx.from);
+        let md_dir = md_file.parent().unwrap().to_path_buf();
+
+        // CLI resolution
+        let cli_path = SourcedConfig::discover_config_for_dir(&md_dir, &project);
+
+        // LSP resolution (workspace root = project so walk-up bounds match CLI)
+        let server = create_test_server();
+        {
+            let mut roots = server.workspace_roots.write().await;
+            roots.push(project.clone());
+        }
+        let lsp_path = lsp_resolve_config_path(&server, &md_file).await;
+
+        assert_eq!(
+            lsp_path.as_ref().map(|p| std::fs::canonicalize(p).unwrap()),
+            cli_path.as_ref().map(|p| std::fs::canonicalize(p).unwrap()),
+            "LSP and CLI must resolve the same config file for fixture `{}`. \
+             LSP picked {:?}, CLI picked {:?}",
+            fx.name,
+            lsp_path,
+            cli_path,
+        );
+    }
+}
+
+/// Regression test for #751: the LSP resolved every discovered config through the
+/// *explicit*-config entry point, which is standalone by design. That is right for
+/// a config the user named with `--config`, but a discovered markdownlint config is
+/// the one case where the CLI keeps the user config as a base, since the
+/// markdownlint format cannot express rumdl's own settings. The server therefore
+/// resolved a different config than `rumdl check` on the same file, and reported
+/// different diagnostics.
+///
+/// Both fixtures compare against the CLI's own result rather than a hardcoded one,
+/// so the rumdl-native fixture is a live negative control: a fix that merged the
+/// user config into every discovered config would fail it.
+///
+/// Mutates the process cwd to run the CLI half, so it runs serially.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_lsp_matches_cli_values_under_a_discovered_config() {
+    use crate::config::{Config, SourcedConfig};
+    use std::fs;
+    use tempfile::tempdir;
+
+    // (fixture name, project config filename, contents, expected MD007 indent).
+    // MD007 is set only by the user config, so its resolved value is exactly
+    // "was the user config used as a base".
+    let fixtures: &[(&str, &str, &str, Option<usize>)] = &[
+        (
+            "markdownlint_project_config",
+            ".markdownlint.json",
+            r#"{ "MD004": { "style": "asterisk" } }"#,
+            Some(4),
+        ),
+        (
+            "markdownlint_cli2_project_config",
+            ".markdownlint-cli2.yaml",
+            "config:\n  MD004:\n    style: asterisk\n",
+            Some(4),
+        ),
+        (
+            "rumdl_project_config",
+            ".rumdl.toml",
+            "[MD004]\nstyle = \"asterisk\"\n",
+            None,
+        ),
+    ];
+
+    for (name, config_name, config_body, expected_indent) in fixtures {
+        let temp = tempdir().unwrap();
+        let root = temp.path().resolve_like_server();
+        let project = root.join("project");
+        let sub = project.join("sub");
+        let user_config_dir = root.join("xdg");
+        let home_dir = root.join("fakehome");
+
+        fs::create_dir_all(&sub).unwrap();
+        fs::create_dir_all(project.join(".git")).unwrap(); // bound both walks here
+        fs::create_dir_all(user_config_dir.join("rumdl")).unwrap();
+        fs::create_dir_all(&home_dir).unwrap();
+        fs::write(
+            user_config_dir.join("rumdl").join("rumdl.toml"),
+            "[MD007]\nindent = 4\n",
+        )
+        .unwrap();
+        fs::write(project.join(config_name), config_body).unwrap();
+
+        let md_file = sub.join("test.md");
+        fs::write(&md_file, "").unwrap();
+
+        // CLI resolution: discovery walks up from the process cwd.
+        let prev_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&sub).unwrap();
+        let cli_sourced =
+            SourcedConfig::load_with_discovery_impl(None, None, false, Some(&user_config_dir), Some(&home_dir));
+        std::env::set_current_dir(&prev_cwd).unwrap();
+        let cli_config: Config = cli_sourced
+            .expect("CLI config should load")
+            .into_validated_unchecked()
+            .into();
+
+        // LSP resolution: its own walk up from the file, workspace root = project.
+        let server = create_test_server();
+        {
+            let mut roots = server.workspace_roots.write().await;
+            roots.push(project.clone());
+        }
+        let lsp_config = server
+            .resolve_config_for_file_impl(&md_file, Some(&user_config_dir), Some(&home_dir))
+            .await;
+
+        // Positive control: the markdownlint fixture must actually reach the user
+        // config, or the parity assertion below would hold vacuously.
+        assert_eq!(
+            crate::config::get_rule_config_value::<usize>(&cli_config, "MD007", "indent"),
+            *expected_indent,
+            "fixture `{name}`: the CLI itself did not behave as the fixture assumes"
+        );
+        assert_eq!(
+            crate::config::get_rule_config_value::<usize>(&lsp_config, "MD007", "indent"),
+            *expected_indent,
+            "fixture `{name}`: LSP resolved MD007 differently than the CLI"
+        );
+        assert_eq!(
+            crate::config::get_rule_config_value::<String>(&lsp_config, "MD004", "style"),
+            Some("asterisk".to_string()),
+            "fixture `{name}`: the project config's own settings must still apply"
+        );
+        assert_eq!(
+            serde_json::to_value(&lsp_config).unwrap(),
+            serde_json::to_value(&cli_config).unwrap(),
+            "fixture `{name}`: LSP and CLI must resolve the same configuration"
+        );
+    }
+}
+
+/// A broken user config makes a nearer markdownlint config unresolvable, since
+/// that is the one project config rumdl merges onto the user config. The server
+/// must not answer with a config from further up the tree: `rumdl check` refuses
+/// to run at all in this state, so silently substituting the parent's rules would
+/// have the editor lint against a ruleset that exists nowhere on disk.
+#[tokio::test]
+async fn test_resolve_config_does_not_substitute_a_parent_config_when_the_user_config_is_broken() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp = tempdir().unwrap();
+    let root = temp.path().resolve_like_server();
+    let project = root.join("project");
+    let sub = project.join("sub");
+    let user_config_dir = root.join("xdg");
+    let home_dir = root.join("fakehome");
+
+    fs::create_dir_all(&sub).unwrap();
+    fs::create_dir_all(user_config_dir.join("rumdl")).unwrap();
+    fs::create_dir_all(&home_dir).unwrap();
+    fs::write(
+        user_config_dir.join("rumdl").join("rumdl.toml"),
+        "this is not valid toml {{{\n",
+    )
+    .unwrap();
+
+    // A parent config that resolves fine, so substituting it would look like success.
+    fs::write(project.join(".rumdl.toml"), "[MD004]\nstyle = \"dash\"\n").unwrap();
+    // The nearer config, which needs the broken user config as its base.
+    fs::write(
+        sub.join(".markdownlint.json"),
+        r#"{ "MD004": { "style": "asterisk" } }"#,
+    )
+    .unwrap();
+
+    let md_file = sub.join("test.md");
+    fs::write(&md_file, "").unwrap();
+
+    let server = create_test_server();
+    {
+        let mut roots = server.workspace_roots.write().await;
+        roots.push(project.clone());
+    }
+    // Startup discovery runs from the workspace root, where the parent config is
+    // rumdl-native and so resolves standalone. That leaves the parent's rules in
+    // `rumdl_config`, which is the second route by which they could reach this file.
+    {
+        let mut startup = server.rumdl_config.write().await;
+        *startup = crate::config::SourcedConfig::load_with_discovery_impl(
+            Some(&project.join(".rumdl.toml").to_string_lossy()),
+            None,
+            true,
+            Some(&user_config_dir),
+            Some(&home_dir),
+        )
+        .expect("the parent config resolves standalone")
+        .into_validated_unchecked()
+        .into();
+        assert_eq!(
+            crate::config::get_rule_config_value::<String>(&startup, "MD004", "style"),
+            Some("dash".to_string()),
+            "precondition: the startup config carries the parent's rules"
+        );
+    }
+
+    let config = server
+        .resolve_config_for_file_impl(&md_file, Some(&user_config_dir), Some(&home_dir))
+        .await;
+
+    assert_eq!(
+        crate::config::get_rule_config_value::<String>(&config, "MD004", "style"),
+        None,
+        "resolution should stop at the unresolvable config, not reach for the parent's rules"
+    );
+}
+
+/// A config that cannot be resolved is a temporary state the user fixes outside the
+/// workspace, so nothing the server watches changes when they do. Caching it would
+/// pin the file to defaults for the rest of the session.
+#[tokio::test]
+async fn test_resolve_config_retries_after_a_broken_user_config_is_fixed() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp = tempdir().unwrap();
+    let root = temp.path().resolve_like_server();
+    let project = root.join("project");
+    // The unresolvable config sits above the file's own directory, so a cache entry
+    // keyed on that directory would never notice it.
+    let deep = project.join("sub").join("deep");
+    let user_config_dir = root.join("xdg");
+    let home_dir = root.join("fakehome");
+
+    fs::create_dir_all(&deep).unwrap();
+    fs::create_dir_all(user_config_dir.join("rumdl")).unwrap();
+    fs::create_dir_all(&home_dir).unwrap();
+
+    let user_config = user_config_dir.join("rumdl").join("rumdl.toml");
+    fs::write(&user_config, "this is not valid toml {{{\n").unwrap();
+    fs::write(
+        project.join("sub").join(".markdownlint.json"),
+        r#"{ "MD004": { "style": "asterisk" } }"#,
+    )
+    .unwrap();
+
+    let md_file = deep.join("test.md");
+    fs::write(&md_file, "").unwrap();
+
+    let server = create_test_server();
+    {
+        let mut roots = server.workspace_roots.write().await;
+        roots.push(project.clone());
+    }
+
+    let broken = server
+        .resolve_config_for_file_impl(&md_file, Some(&user_config_dir), Some(&home_dir))
+        .await;
+    assert_eq!(
+        crate::config::get_rule_config_value::<String>(&broken, "MD004", "style"),
+        None,
+        "precondition: the config cannot be resolved while the user config is broken"
+    );
+
+    fs::write(&user_config, "[MD007]\nindent = 4\n").unwrap();
+
+    let fixed = server
+        .resolve_config_for_file_impl(&md_file, Some(&user_config_dir), Some(&home_dir))
+        .await;
+    assert_eq!(
+        crate::config::get_rule_config_value::<String>(&fixed, "MD004", "style"),
+        Some("asterisk".to_string()),
+        "the config should resolve as soon as the user config parses again"
+    );
+}
+
+/// Control for the test above: with a valid user config, the same tree resolves to
+/// the nearer markdownlint config. Without this, the assertion above would also
+/// pass if the walk never reached that config in the first place.
+#[tokio::test]
+async fn test_resolve_config_uses_the_nearer_markdownlint_config_when_the_user_config_loads() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp = tempdir().unwrap();
+    let root = temp.path().resolve_like_server();
+    let project = root.join("project");
+    let sub = project.join("sub");
+    let user_config_dir = root.join("xdg");
+    let home_dir = root.join("fakehome");
+
+    fs::create_dir_all(&sub).unwrap();
+    fs::create_dir_all(user_config_dir.join("rumdl")).unwrap();
+    fs::create_dir_all(&home_dir).unwrap();
+    fs::write(
+        user_config_dir.join("rumdl").join("rumdl.toml"),
+        "[MD007]\nindent = 4\n",
+    )
+    .unwrap();
+
+    fs::write(project.join(".rumdl.toml"), "[MD004]\nstyle = \"dash\"\n").unwrap();
+    fs::write(
+        sub.join(".markdownlint.json"),
+        r#"{ "MD004": { "style": "asterisk" } }"#,
+    )
+    .unwrap();
+
+    let md_file = sub.join("test.md");
+    fs::write(&md_file, "").unwrap();
+
+    let server = create_test_server();
+    {
+        let mut roots = server.workspace_roots.write().await;
+        roots.push(project.clone());
+    }
+
+    let config = server
+        .resolve_config_for_file_impl(&md_file, Some(&user_config_dir), Some(&home_dir))
+        .await;
+
+    assert_eq!(
+        crate::config::get_rule_config_value::<String>(&config, "MD004", "style"),
+        Some("asterisk".to_string()),
+        "the nearer markdownlint config should win over the parent rumdl config"
+    );
+    assert_eq!(
+        crate::config::get_rule_config_value::<usize>(&config, "MD007", "indent"),
+        Some(4),
+        "and it should carry the user config as its base"
+    );
+}
+
+/// The editor must resolve the same configuration `rumdl check` does, so a
+/// project that opts into `.editorconfig` gets those settings here too.
+#[tokio::test]
+async fn test_resolve_config_applies_editorconfig_when_the_project_opts_in() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp = tempdir().unwrap();
+    let root = temp.path().resolve_like_server();
+    let project = root.join("project");
+    let user_config_dir = root.join("xdg");
+    let home_dir = root.join("fakehome");
+
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(user_config_dir.join("rumdl")).unwrap();
+    fs::create_dir_all(&home_dir).unwrap();
+
+    fs::write(project.join(".rumdl.toml"), "[global]\neditorconfig = true\n").unwrap();
+    fs::write(
+        project.join(".editorconfig"),
+        "root = true\n[*.md]\nmax_line_length = 111\nindent_size = 4\n",
+    )
+    .unwrap();
+
+    let md_file = project.join("test.md");
+    fs::write(&md_file, "").unwrap();
+
+    let server = create_test_server();
+    {
+        let mut roots = server.workspace_roots.write().await;
+        roots.push(project.clone());
+    }
+
+    let config = server
+        .resolve_config_for_file_impl(&md_file, Some(&user_config_dir), Some(&home_dir))
+        .await;
+
+    assert_eq!(config.global.line_length.get(), 111, "max_line_length should apply");
+    assert_eq!(
+        crate::config::get_rule_config_value::<usize>(&config, "MD007", "indent"),
+        Some(4),
+        "indent_size should apply"
+    );
+}
+
+/// The config cache is keyed by directory, but `.editorconfig` sections can name
+/// a single file. Two neighbours must still resolve to their own settings.
+#[tokio::test]
+async fn test_resolve_config_applies_editorconfig_sections_per_file() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp = tempdir().unwrap();
+    let root = temp.path().resolve_like_server();
+    let project = root.join("project");
+    let user_config_dir = root.join("xdg");
+    let home_dir = root.join("fakehome");
+
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(user_config_dir.join("rumdl")).unwrap();
+    fs::create_dir_all(&home_dir).unwrap();
+
+    fs::write(project.join(".rumdl.toml"), "[global]\neditorconfig = true\n").unwrap();
+    fs::write(
+        project.join(".editorconfig"),
+        "root = true\n[narrow.md]\nmax_line_length = 40\n[wide.md]\nmax_line_length = 120\n",
+    )
+    .unwrap();
+
+    let narrow = project.join("narrow.md");
+    let wide = project.join("wide.md");
+    fs::write(&narrow, "").unwrap();
+    fs::write(&wide, "").unwrap();
+
+    let server = create_test_server();
+    {
+        let mut roots = server.workspace_roots.write().await;
+        roots.push(project.clone());
+    }
+
+    // Resolve the cached directory entry first, so the second file is answered
+    // from the cache: that is where a per-directory answer would leak.
+    let narrow_config = server
+        .resolve_config_for_file_impl(&narrow, Some(&user_config_dir), Some(&home_dir))
+        .await;
+    let wide_config = server
+        .resolve_config_for_file_impl(&wide, Some(&user_config_dir), Some(&home_dir))
+        .await;
+
+    assert_eq!(narrow_config.global.line_length.get(), 40);
+    assert_eq!(
+        wide_config.global.line_length.get(),
+        120,
+        "a cache hit must not reuse the neighbour's section"
+    );
+}
+
+/// Build a project whose config opts into `.editorconfig` when asked to, and a
+/// server that has already resolved the file's config once.
+#[cfg(test)]
+async fn server_with_resolved_editorconfig_project(opt_in: bool) -> (tempfile::TempDir, RumdlLanguageServer, PathBuf) {
+    use std::fs;
+
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().resolve_like_server();
+
+    let rumdl_toml = if opt_in {
+        "[global]\neditorconfig = true\n"
+    } else {
+        "[global]\n"
+    };
+    fs::write(project.join(".rumdl.toml"), rumdl_toml).unwrap();
+    fs::write(
+        project.join(".editorconfig"),
+        "root = true\n[*.md]\nmax_line_length = 40\n",
+    )
+    .unwrap();
+    let md_file = project.join("doc.md");
+    fs::write(&md_file, "# Title\n").unwrap();
+
+    let server = create_test_server();
+    server.workspace_roots.write().await.push(project.clone());
+    server.resolve_config_for_file(&md_file).await;
+    assert!(
+        !server.config_cache.read().await.is_empty(),
+        "the resolved config is what the change under test has to invalidate"
+    );
+
+    (temp, server, project)
+}
+
+fn editorconfig_changed(project: &std::path::Path) -> DidChangeWatchedFilesParams {
+    DidChangeWatchedFilesParams {
+        changes: vec![FileEvent {
+            uri: Url::from_file_path(project.join(".editorconfig")).unwrap(),
+            typ: FileChangeType::CHANGED,
+        }],
+    }
+}
+
+/// An `.editorconfig` edit changes what the editor should report, so it has to
+/// invalidate the cached configs the way any other config file does.
+#[tokio::test]
+async fn test_editorconfig_change_invalidates_the_config_cache() {
+    use tower_lsp::LanguageServer;
+
+    let (_temp, server, project) = server_with_resolved_editorconfig_project(true).await;
+
+    server.did_change_watched_files(editorconfig_changed(&project)).await;
+
+    assert!(
+        server.config_cache.read().await.is_empty(),
+        "an opted-in workspace must re-resolve after its .editorconfig changes"
+    );
+}
+
+/// Without the opt-in the file supplies nothing, so an edit to it cannot change
+/// a result and must not throw away work.
+#[tokio::test]
+async fn test_editorconfig_change_is_ignored_without_the_opt_in() {
+    use tower_lsp::LanguageServer;
+
+    let (_temp, server, project) = server_with_resolved_editorconfig_project(false).await;
+
+    server.did_change_watched_files(editorconfig_changed(&project)).await;
+
+    assert!(
+        !server.config_cache.read().await.is_empty(),
+        "a file rumdl does not read cannot invalidate anything"
+    );
+}
+
+/// Regression test for rumdl-vscode#115: an opt-in rule enabled via
+/// `extend-enable` in a `.config/rumdl.toml` at a parent directory must fire
+/// from the LSP, matching CLI behaviour.
+///
+/// Before the fix, the LSP's walk-up search only looked for `.rumdl.toml`,
+/// `rumdl.toml`, `pyproject.toml`, `.markdownlint.json` — missing
+/// `.config/rumdl.toml` — so it fell through to `Config::default()` and
+/// silently disabled opt-in rules.
+#[tokio::test]
+async fn test_resolve_config_finds_dotconfig_rumdl_toml() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let temp_path = temp_dir.path();
+
+    let project = temp_path.join("project");
+    let dotconfig = project.join(".config");
+    fs::create_dir_all(&dotconfig).unwrap();
+
+    let config_file = dotconfig.join("rumdl.toml");
+    fs::write(
+        &config_file,
+        r#"
+[global]
+extend-enable = ["MD060"]
+
+[MD060]
+style = "aligned"
+"#,
+    )
+    .unwrap();
+
+    // File nested below the config's parent directory
+    let deep_dir = project.join("sub").join("deeper");
+    fs::create_dir_all(&deep_dir).unwrap();
+    let test_file = deep_dir.join("test.md");
+    fs::write(&test_file, "# Test\n").unwrap();
+
+    let server = create_test_server();
+    {
+        let mut roots = server.workspace_roots.write().await;
+        roots.push(project.clone());
+    }
+
+    let config = server.resolve_config_for_file(&test_file).await;
+
+    // MD060 must appear in extend_enable so opt-in filtering picks it up
+    assert!(
+        config.global.extend_enable.iter().any(|r| r == "MD060"),
+        "LSP should discover `.config/rumdl.toml` when walking up from a nested file. \
+         extend_enable was {:?}",
+        config.global.extend_enable
+    );
+
+    // And the rule-specific [MD060] table should be loaded
+    assert!(
+        config.rules.contains_key("MD060"),
+        "LSP should load [MD060] table from `.config/rumdl.toml`"
+    );
+}
+
+/// Regression test for the exact scenario reported in rumdl-vscode#115:
+/// the LSP server is launched without any workspace folder (single-file
+/// open in VS Code), its CWD has no config, and the only relevant config
+/// lives in an ancestor directory as `.config/rumdl.toml`. The resolver
+/// must still find it by walking up to filesystem root.
+#[tokio::test]
+async fn test_resolve_config_no_workspace_finds_dotconfig_rumdl_toml() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    // Canonicalize to avoid `/private/tmp` vs `/tmp` mismatches on macOS when
+    // the resolver walks up through symlink'd parents.
+    let temp_path = std::fs::canonicalize(temp_dir.path()).unwrap();
+
+    let project = temp_path.join("project");
+    let dotconfig = project.join(".config");
+    fs::create_dir_all(&dotconfig).unwrap();
+    fs::write(
+        dotconfig.join("rumdl.toml"),
+        r#"
+[global]
+extend-enable = ["MD060"]
+
+[MD060]
+style = "aligned"
+"#,
+    )
+    .unwrap();
+
+    let deep_dir = project.join("sub").join("deeper");
+    fs::create_dir_all(&deep_dir).unwrap();
+    let test_file = deep_dir.join("test.md");
+    fs::write(&test_file, "# Test\n").unwrap();
+
+    let server = create_test_server();
+    // Explicitly leave workspace_roots empty — this is the single-file-open
+    // scenario where VS Code launches the LSP with no workspace folder.
+    assert!(server.workspace_roots.read().await.is_empty());
+
+    let config = server.resolve_config_for_file(&test_file).await;
+
+    assert!(
+        config.global.extend_enable.iter().any(|r| r == "MD060"),
+        "With no workspace root, LSP must still walk up to filesystem root \
+         and discover `.config/rumdl.toml`. extend_enable was {:?}",
+        config.global.extend_enable
+    );
+    assert!(
+        config.rules.contains_key("MD060"),
+        "With no workspace root, `[MD060]` table must still load"
+    );
+}
+
+/// Helper: create a test server with a CLI-supplied config path.
+fn create_test_server_with_cli_config(cli_config_path: &str) -> RumdlLanguageServer {
+    let path = cli_config_path.to_string();
+    let (service, _socket) = LspService::new(move |client| RumdlLanguageServer::new(client, Some(&path)));
+    service.inner().clone()
+}
+
+/// Issue #586: `rumdl server --config` must be authoritative for every file,
+/// overriding any locally-discoverable config that lives alongside the file.
+///
+/// The CLI's `check` command treats an explicit config path as standalone (see
+/// `src/config/loading.rs` -- "If explicit config path provided -> use ONLY that").
+/// The LSP must mirror that contract; otherwise distributing a canonical ruleset
+/// via `rumdl server --config <plugin-config>` silently fails whenever the user's
+/// project happens to contain its own config file.
+#[tokio::test]
+async fn test_cli_config_overrides_local_project_config() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let temp_path = temp_dir.path();
+
+    // The user's project has its own .rumdl.toml -- this MUST be ignored
+    // when the server was started with --config pointing elsewhere.
+    let project = temp_path.join("user_project");
+    fs::create_dir(&project).unwrap();
+    fs::write(
+        project.join(".rumdl.toml"),
+        r#"
+[global]
+
+[MD013]
+line_length = 50
+"#,
+    )
+    .unwrap();
+
+    // The CLI-supplied config (e.g. shipped with a Claude Code plugin).
+    let cli_config = temp_path.join("plugin").join(".rumdl.toml");
+    fs::create_dir_all(cli_config.parent().unwrap()).unwrap();
+    fs::write(
+        &cli_config,
+        r#"
+[global]
+
+[MD013]
+line_length = 200
+"#,
+    )
+    .unwrap();
+
+    let server = create_test_server_with_cli_config(cli_config.to_str().unwrap());
+    server.load_configuration(false).await;
+
+    {
+        let mut roots = server.workspace_roots.write().await;
+        roots.push(project.clone());
+    }
+
+    let test_file = project.join("doc.md");
+    fs::write(&test_file, "# Test\n").unwrap();
+
+    let resolved = server.resolve_config_for_file(&test_file).await;
+    let line_length = crate::config::get_rule_config_value::<usize>(&resolved, "MD013", "line_length");
+
+    assert_eq!(
+        line_length,
+        Some(200),
+        "Issue #586: explicit --config must win over a locally-discoverable .rumdl.toml. \
+         Got line_length={line_length:?} (expected 200 from CLI config, not 50 from project)."
+    );
+}
+
+/// Issue #586 (related): the CLI-supplied config path must survive a client
+/// `initialize` that wholesale-replaces `self.config`. Many editors send
+/// initialization options without a `configPath`, and the existing implementation
+/// dropped the CLI value when that happened.
+#[tokio::test]
+async fn test_cli_config_survives_init_options_without_config_path() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let cli_config = temp_dir.path().join("cli.toml");
+    fs::write(
+        &cli_config,
+        r#"
+[global]
+
+[MD013]
+line_length = 175
+"#,
+    )
+    .unwrap();
+
+    let server = create_test_server_with_cli_config(cli_config.to_str().unwrap());
+
+    // Simulate `initialize` receiving init options that do NOT specify a
+    // configPath -- the existing implementation overwrites self.config
+    // wholesale (see src/lsp/server.rs::initialize).
+    {
+        let mut config = server.config.write().await;
+        *config = RumdlLspConfig {
+            config_path: None,
+            enable_auto_fix: true,
+            ..RumdlLspConfig::default()
+        };
+    }
+
+    server.load_configuration(false).await;
+
+    let project = temp_dir.path().join("project");
+    fs::create_dir(&project).unwrap();
+    let file = project.join("doc.md");
+    fs::write(&file, "# Test\n").unwrap();
+
+    let resolved = server.resolve_config_for_file(&file).await;
+    let line_length = crate::config::get_rule_config_value::<usize>(&resolved, "MD013", "line_length");
+
+    assert_eq!(
+        line_length,
+        Some(175),
+        "Issue #586: client init options without configPath must not erase the CLI --config. \
+         Got line_length={line_length:?} (expected 175 from CLI config)."
+    );
+}
+
+/// Issue #586 (regression guard surfaced by code review): when the client changes
+/// `configPath` at runtime via `workspace/didChangeConfiguration`, the in-memory
+/// `rumdl_config` must be reloaded from the new file. Without this, the explicit-config
+/// fast path in `resolve_config_for_file` keeps returning the previously-loaded config
+/// and the client's setting change is silently ignored.
+#[tokio::test]
+async fn test_runtime_config_path_change_reloads_config() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+
+    let initial_config = temp_dir.path().join("initial.toml");
+    fs::write(
+        &initial_config,
+        r#"
+[global]
+
+[MD013]
+line_length = 60
+"#,
+    )
+    .unwrap();
+
+    let updated_config = temp_dir.path().join("updated.toml");
+    fs::write(
+        &updated_config,
+        r#"
+[global]
+
+[MD013]
+line_length = 240
+"#,
+    )
+    .unwrap();
+
+    let server = create_test_server();
+
+    // Simulate client `initialize` setting an initial configPath.
+    {
+        let mut config = server.config.write().await;
+        *config = RumdlLspConfig {
+            config_path: Some(initial_config.to_string_lossy().to_string()),
+            ..RumdlLspConfig::default()
+        };
+    }
+    server.load_configuration(false).await;
+
+    // Sanity: the initial config is in effect.
+    let project = temp_dir.path().join("project");
+    fs::create_dir(&project).unwrap();
+    let file = project.join("doc.md");
+    fs::write(&file, "# Test\n").unwrap();
+
+    let resolved = server.resolve_config_for_file(&file).await;
+    assert_eq!(
+        crate::config::get_rule_config_value::<usize>(&resolved, "MD013", "line_length"),
+        Some(60),
+        "Initial configPath should be in effect."
+    );
+
+    // Simulate the client switching configPath via did_change_configuration.
+    let new_settings = serde_json::json!({
+        "rumdl": {
+            "configPath": updated_config.to_string_lossy().to_string()
+        }
+    });
+    server
+        .did_change_configuration(tower_lsp::lsp_types::DidChangeConfigurationParams { settings: new_settings })
+        .await;
+
+    let resolved = server.resolve_config_for_file(&file).await;
+    assert_eq!(
+        crate::config::get_rule_config_value::<usize>(&resolved, "MD013", "line_length"),
+        Some(240),
+        "Issue #586 (P1): runtime configPath change must reload the config; fast-path must not \
+         return the stale rumdl_config from the previous configPath."
+    );
+}
+
+/// Issue #586 (precedence): when both `rumdl server --config` and a client-supplied
+/// `configPath` are present, the CLI flag wins. The user's stated rationale -- shipping
+/// a canonical ruleset alongside a plugin -- requires this; otherwise the editor
+/// can silently override the distributed config.
+#[tokio::test]
+async fn test_cli_config_overrides_client_init_config_path() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let cli_config = temp_dir.path().join("cli.toml");
+    fs::write(
+        &cli_config,
+        r#"
+[global]
+
+[MD013]
+line_length = 220
+"#,
+    )
+    .unwrap();
+
+    let client_config = temp_dir.path().join("client.toml");
+    fs::write(
+        &client_config,
+        r#"
+[global]
+
+[MD013]
+line_length = 40
+"#,
+    )
+    .unwrap();
+
+    let server = create_test_server_with_cli_config(cli_config.to_str().unwrap());
+
+    // Simulate the client passing its own configPath via init options.
+    {
+        let mut config = server.config.write().await;
+        *config = RumdlLspConfig {
+            config_path: Some(client_config.to_string_lossy().to_string()),
+            ..RumdlLspConfig::default()
+        };
+    }
+
+    server.load_configuration(false).await;
+
+    let project = temp_dir.path().join("project");
+    fs::create_dir(&project).unwrap();
+    let file = project.join("doc.md");
+    fs::write(&file, "# Test\n").unwrap();
+
+    let resolved = server.resolve_config_for_file(&file).await;
+    let line_length = crate::config::get_rule_config_value::<usize>(&resolved, "MD013", "line_length");
+
+    assert_eq!(
+        line_length,
+        Some(220),
+        "Issue #586: --config must outrank client init configPath. \
+         Got line_length={line_length:?} (expected 220 from CLI config, not 40 from client)."
+    );
+}
+
+/// Regression test for issue #588: `rumdl server` (LSP) must honour
+/// alias-based disable lists in `.markdownlint-cli2.yaml`.
+///
+/// The reporter saw `MD033` violations from the LSP for a file containing
+/// `<b>...</b>`, even though the project's `.markdownlint-cli2.yaml` set
+/// `no-inline-html: false`. The CLI honoured the same config.
+///
+/// Root cause: the markdownlint parser pushed the alias (`"no-inline-html"`)
+/// into `global.disable`, and `rules::filter_rules` matched against
+/// `Rule::name()` (`"MD033"`) with plain string equality. The CLI compensated
+/// by canonicalising at filter time; the LSP did not, causing silent
+/// divergence.
+///
+/// The fix establishes an invariant — every `Config` returned from a
+/// mutation boundary has canonical rule IDs in its rule lists — enforced
+/// by `Config::canonicalize_rule_lists` in `From<SourcedConfig> for Config`,
+/// LSP `apply_lsp_settings_*`, and WASM `to_config_with_warnings`.
+///
+/// This test asserts both halves of the parity contract:
+/// 1. `MD033` is filtered out of the LSP's enabled rule set.
+/// 2. The LSP produces no `MD033` diagnostics for the reporter's exact
+///    reproduction file.
+#[tokio::test]
+async fn test_issue_588_lsp_honours_markdownlint_cli2_alias_disable() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().expect("create temp dir");
+    let project = temp_dir.path().resolve_like_server();
+
+    fs::write(
+        project.join(".markdownlint-cli2.yaml"),
+        "---\nconfig:\n  no-inline-html: false\n",
+    )
+    .expect("write .markdownlint-cli2.yaml");
+
+    // Reporter's exact reproduction file (frontmatter + inline HTML).
+    let test_md = project.join("test.md");
+    let content = "---\ntitle: Heading\n---\n\nTest Markdown<b>1</b>.\n";
+    fs::write(&test_md, content).expect("write test.md");
+
+    let server = create_test_server();
+    server.workspace_roots.write().await.push(project.clone());
+
+    let resolved_config = server.resolve_config_for_file(&test_md).await;
+
+    // Invariant: alias was canonicalised to "MD033" in the disable list.
+    assert!(
+        resolved_config.global.disable.iter().any(|r| r == "MD033"),
+        "Issue #588: alias-based disable in .markdownlint-cli2.yaml must be canonicalised \
+         to MD033 in the resolved Config. Got disable list: {:?}",
+        resolved_config.global.disable,
+    );
+    assert!(
+        !resolved_config.global.disable.iter().any(|r| r == "no-inline-html"),
+        "Issue #588: the alias \"no-inline-html\" must NOT remain in the disable list \
+         after canonicalisation. Got disable list: {:?}",
+        resolved_config.global.disable,
+    );
+
+    // Filter rules through the same path the LSP uses; MD033 must be excluded.
+    let all_rules = crate::rules::all_rules(&resolved_config);
+    let filtered_rules = crate::rules::filter_rules(&all_rules, &resolved_config.global);
+    assert!(
+        !filtered_rules.iter().any(|r| r.name() == "MD033"),
+        "Issue #588: MD033 must be filtered out when .markdownlint-cli2.yaml sets \
+         no-inline-html: false. Filtered rule names: {:?}",
+        filtered_rules.iter().map(|r| r.name()).collect::<Vec<_>>(),
+    );
+
+    // End-to-end: lint_document must produce no MD033 diagnostics.
+    let uri = Url::from_file_path(&test_md).unwrap();
+    let diagnostics = server.lint_document(&uri, content, true).await.unwrap();
+    let md033_diagnostics: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| {
+            d.code
+                .as_ref()
+                .is_some_and(|c| matches!(c, NumberOrString::String(s) if s == "MD033"))
+        })
+        .collect();
+    assert!(
+        md033_diagnostics.is_empty(),
+        "Issue #588: LSP must emit no MD033 diagnostics for the reporter's reproduction. \
+         Got {} diagnostic(s): {:?}",
+        md033_diagnostics.len(),
+        md033_diagnostics
+            .iter()
+            .map(|d| format!("line {}: {}", d.range.start.line, d.message))
+            .collect::<Vec<_>>(),
+    );
+}
+
+/// Companion to `test_issue_588_lsp_honours_markdownlint_cli2_alias_disable`:
+/// the same invariant must hold when a user writes aliases directly in
+/// `.rumdl.toml` (`disable = ["line-length"]`). Before the canonical-IDs
+/// invariant, this also silently failed for non-CLI consumers.
+#[tokio::test]
+async fn test_alias_in_rumdl_toml_disable_is_canonicalized() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().expect("create temp dir");
+    let project = temp_dir.path().resolve_like_server();
+
+    fs::write(
+        project.join(".rumdl.toml"),
+        "[global]\ndisable = [\"line-length\", \"no-inline-html\"]\n",
+    )
+    .expect("write .rumdl.toml");
+
+    let test_md = project.join("test.md");
+    fs::write(&test_md, "# Title\n").expect("write test.md");
+
+    let server = create_test_server();
+    server.workspace_roots.write().await.push(project.clone());
+
+    let resolved = server.resolve_config_for_file(&test_md).await;
+    assert!(
+        resolved.global.disable.iter().any(|r| r == "MD013"),
+        "Alias `line-length` in .rumdl.toml must be canonicalised to MD013. Got: {:?}",
+        resolved.global.disable,
+    );
+    assert!(
+        resolved.global.disable.iter().any(|r| r == "MD033"),
+        "Alias `no-inline-html` in .rumdl.toml must be canonicalised to MD033. Got: {:?}",
+        resolved.global.disable,
+    );
+    assert!(
+        !resolved
+            .global
+            .disable
+            .iter()
+            .any(|r| r == "line-length" || r == "no-inline-html"),
+        "Aliases must not remain in the disable list after canonicalisation. Got: {:?}",
+        resolved.global.disable,
+    );
+
+    let all_rules = crate::rules::all_rules(&resolved);
+    let filtered = crate::rules::filter_rules(&all_rules, &resolved.global);
+    assert!(
+        !filtered.iter().any(|r| r.name() == "MD013" || r.name() == "MD033"),
+        "filter_rules must exclude MD013 and MD033 when their aliases are in disable. \
+         Got: {:?}",
+        filtered.iter().map(|r| r.name()).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn test_lsp_config_walk_stops_at_home_boundary() {
+    // A config file in $HOME is user-level, not a project config. When the linted file
+    // lives in a config-less directory under $HOME and no workspace root bounds the walk
+    // (single-file edit), the upward project-config search must NOT return ~/.rumdl.toml.
+    // Otherwise it shadows the platform user-config dir, which is exactly the precedence
+    // inversion reported on Windows (%HOMEPATH%\.rumdl.toml beating %APPDATA%\rumdl).
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp = tempdir().unwrap();
+    let fake_home = temp.path().join("home");
+    let work_dir = fake_home.join("notes").join("subdir");
+    fs::create_dir_all(&work_dir).unwrap();
+    fs::write(fake_home.join(".rumdl.toml"), "[global]\ndisable = [\"MD041\"]\n").unwrap();
+
+    let candidates = crate::config::collect_project_config_candidates(&work_dir, None, Some(&fake_home));
+
+    assert!(
+        candidates.is_empty(),
+        "Home dotfile must not be discovered as a project config, got: {candidates:?}"
+    );
+}
+
+#[test]
+fn test_lsp_config_walk_finds_project_config_below_home() {
+    // The home boundary must not suppress a genuine project config that lives in a
+    // subdirectory of $HOME -- only $HOME itself is off-limits as a project root.
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp = tempdir().unwrap();
+    let fake_home = temp.path().join("home");
+    let project = fake_home.join("project");
+    let nested = project.join("docs");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(project.join(".rumdl.toml"), "[global]\ndisable = [\"MD013\"]\n").unwrap();
+
+    let candidates = crate::config::collect_project_config_candidates(&nested, None, Some(&fake_home));
+
+    assert_eq!(
+        candidates.first(),
+        Some(&project.join(".rumdl.toml")),
+        "A real project config below $HOME must still be discovered"
+    );
+}
+
+#[test]
+fn test_lsp_config_walk_collects_same_dir_fallback_candidates() {
+    // Within a directory, every config file is collected in precedence order so the
+    // caller can fall through to a lower-precedence file when a higher-precedence one
+    // fails to load. Without this, a stale/malformed `.rumdl.toml` would hide a valid
+    // markdownlint config sitting next to it.
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp = tempdir().unwrap();
+    let dir = temp.path().join("proj");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join(".rumdl.toml"), "[global]\ndisable = [\"MD013\"]\n").unwrap();
+    fs::write(dir.join(".markdownlint.json"), "{}\n").unwrap();
+
+    // Bound the walk to this directory (workspace root) so only its own files are scanned.
+    let candidates = crate::config::collect_project_config_candidates(&dir, Some(&dir), None);
+
+    assert_eq!(
+        candidates,
+        vec![dir.join(".rumdl.toml"), dir.join(".markdownlint.json")],
+        "both same-directory config files must be collected in precedence order"
+    );
+}
+
+#[tokio::test]
+async fn test_apply_all_fixes_matches_cli_fix_engine() {
+    // apply_all_fixes routes through the FixCoordinator, so editor fix-all
+    // must produce byte-identical output to the CLI fix engine for the same
+    // content and config, including cascading fixes that need more than one
+    // pass (a single-pass loop would leave residue here).
+    let server = create_test_server();
+    let uri = Url::parse("file:///test.md").unwrap();
+    let text = "#Title  \nSome text   \n- item\n-  item2\n## Sub##\nmore text";
+
+    let lsp_fixed = server
+        .apply_all_fixes(&uri, text)
+        .await
+        .unwrap()
+        .expect("content has fixable violations");
+
+    let config = crate::config::Config::default();
+    let all_rules = crate::rules::all_rules(&config);
+    let rules = crate::rules::filter_rules(&all_rules, &config.global);
+    let mut cli_fixed = text.to_string();
+    crate::fix_coordinator::FixCoordinator::new()
+        .apply_fixes_iterative(&rules, &[], &mut cli_fixed, &config, 100, None)
+        .expect("CLI fix engine must converge");
+
+    assert_eq!(lsp_fixed, cli_fixed, "editor fix-all must match the CLI fix engine");
+    assert_ne!(lsp_fixed, text, "the test content must actually change");
+}
+
+/// Editor fix-all must hand back the document in its own line-ending
+/// convention. `rumdl fmt` normalises a file to LF before fixing and restores
+/// the original ending on write; the LSP used to pass the editor's text to the
+/// fix engine as-is, so a rule whose `fix()` rebuilds the document with
+/// `join("\n")` (MD032 here) returned a CRLF document as LF, and the
+/// whole-document edit then rewrote every line ending in the buffer.
+#[tokio::test]
+async fn test_apply_all_fixes_keeps_the_documents_line_endings() {
+    let server = create_test_server();
+    let uri = Url::parse("file:///crlf.md").unwrap();
+    let lf = "# Title\n\nText\n- item\n";
+    let crlf = lf.replace('\n', "\r\n");
+
+    let lf_fixed = server
+        .apply_all_fixes(&uri, lf)
+        .await
+        .unwrap()
+        .expect("MD032 must fix the LF document");
+    // Control: the fix ran and rebuilt the document (a blank line before the list).
+    assert_eq!(lf_fixed, "# Title\n\nText\n\n- item\n");
+
+    let crlf_fixed = server
+        .apply_all_fixes(&uri, &crlf)
+        .await
+        .unwrap()
+        .expect("MD032 must fix the CRLF document");
+    assert_eq!(
+        crlf_fixed,
+        lf_fixed.replace('\n', "\r\n"),
+        "the CRLF document must come back as the LF result with its endings restored"
+    );
+
+    // A CRLF document with nothing to fix must not be reported as changed.
+    let clean_crlf = "# Title\r\n\r\nText\r\n\r\n- item\r\n";
+    assert_eq!(server.apply_all_fixes(&uri, clean_crlf).await.unwrap(), None);
+}
+
+/// "Format Document" on a CRLF buffer must keep it CRLF through both phases:
+/// the rule fixes and the editor's formatting options.
+#[tokio::test]
+async fn test_formatting_keeps_crlf_line_endings() {
+    let server = create_test_server();
+    let uri = Url::parse("file:///format-crlf.md").unwrap();
+    let input = "# Title  \r\n\r\nText\r\n- item\r\n\r\n\r\n";
+    let (after_first, after_second) = format_twice(&server, &uri, input).await;
+
+    assert_eq!(after_first, "# Title\r\n\r\nText\r\n\r\n- item\r\n");
+    assert_eq!(
+        after_first, after_second,
+        "formatting must reach a fixpoint in one pass"
+    );
+}
+
+/// A single quick fix copies the rule's replacement into a `TextEdit`. On a
+/// CRLF buffer a fix that inserts a line ending (MD022 and MD032 here, and
+/// MD047 at the end) used to insert a bare `\n`, leaving the buffer with mixed
+/// endings after the very edit meant to clean it up.
+#[tokio::test]
+async fn test_quick_fix_edits_use_the_documents_crlf_line_ending() {
+    let server = create_test_server();
+    let uri = Url::parse("file:///quick-fix-crlf.md").unwrap();
+    let text = "# Title\r\nText\r\n- item\r\ntext";
+    let range = Range {
+        start: Position { line: 0, character: 0 },
+        end: Position { line: 3, character: 4 },
+    };
+
+    let actions = server.get_code_actions(&uri, text, range).await.unwrap();
+    let new_texts: Vec<String> = actions
+        .iter()
+        .filter_map(|action| action.edit.as_ref())
+        .filter_map(|edit| edit.changes.as_ref())
+        .flat_map(|changes| changes.values().flatten())
+        .map(|edit| edit.new_text.clone())
+        .collect();
+
+    let has_bare_lf = |text: &str| {
+        let bytes = text.as_bytes();
+        bytes
+            .iter()
+            .enumerate()
+            .any(|(i, b)| *b == b'\n' && (i == 0 || bytes[i - 1] != b'\r'))
+    };
+    let bare: Vec<_> = new_texts.iter().filter(|t| has_bare_lf(t)).collect();
+    assert!(
+        bare.is_empty(),
+        "quick fix inserted a bare LF into a CRLF buffer: {bare:?}"
+    );
+    // Control: line-inserting quick fixes were offered at all.
+    assert!(
+        new_texts.iter().filter(|t| t.contains("\r\n")).count() >= 3,
+        "expected MD022, MD032 and MD047 quick fixes inserting CRLF; got {new_texts:?}"
+    );
+}
+
+/// Regression test for rumdl-intellij#2: a multi-line diagnostic's quick fixes
+/// must be offered on every line the diagnostic spans, not only the warning's
+/// anchor (first) line. IntelliJ requests code actions for the cursor's line, so
+/// with the bug a user whose cursor sat on a later line of a flagged paragraph
+/// saw an empty light-bulb popup even though the squiggle covered that line.
+#[tokio::test]
+async fn test_code_action_offered_across_multiline_diagnostic_span() {
+    use tempfile::tempdir;
+
+    let server = create_test_server();
+
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    std::fs::write(
+        temp_dir.path().join("pyproject.toml"),
+        r#"
+[tool.rumdl]
+flavor = "mkdocs"
+line_length = 120
+
+[tool.rumdl.MD013]
+reflow = true
+reflow-mode = "semantic-line-breaks"
+"#,
+    )
+    .unwrap();
+
+    // One paragraph across three physical lines holding two sentences; in
+    // semantic-line-breaks mode rumdl flags the whole paragraph (0-indexed
+    // lines 2..=4) with a single MD013 warning anchored at line 2.
+    let content = "# Title\n\nBefore creating a task and sending it to the background, validate that all\nrequired resources exist. We want to fail early if we now, that e.g a\nworkbook with a passed `workbook_id` does not exist.\n";
+    let test_md_path = temp_dir.path().join("test.md");
+    std::fs::write(&test_md_path, content).unwrap();
+
+    let canonical_temp = temp_dir.path().resolve_like_server();
+    server.workspace_roots.write().await.push(canonical_temp);
+
+    let canonical_test_path = test_md_path.resolve_like_server();
+    let uri = Url::from_file_path(&canonical_test_path).unwrap();
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+
+    // Cursor on the LAST line of the flagged paragraph (0-indexed line 4) must
+    // still surface the MD013 reflow quick fix, not just the document-wide
+    // "Fix all" source action.
+    let range = Range {
+        start: Position { line: 4, character: 0 },
+        end: Position { line: 4, character: 0 },
+    };
+    let actions = server.get_code_actions(&uri, content, range).await.unwrap();
+
+    assert!(
+        actions.iter().any(|a| a.title.contains("semantic line breaks")),
+        "MD013 reflow quick fix must be offered on the last line of the flagged paragraph, got: {:?}",
+        actions.iter().map(|a| &a.title).collect::<Vec<_>>()
+    );
+}
+
+/// Apply one LSP `formatting` pass and return the resulting document content,
+/// persisting it back to the server (mimicking the editor applying the edit).
+/// The handler returns a single whole-document edit, so `new_text` is the full
+/// new content.
+async fn format_once(server: &RumdlLanguageServer, uri: &Url, options: &FormattingOptions) -> String {
+    let before = server.documents.read().await.get(uri).unwrap().content.clone();
+    let params = DocumentFormattingParams {
+        text_document: TextDocumentIdentifier { uri: uri.clone() },
+        options: options.clone(),
+        work_done_progress_params: WorkDoneProgressParams::default(),
+    };
+    let after = match server.formatting(params).await.unwrap() {
+        Some(edits) if !edits.is_empty() => edits[0].new_text.clone(),
+        _ => before,
+    };
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: after.clone(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+    after
+}
+
+/// Standard editor formatting options used by the formatting tests.
+fn editor_formatting_options() -> FormattingOptions {
+    FormattingOptions {
+        tab_size: 4,
+        insert_spaces: true,
+        properties: HashMap::new(),
+        trim_trailing_whitespace: Some(true),
+        insert_final_newline: Some(true),
+        trim_final_newlines: Some(true),
+    }
+}
+
+/// Build a test server whose resolved config sets MD030 `ul-single`/`ul-multi`,
+/// using the same config representation the CLI loads from a `rumdl.toml`.
+async fn server_with_md030_spacing(ul_single: usize, ul_multi: usize) -> RumdlLanguageServer {
+    let server = create_test_server();
+    let mut config = crate::config::Config::default();
+    let toml_src = format!("[MD030]\nul-single = {ul_single}\nul-multi = {ul_multi}\n");
+    let parsed: toml::Table = toml::from_str(&toml_src).unwrap();
+    for (key, value) in parsed {
+        let mut values = std::collections::BTreeMap::new();
+        if let toml::Value::Table(table) = value {
+            for (k, v) in table {
+                values.insert(k, v);
+            }
+        }
+        config
+            .rules
+            .insert(key, crate::config::RuleConfig { severity: None, values });
+    }
+    *server.rumdl_config.write().await = config;
+    // Force config resolution to use the injected config instead of on-disk discovery.
+    server.config.write().await.config_path = Some("rumdl.toml".to_string());
+    server
+}
+
+/// Store `content` under `uri`, format it twice, and return both results so the
+/// caller can assert the formatting handler reaches a fixpoint in a single pass.
+async fn format_twice(server: &RumdlLanguageServer, uri: &Url, content: &str) -> (String, String) {
+    server.documents.write().await.insert(
+        uri.clone(),
+        DocumentEntry {
+            content: content.to_string(),
+            version: Some(1),
+            from_disk: false,
+        },
+    );
+    let options = editor_formatting_options();
+    let first = format_once(server, uri, &options).await;
+    let second = format_once(server, uri, &options).await;
+    (first, second)
+}
+
+/// Regression for rvben/rumdl-vscode#145: a single "Format Document" must reach a
+/// fixpoint. Nested lists whose marker spacing AND continuation indent both need
+/// adjusting (MD030 `ul-single`/`ul-multi` = 3) used to need several passes in the
+/// editor because the LSP formatting handler applied fixes in a single pass.
+/// `rumdl check --fix` converges in one run by iterating to a fixpoint; the
+/// formatting handler must do the same.
+#[tokio::test]
+async fn test_formatting_idempotent_cascading_list_indent_issue_145() {
+    let server = server_with_md030_spacing(3, 3).await;
+    let uri = Url::parse("file:///nested.md").unwrap();
+    // The exact testcase from the issue.
+    let input = indoc! {"
+        - Bullet 1
+            - Sub-bullet with long text that is long enough that it is wrapped onto
+              multiple lines.
+        - Bullet 2
+    "};
+
+    let (after_first, after_second) = format_twice(&server, &uri, input).await;
+
+    assert_eq!(
+        after_first, after_second,
+        "formatting must reach a fixpoint in one pass (rvben/rumdl-vscode#145):\n--- after first pass ---\n{after_first}\n--- after second pass ---\n{after_second}"
+    );
+
+    // A single pass must also land on the exact fixpoint that `rumdl check --fix`
+    // (the iterative engine) produces for this input and config. With the markers
+    // widened to `-   ` (content column 4), the sub-bullet stays nested under the
+    // parent at column 4 rather than detaching to column 2 (MD007 aligns it to the
+    // parent's widened content column).
+    let expected = indoc! {"
+        -   Bullet 1
+            -   Sub-bullet with long text that is long enough that it is wrapped onto
+                multiple lines.
+        -   Bullet 2
+    "};
+    assert_eq!(
+        after_first, expected,
+        "one formatting pass should match the `rumdl check --fix` fixpoint, got:\n{after_first}"
+    );
+}
+
+/// Same root cause as #145 but with continuation lines at both nesting levels:
+/// widening the markers cascades into re-indenting each level's continuation, so
+/// a single-pass formatter could not converge. One pass must now be a fixpoint.
+#[tokio::test]
+async fn test_formatting_idempotent_nested_continuation_both_levels() {
+    let server = server_with_md030_spacing(3, 3).await;
+    let uri = Url::parse("file:///both-levels.md").unwrap();
+    let input = "- Outer item with text long enough that it is\n  wrapped onto a second line here.\n  - Inner item with text long enough that it is\n    wrapped onto a second line here.\n";
+
+    let (after_first, after_second) = format_twice(&server, &uri, input).await;
+
+    assert_eq!(
+        after_first, after_second,
+        "formatting must reach a fixpoint in one pass with continuation at both levels:\n--- after first pass ---\n{after_first}\n--- after second pass ---\n{after_second}"
+    );
+    // Both markers were widened to three spaces after the bullet.
+    assert!(
+        after_first.contains("-   Outer"),
+        "outer marker widened, got:\n{after_first}"
+    );
+    assert!(
+        after_first.contains("-   Inner"),
+        "inner marker widened, got:\n{after_first}"
+    );
+}
+
+/// The formatting handler routes through `apply_all_fixes`, which must keep
+/// applying the LSP-specific config (VS Code settings), not just the on-disk
+/// file config. Disabling MD030 via the LSP `disable_rules` setting must stop
+/// the formatter from re-spacing list markers, even though the file config
+/// enables MD030 `ul-single`/`ul-multi` = 3.
+#[tokio::test]
+async fn test_formatting_honors_lsp_disable_rules() {
+    let server = server_with_md030_spacing(3, 3).await;
+    // LSP-specific override: a VS Code user/workspace setting disabling MD030.
+    server.config.write().await.disable_rules = Some(vec!["MD030".to_string()]);
+
+    let uri = Url::parse("file:///lsp-disable.md").unwrap();
+    let input = "- Bullet 1\n  - Sub-bullet here.\n- Bullet 2\n";
+    let (after_first, _after_second) = format_twice(&server, &uri, input).await;
+
+    // MD030 is disabled through LSP settings, so markers keep their single space.
+    assert!(
+        !after_first.contains("-   "),
+        "LSP disable_rules must suppress MD030 marker spacing during formatting, got:\n{after_first}"
+    );
+    assert!(
+        after_first.contains("- Bullet 1"),
+        "single-space marker must be preserved, got:\n{after_first}"
+    );
+}
+
+/// One workspace/working-directory arrangement to resolve a file under.
+struct WorkspaceDiscoveryCase {
+    name: &'static str,
+    /// The MD007 indent `project/.rumdl.toml` sets, or `None` to leave the project
+    /// without a config of its own.
+    project_indent: Option<usize>,
+    /// The workspace root the client declares, relative to the temp root.
+    workspace_root: &'static str,
+    /// The directory holding the file being edited, relative to the temp root.
+    file_dir: &'static str,
+    /// The MD007 indent the file must resolve to.
+    expected_indent: usize,
+}
+
+/// The server must resolve a file's configuration from the workspace, never from
+/// the directory the editor happened to launch it in.
+///
+/// `rumdl check` discovers upward from the working directory because that is the
+/// scope the user chose. A server's working directory is whatever the editor was
+/// started in, so an unrelated project sitting there used to supply the settings
+/// for a workspace that had none. Each case pins the resolved value against what
+/// `rumdl check` resolves for the same file, and against the value itself so a
+/// change moving both together could not pass.
+///
+/// Mutates the process working directory, so it runs serially.
+#[tokio::test]
+#[serial_test::serial]
+async fn test_lsp_resolves_from_the_workspace_not_the_working_directory() {
+    use crate::config::{Config, SourcedConfig};
+    use std::fs;
+    use tempfile::tempdir;
+
+    const USER_INDENT: usize = 5;
+    const CWD_INDENT: usize = 7;
+
+    let cases = [
+        // The reported divergence: nothing in the workspace, so an unrelated
+        // project at the working directory used to answer for it.
+        WorkspaceDiscoveryCase {
+            name: "cwd_config_does_not_leak_into_the_workspace",
+            project_indent: None,
+            workspace_root: "project",
+            file_dir: "project/nested",
+            expected_indent: USER_INDENT,
+        },
+        WorkspaceDiscoveryCase {
+            name: "workspace_config_outranks_the_working_directory",
+            project_indent: Some(3),
+            workspace_root: "project",
+            file_dir: "project/nested",
+            expected_indent: 3,
+        },
+        // Opening a subdirectory as the workspace: the per-file walk stops at the
+        // declared root, so only the workspace-level walk can reach the config
+        // above it, which is the one `rumdl check` finds from the same file.
+        WorkspaceDiscoveryCase {
+            name: "config_above_the_workspace_root_still_applies",
+            project_indent: Some(3),
+            workspace_root: "project/docs",
+            file_dir: "project/docs",
+            expected_indent: 3,
+        },
+    ];
+
+    let mut failures = Vec::new();
+    for case in cases {
+        let temp = tempdir().unwrap();
+        let root = temp.path().resolve_like_server();
+        let project = root.join("project");
+        let other = root.join("other");
+        let user_config_dir = root.join("xdg");
+        let home_dir = root.join("fakehome");
+
+        fs::create_dir_all(project.join("nested")).unwrap();
+        fs::create_dir_all(project.join("docs")).unwrap();
+        fs::create_dir_all(project.join(".git")).unwrap();
+        fs::create_dir_all(other.join(".git")).unwrap();
+        fs::create_dir_all(user_config_dir.join("rumdl")).unwrap();
+        fs::create_dir_all(&home_dir).unwrap();
+
+        fs::write(
+            user_config_dir.join("rumdl").join("rumdl.toml"),
+            format!("[MD007]\nindent = {USER_INDENT}\n"),
+        )
+        .unwrap();
+        // An unrelated project that the server process happens to sit in.
+        fs::write(other.join(".rumdl.toml"), format!("[MD007]\nindent = {CWD_INDENT}\n")).unwrap();
+        if let Some(indent) = case.project_indent {
+            fs::write(project.join(".rumdl.toml"), format!("[MD007]\nindent = {indent}\n")).unwrap();
+        }
+
+        let file_dir = root.join(case.file_dir);
+        let md_file = file_dir.join("test.md");
+        fs::write(&md_file, "").unwrap();
+
+        let prev_cwd = std::env::current_dir().unwrap();
+
+        // What `rumdl check` resolves for this file, run from the file's directory.
+        std::env::set_current_dir(&file_dir).unwrap();
+        let cli = SourcedConfig::load_with_discovery_impl(None, None, false, Some(&user_config_dir), Some(&home_dir));
+        std::env::set_current_dir(&prev_cwd).unwrap();
+        let cli_config: Config = cli.expect("CLI config should load").into_validated_unchecked().into();
+        let cli_indent = crate::config::get_rule_config_value::<usize>(&cli_config, "MD007", "indent");
+
+        // What the server resolves for it, launched from the unrelated project.
+        let server = create_test_server();
+        server
+            .workspace_roots
+            .write()
+            .await
+            .push(root.join(case.workspace_root));
+        std::env::set_current_dir(&other).unwrap();
+        server
+            .load_configuration_impl(false, Some(&user_config_dir), Some(&home_dir))
+            .await;
+        std::env::set_current_dir(&prev_cwd).unwrap();
+        let lsp_config = server
+            .resolve_config_for_file_impl(&md_file, Some(&user_config_dir), Some(&home_dir))
+            .await;
+        let lsp_indent = crate::config::get_rule_config_value::<usize>(&lsp_config, "MD007", "indent");
+
+        // Collected rather than asserted so one failing arrangement does not hide
+        // the others.
+        if cli_indent != Some(case.expected_indent) {
+            failures.push(format!(
+                "{}: the case does not describe what `rumdl check` resolves: expected MD007.indent {:?}, CLI resolved {cli_indent:?}",
+                case.name, case.expected_indent
+            ));
+        }
+        if lsp_indent != Some(case.expected_indent) {
+            failures.push(format!(
+                "{}: server resolved MD007.indent from the wrong scope: expected {:?}, got {lsp_indent:?}",
+                case.name, case.expected_indent
+            ));
+        }
+    }
+
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Each workspace root is its own project. A file in a root that holds no config
+/// must not inherit the settings of a sibling root that does: `rumdl check` inside
+/// that root would resolve its own scope, and nothing about opening a second folder
+/// in the editor changes which project a file belongs to.
+#[tokio::test]
+async fn test_a_workspace_root_without_config_does_not_inherit_a_sibling_roots_config() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp = tempdir().unwrap();
+    let root = temp.path().resolve_like_server();
+    let configured = root.join("configured");
+    let bare = root.join("bare");
+    let user_config_dir = root.join("userconfig");
+    let home_dir = root.join("fakehome");
+
+    fs::create_dir_all(&configured).unwrap();
+    fs::create_dir_all(&bare).unwrap();
+    fs::create_dir_all(&user_config_dir).unwrap();
+    fs::create_dir_all(&home_dir).unwrap();
+    fs::write(configured.join(".rumdl.toml"), "[MD007]\nindent = 4\n").unwrap();
+
+    let configured_file = configured.join("doc.md");
+    let bare_file = bare.join("doc.md");
+    fs::write(&configured_file, "").unwrap();
+    fs::write(&bare_file, "").unwrap();
+
+    // Both folders are open, the configured one first, so it is the root the server
+    // treats as primary.
+    let server = create_test_server();
+    {
+        let mut roots = server.workspace_roots.write().await;
+        roots.push(configured.clone());
+        roots.push(bare.clone());
+    }
+    server
+        .load_configuration_impl(false, Some(&user_config_dir), Some(&home_dir))
+        .await;
+
+    let in_configured = server
+        .resolve_config_for_file_impl(&configured_file, Some(&user_config_dir), Some(&home_dir))
+        .await;
+    let in_bare = server
+        .resolve_config_for_file_impl(&bare_file, Some(&user_config_dir), Some(&home_dir))
+        .await;
+
+    // Positive control: the config is reached where it belongs, so the assertion
+    // below cannot pass for want of a working config.
+    assert_eq!(
+        crate::config::get_rule_config_value::<usize>(&in_configured, "MD007", "indent"),
+        Some(4),
+        "a file in the configured root must use that root's config"
+    );
+    assert_eq!(
+        crate::config::get_rule_config_value::<usize>(&in_bare, "MD007", "indent"),
+        None,
+        "a file in the root without a config must fall back to defaults, not the sibling root's config"
+    );
+}
+
+/// The per-file walk stops at the workspace root, so a config above the root is
+/// found only by resolving that root's own scope. Every root gets that treatment,
+/// not just the first one the editor happened to send.
+#[tokio::test]
+async fn test_a_secondary_workspace_root_resolves_a_config_above_itself() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp = tempdir().unwrap();
+    let root = temp.path().resolve_like_server();
+    let primary = root.join("primary");
+    let parent = root.join("parent");
+    let secondary = parent.join("secondary");
+    let user_config_dir = root.join("userconfig");
+    let home_dir = root.join("fakehome");
+
+    fs::create_dir_all(&primary).unwrap();
+    fs::create_dir_all(&secondary).unwrap();
+    fs::create_dir_all(parent.join(".git")).unwrap(); // bound the upward walk here
+    fs::create_dir_all(&user_config_dir).unwrap();
+    fs::create_dir_all(&home_dir).unwrap();
+    fs::write(primary.join(".rumdl.toml"), "[MD007]\nindent = 4\n").unwrap();
+    fs::write(parent.join(".rumdl.toml"), "[MD007]\nindent = 3\n").unwrap();
+
+    let md_file = secondary.join("doc.md");
+    fs::write(&md_file, "").unwrap();
+
+    let server = create_test_server();
+    {
+        let mut roots = server.workspace_roots.write().await;
+        roots.push(primary.clone());
+        roots.push(secondary.clone());
+    }
+    server
+        .load_configuration_impl(false, Some(&user_config_dir), Some(&home_dir))
+        .await;
+
+    let config = server
+        .resolve_config_for_file_impl(&md_file, Some(&user_config_dir), Some(&home_dir))
+        .await;
+
+    assert_eq!(
+        crate::config::get_rule_config_value::<usize>(&config, "MD007", "indent"),
+        Some(3),
+        "the secondary root must resolve the config above it, not the primary root's"
+    );
+}
+
+/// A root whose own scope cannot be resolved is still not the primary root's project.
+/// Falling back to the server's startup config there would lint it under another
+/// project's settings for as long as the broken config stays broken.
+#[tokio::test]
+async fn test_a_secondary_workspace_root_with_a_broken_config_falls_back_to_defaults() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp = tempdir().unwrap();
+    let root = temp.path().resolve_like_server();
+    let primary = root.join("primary");
+    let parent = root.join("parent");
+    let secondary = parent.join("secondary");
+    let user_config_dir = root.join("userconfig");
+    let home_dir = root.join("fakehome");
+
+    fs::create_dir_all(&primary).unwrap();
+    fs::create_dir_all(&secondary).unwrap();
+    fs::create_dir_all(parent.join(".git")).unwrap(); // bound the upward walk here
+    fs::create_dir_all(&user_config_dir).unwrap();
+    fs::create_dir_all(&home_dir).unwrap();
+    fs::write(primary.join(".rumdl.toml"), "[MD007]\nindent = 4\n").unwrap();
+    fs::write(parent.join(".rumdl.toml"), "[MD007\nindent = 3\n").unwrap();
+
+    let md_file = secondary.join("doc.md");
+    fs::write(&md_file, "").unwrap();
+
+    let server = create_test_server();
+    {
+        let mut roots = server.workspace_roots.write().await;
+        roots.push(primary.clone());
+        roots.push(secondary.clone());
+    }
+    server
+        .load_configuration_impl(false, Some(&user_config_dir), Some(&home_dir))
+        .await;
+
+    let config = server
+        .resolve_config_for_file_impl(&md_file, Some(&user_config_dir), Some(&home_dir))
+        .await;
+
+    assert_eq!(
+        crate::config::get_rule_config_value::<usize>(&config, "MD007", "indent"),
+        None,
+        "an unresolvable scope must fall back to defaults, not to another root's config"
+    );
+}
+
+/// Block until the background index worker reports the workspace indexed.
+///
+/// Panics rather than returning on timeout: every caller's assertion is
+/// meaningless against a half-built index, so a silent proceed would turn a
+/// stalled worker into a confident wrong answer.
+async fn wait_for_index_ready(server: &RumdlLanguageServer) {
+    for _ in 0..1000 {
+        if matches!(*server.index_state.read().await, crate::lsp::types::IndexState::Ready) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("workspace index never became ready");
+}
+
+/// Wait until one indexed file reaches a caller-defined state.
+async fn wait_for_index_entry(
+    server: &RumdlLanguageServer,
+    path: &std::path::Path,
+    matches: impl Fn(&crate::workspace_index::FileIndex) -> bool,
+) {
+    for _ in 0..1000 {
+        let matched = {
+            let index = server.workspace_index.read().await;
+            index.get_file(path).is_some_and(&matches)
+        };
+        if matched {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!(
+        "workspace index entry for {} never reached the expected state",
+        path.display()
+    );
+}
+
+/// A nested config governs both the initial workspace scan and later debounced
+/// buffer updates. The flavor assertion catches path resolution drift; the
+/// anchor assertion catches rule construction from the root config.
+#[tokio::test]
+async fn test_workspace_index_uses_nested_config_for_full_and_incremental_updates() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp = tempdir().unwrap();
+    let root = temp.path().resolve_like_server();
+    let nested = root.join("docs");
+    let user_config_dir = root.join("userconfig");
+    let home_dir = root.join("fakehome");
+    fs::create_dir_all(&nested).unwrap();
+    fs::create_dir_all(&user_config_dir).unwrap();
+    fs::create_dir_all(&home_dir).unwrap();
+
+    fs::write(
+        root.join(".rumdl.toml"),
+        "[global]\nflavor = \"standard\"\n\n[MD051]\nanchor-style = \"python-markdown\"\n",
+    )
+    .unwrap();
+    fs::write(
+        nested.join(".rumdl.toml"),
+        "[global]\nflavor = \"mkdocs\"\n\n[MD051]\nanchor-style = \"github\"\n",
+    )
+    .unwrap();
+
+    let doc_path = nested.join("guide.md");
+    let initial = "# Getting Started — Advanced\n\n# -8<- [start:section]\n";
+    fs::write(&doc_path, initial).unwrap();
+
+    let server = create_test_server();
+    *server.workspace_roots.write().await = vec![root.clone()];
+    server
+        .load_configuration_impl(false, Some(&user_config_dir), Some(&home_dir))
+        .await;
+
+    assert!(server.queue_index_update(IndexUpdate::FullRescan).await);
+    wait_for_index_ready(&server).await;
+
+    {
+        let index = server.workspace_index.read().await;
+        let file = index.get_file(&doc_path).expect("nested document should be indexed");
+        assert_eq!(file.headings.len(), 1, "MkDocs must hide its snippet marker");
+        assert_eq!(
+            file.headings[0].auto_anchor, "getting-started--advanced",
+            "the nested MD051 anchor style must override the root rule config"
+        );
+    }
+
+    let changed = "# Updated — Heading\n\n# -8<- [start:other]\n";
+    assert!(
+        server
+            .queue_index_update(IndexUpdate::FileChanged {
+                path: doc_path.clone(),
+                content: changed.to_string(),
+            })
+            .await
+    );
+    wait_for_index_entry(&server, &doc_path, |file| {
+        file.headings.len() == 1
+            && file.headings[0].text == "Updated — Heading"
+            && file.headings[0].auto_anchor == "updated--heading"
+    })
+    .await;
+}
+
+/// Editing a nested config clears the resolver cache and makes the rescan use
+/// the new scope. Waiting on the entry, rather than merely `IndexState::Ready`,
+/// avoids racing the worker before it observes the queued rescan.
+#[tokio::test]
+async fn test_nested_config_change_rebuilds_index_with_new_effective_config() {
+    use std::fs;
+    use tempfile::tempdir;
+    use tower_lsp::LanguageServer;
+
+    let temp = tempdir().unwrap();
+    let root = temp.path().resolve_like_server();
+    let nested = root.join("docs");
+    let user_config_dir = root.join("userconfig");
+    let home_dir = root.join("fakehome");
+    fs::create_dir_all(&nested).unwrap();
+    fs::create_dir_all(&user_config_dir).unwrap();
+    fs::create_dir_all(&home_dir).unwrap();
+    fs::write(root.join(".rumdl.toml"), "[global]\nflavor = \"standard\"\n").unwrap();
+
+    let nested_config = nested.join(".rumdl.toml");
+    fs::write(
+        &nested_config,
+        "[global]\nflavor = \"standard\"\n\n[MD051]\nanchor-style = \"python-markdown\"\n",
+    )
+    .unwrap();
+    let doc_path = nested.join("guide.md");
+    fs::write(&doc_path, "# Getting Started — Advanced\n\n# -8<- [start:section]\n").unwrap();
+
+    let server = create_test_server();
+    *server.workspace_roots.write().await = vec![root.clone()];
+    server
+        .load_configuration_impl(false, Some(&user_config_dir), Some(&home_dir))
+        .await;
+    assert!(server.queue_index_update(IndexUpdate::FullRescan).await);
+    wait_for_index_ready(&server).await;
+
+    {
+        let index = server.workspace_index.read().await;
+        let file = index.get_file(&doc_path).expect("nested document should be indexed");
+        assert_eq!(
+            file.headings.len(),
+            2,
+            "control: Standard parses the marker as a heading"
+        );
+        assert_eq!(file.headings[0].auto_anchor, "getting-started-advanced");
+    }
+
+    fs::write(
+        &nested_config,
+        "[global]\nflavor = \"mkdocs\"\n\n[MD051]\nanchor-style = \"github\"\n",
+    )
+    .unwrap();
+    server
+        .did_change_watched_files(DidChangeWatchedFilesParams {
+            changes: vec![FileEvent {
+                uri: Url::from_file_path(&nested_config).unwrap(),
+                typ: FileChangeType::CHANGED,
+            }],
+        })
+        .await;
+
+    wait_for_index_entry(&server, &doc_path, |file| {
+        file.headings.len() == 1 && file.headings[0].auto_anchor == "getting-started--advanced"
+    })
+    .await;
+}
+
+/// Issue #792: MD051's `check-frontmatter` found a broken fragment under
+/// `rumdl check` but not under `rumdl server`.
+///
+/// The server built its own workspace index instead of asking the rules what a
+/// file contributes, so the frontmatter link never entered the index and the
+/// cross-file check had nothing to resolve. Everything a rule's configuration
+/// decides about indexing was invisible to the editor.
+#[tokio::test]
+async fn test_frontmatter_link_fragments_are_checked_by_the_server() {
+    use std::fs;
+    use tempfile::tempdir;
+    use tower_lsp::LanguageServer;
+
+    let temp = tempdir().unwrap();
+    let root = temp.path().resolve_like_server();
+    let user_config_dir = root.join("userconfig");
+    let home_dir = root.join("fakehome");
+    fs::create_dir_all(&user_config_dir).unwrap();
+    fs::create_dir_all(&home_dir).unwrap();
+
+    fs::write(
+        root.join(".rumdl.toml"),
+        "[global]\nenable = [\"MD051\"]\n\n[MD051]\ncheck-frontmatter = true\n",
+    )
+    .unwrap();
+
+    let doc_path = root.join("test.md");
+    let text = "---\ntitle: Heading 1\nlink: 'test.md#heading'\n---\n\nThis is a Markdown file.\n";
+    fs::write(&doc_path, text).unwrap();
+
+    let server = create_test_server();
+    *server.workspace_roots.write().await = vec![root.clone()];
+    server
+        .load_configuration_impl(false, Some(&user_config_dir), Some(&home_dir))
+        .await;
+
+    assert!(server.queue_index_update(IndexUpdate::FullRescan).await);
+    wait_for_index_ready(&server).await;
+
+    let uri = Url::from_file_path(&doc_path).unwrap();
+    server
+        .did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: uri.clone(),
+                language_id: "markdown".to_string(),
+                version: 1,
+                text: text.to_string(),
+            },
+        })
+        .await;
+
+    let report = server
+        .diagnostic(DocumentDiagnosticParams {
+            text_document: TextDocumentIdentifier { uri },
+            identifier: None,
+            previous_result_id: None,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        })
+        .await
+        .expect("diagnostic request should succeed");
+
+    let DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(report)) = report else {
+        panic!("expected a full diagnostic report");
+    };
+    let diagnostics = report.full_document_diagnostic_report.items;
+
+    let md051: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.code == Some(NumberOrString::String("MD051".to_string())))
+        .collect();
+    assert_eq!(
+        md051.len(),
+        1,
+        "the frontmatter fragment should be flagged exactly once, got {diagnostics:?}"
+    );
+    assert_eq!(
+        md051[0].range.start.line, 2,
+        "the diagnostic belongs on the frontmatter line holding the link"
+    );
+    assert!(
+        md051[0].message.contains("heading") && md051[0].message.contains("test.md"),
+        "unexpected message: {}",
+        md051[0].message
+    );
+}
+
+/// The control for the test above: the same document without the configuration
+/// that asks for frontmatter checking must stay clean, so a passing run proves
+/// the server honored `check-frontmatter` rather than flagging frontmatter
+/// unconditionally.
+#[tokio::test]
+async fn test_frontmatter_link_fragments_are_left_alone_by_default() {
+    use std::fs;
+    use tempfile::tempdir;
+    use tower_lsp::LanguageServer;
+
+    let temp = tempdir().unwrap();
+    let root = temp.path().resolve_like_server();
+    let user_config_dir = root.join("userconfig");
+    let home_dir = root.join("fakehome");
+    fs::create_dir_all(&user_config_dir).unwrap();
+    fs::create_dir_all(&home_dir).unwrap();
+
+    fs::write(root.join(".rumdl.toml"), "[global]\nenable = [\"MD051\"]\n").unwrap();
+
+    let doc_path = root.join("test.md");
+    let text = "---\ntitle: Heading 1\nlink: 'test.md#heading'\n---\n\nThis is a Markdown file.\n";
+    fs::write(&doc_path, text).unwrap();
+
+    let server = create_test_server();
+    *server.workspace_roots.write().await = vec![root.clone()];
+    server
+        .load_configuration_impl(false, Some(&user_config_dir), Some(&home_dir))
+        .await;
+
+    assert!(server.queue_index_update(IndexUpdate::FullRescan).await);
+    wait_for_index_ready(&server).await;
+
+    let uri = Url::from_file_path(&doc_path).unwrap();
+    server
+        .did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: uri.clone(),
+                language_id: "markdown".to_string(),
+                version: 1,
+                text: text.to_string(),
+            },
+        })
+        .await;
+
+    let report = server
+        .diagnostic(DocumentDiagnosticParams {
+            text_document: TextDocumentIdentifier { uri },
+            identifier: None,
+            previous_result_id: None,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        })
+        .await
+        .expect("diagnostic request should succeed");
+
+    let DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(report)) = report else {
+        panic!("expected a full diagnostic report");
+    };
+
+    assert!(
+        report.full_document_diagnostic_report.items.is_empty(),
+        "frontmatter is not checked without check-frontmatter, got {:?}",
+        report.full_document_diagnostic_report.items
+    );
+}
+
+/// `initialize` canonicalizes each workspace root, so every index key descends
+/// from a canonical path. A document arrives as whatever URI the editor sent,
+/// which resolves to a path that need not be canonical: it can run through a
+/// symlinked ancestor, and on Windows it never carries the `\\?\` prefix that
+/// `canonicalize` adds. Looking the document up in its own index by that raw
+/// path found nothing, and every cross-file diagnostic silently disappeared.
+///
+/// The symlink is the portable way to build the skew. Windows reaches the same
+/// state with no symlink at all, which is how the test above caught this.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_cross_file_diagnostics_survive_a_symlinked_workspace_root() {
+    use std::fs;
+    use tempfile::tempdir;
+    use tower_lsp::LanguageServer;
+
+    let temp = tempdir().unwrap();
+    let base = temp.path().resolve_like_server();
+    let real = base.join("real");
+    let link = base.join("link");
+    fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let user_config_dir = base.join("userconfig");
+    let home_dir = base.join("fakehome");
+    fs::create_dir_all(&user_config_dir).unwrap();
+    fs::create_dir_all(&home_dir).unwrap();
+
+    fs::write(
+        real.join(".rumdl.toml"),
+        "[global]\nenable = [\"MD051\"]\n\n[MD051]\ncheck-frontmatter = true\n",
+    )
+    .unwrap();
+
+    let text = "---\ntitle: Heading 1\nlink: 'test.md#heading'\n---\n\nThis is a Markdown file.\n";
+    fs::write(real.join("test.md"), text).unwrap();
+
+    let server = create_test_server();
+    // What `initialize` stores: the root as the editor sent it, canonicalized.
+    *server.workspace_roots.write().await = vec![link.resolve_like_server()];
+    server
+        .load_configuration_impl(false, Some(&user_config_dir), Some(&home_dir))
+        .await;
+
+    assert!(server.queue_index_update(IndexUpdate::FullRescan).await);
+    wait_for_index_ready(&server).await;
+
+    // What the editor sends: the path the user navigated to, through the symlink.
+    let uri = Url::from_file_path(link.join("test.md")).unwrap();
+    server
+        .did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: uri.clone(),
+                language_id: "markdown".to_string(),
+                version: 1,
+                text: text.to_string(),
+            },
+        })
+        .await;
+
+    let report = server
+        .diagnostic(DocumentDiagnosticParams {
+            text_document: TextDocumentIdentifier { uri },
+            identifier: None,
+            previous_result_id: None,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        })
+        .await
+        .expect("diagnostic request should succeed");
+
+    let DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(report)) = report else {
+        panic!("expected a full diagnostic report");
+    };
+    let diagnostics = report.full_document_diagnostic_report.items;
+
+    let md051: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.code == Some(NumberOrString::String("MD051".to_string())))
+        .collect();
+    assert_eq!(
+        md051.len(),
+        1,
+        "a document opened through a symlinked root still resolves to its index entry, got {diagnostics:?}"
+    );
+}
+
+/// The other half of the resolution boundary: navigation resolves a link target
+/// and asks for that document's content by the resolved spelling, while the
+/// document store is keyed by the spelling the editor opened. Under a symlinked
+/// root the two differ, so without the alias the request falls through to the
+/// file on disk and previews content the buffer no longer has.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_hover_previews_the_open_buffer_under_a_symlinked_root() {
+    use std::fs;
+    use tempfile::tempdir;
+    use tower_lsp::LanguageServer;
+
+    let temp = tempdir().unwrap();
+    let base = temp.path().resolve_like_server();
+    let real = base.join("real");
+    let link = base.join("link");
+    fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let disk = "# Section\n\nDISK BODY\n\n[jump](#section)\n";
+    let buffer = "# Section\n\nBUFFER BODY\n\n[jump](#section)\n";
+    fs::write(real.join("doc.md"), disk).unwrap();
+
+    let server = create_test_server();
+    *server.workspace_roots.write().await = vec![link.resolve_like_server()];
+    assert!(server.queue_index_update(IndexUpdate::FullRescan).await);
+    wait_for_index_ready(&server).await;
+
+    let uri = Url::from_file_path(link.join("doc.md")).unwrap();
+    server
+        .did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: uri.clone(),
+                language_id: "markdown".to_string(),
+                version: 1,
+                text: buffer.to_string(),
+            },
+        })
+        .await;
+
+    let hover = server
+        .hover(HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position: Position { line: 4, character: 8 },
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        })
+        .await
+        .expect("hover should succeed");
+
+    let rendered = format!("{hover:?}");
+    assert!(
+        rendered.contains("BUFFER BODY"),
+        "hover previewed the disk copy instead of the open buffer: {rendered}"
+    );
+}
+
+/// One file can be open under both spellings at once, and the editor holds a
+/// separate buffer for each. A request names one of them, so the alias recorded
+/// for the other must not answer it.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_hover_previews_the_buffer_the_request_names() {
+    use std::fs;
+    use tempfile::tempdir;
+    use tower_lsp::LanguageServer;
+
+    let temp = tempdir().unwrap();
+    let base = temp.path().resolve_like_server();
+    let real = base.join("real");
+    let link = base.join("link");
+    fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let body = |marker: &str| format!("# Section\n\n{marker} BODY\n\n[jump](#section)\n");
+    fs::write(real.join("doc.md"), body("DISK")).unwrap();
+
+    let server = create_test_server();
+    *server.workspace_roots.write().await = vec![link.resolve_like_server()];
+    assert!(server.queue_index_update(IndexUpdate::FullRescan).await);
+    wait_for_index_ready(&server).await;
+
+    // The symlinked spelling is opened first, so its alias is the one on record.
+    for (path, marker) in [(link.join("doc.md"), "LINK"), (real.join("doc.md"), "REAL")] {
+        server
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: Url::from_file_path(path).unwrap(),
+                    language_id: "markdown".to_string(),
+                    version: 1,
+                    text: body(marker),
+                },
+            })
+            .await;
+    }
+
+    let hover = server
+        .hover(HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: Url::from_file_path(real.join("doc.md")).unwrap(),
+                },
+                position: Position { line: 4, character: 8 },
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        })
+        .await
+        .expect("hover should succeed");
+
+    let rendered = format!("{hover:?}");
+    assert!(
+        rendered.contains("REAL BODY"),
+        "hover answered for the other spelling's buffer: {rendered}"
+    );
+}
+
+/// A hover that previews a document nobody has opened caches it from disk under
+/// the resolved spelling. Opening that document makes the editor's buffer the
+/// truth, so the cached copy must stop answering for it.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_hover_prefers_a_newly_opened_buffer_over_its_cached_disk_copy() {
+    use std::fs;
+    use tempfile::tempdir;
+    use tower_lsp::LanguageServer;
+
+    let temp = tempdir().unwrap();
+    let base = temp.path().resolve_like_server();
+    let real = base.join("real");
+    let link = base.join("link");
+    fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let index = "# Index\n\n[doc](doc.md)\n";
+    fs::write(real.join("index.md"), index).unwrap();
+    fs::write(real.join("doc.md"), "# Doc\n\nDISK BODY\n").unwrap();
+
+    let server = create_test_server();
+    *server.workspace_roots.write().await = vec![link.resolve_like_server()];
+    assert!(server.queue_index_update(IndexUpdate::FullRescan).await);
+    wait_for_index_ready(&server).await;
+
+    let open = async |path: std::path::PathBuf, text: &str| {
+        server
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: Url::from_file_path(path).unwrap(),
+                    language_id: "markdown".to_string(),
+                    version: 1,
+                    text: text.to_string(),
+                },
+            })
+            .await;
+    };
+    let hover_over_the_link = async || {
+        server
+            .hover(HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: Url::from_file_path(link.join("index.md")).unwrap(),
+                    },
+                    // Inside the link destination, which is where hover reads one.
+                    position: Position { line: 2, character: 8 },
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .expect("hover should succeed")
+    };
+
+    open(link.join("index.md"), index).await;
+    let first = format!("{:?}", hover_over_the_link().await);
+    assert!(
+        first.contains("DISK BODY"),
+        "a document nobody opened is previewed from disk: {first}"
+    );
+
+    open(link.join("doc.md"), "# Doc\n\nBUFFER BODY\n").await;
+    let second = format!("{:?}", hover_over_the_link().await);
+    assert!(
+        second.contains("BUFFER BODY"),
+        "hover kept previewing the disk copy cached before the document was opened: {second}"
+    );
+}
+
+/// Two symlinks to one directory let the editor open the same file under two
+/// spellings, so closing either must leave the other reachable.
+///
+/// Both directions are asserted because each pins a different mistake. Closing
+/// the first-opened spelling catches an alias removed by resolved path alone,
+/// which strands the buffer still open; closing the last-opened one catches a
+/// single alias slot, where the second open already displaced the first.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_closing_one_spelling_leaves_the_other_reachable() {
+    use std::fs;
+    use tempfile::tempdir;
+    use tower_lsp::LanguageServer;
+
+    for (closed_first, expected) in [(true, "B BODY"), (false, "A BODY")] {
+        let temp = tempdir().unwrap();
+        let base = temp.path().resolve_like_server();
+        let real = base.join("real");
+        fs::create_dir_all(&real).unwrap();
+        let link_a = base.join("link_a");
+        let link_b = base.join("link_b");
+        std::os::unix::fs::symlink(&real, &link_a).unwrap();
+        std::os::unix::fs::symlink(&real, &link_b).unwrap();
+
+        let index = "# Index\n\n[doc](doc.md)\n";
+        fs::write(real.join("index.md"), index).unwrap();
+        fs::write(real.join("doc.md"), "# Doc\n\nDISK BODY\n").unwrap();
+
+        let server = create_test_server();
+        *server.workspace_roots.write().await = vec![link_a.resolve_like_server()];
+        assert!(server.queue_index_update(IndexUpdate::FullRescan).await);
+        wait_for_index_ready(&server).await;
+
+        for (path, text) in [
+            (link_a.join("index.md"), index),
+            (link_a.join("doc.md"), "# Doc\n\nA BODY\n"),
+            (link_b.join("doc.md"), "# Doc\n\nB BODY\n"),
+        ] {
+            server
+                .did_open(DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri: Url::from_file_path(path).unwrap(),
+                        language_id: "markdown".to_string(),
+                        version: 1,
+                        text: text.to_string(),
+                    },
+                })
+                .await;
+        }
+
+        let closing = if closed_first {
+            link_a.join("doc.md")
+        } else {
+            link_b.join("doc.md")
+        };
+        server
+            .did_close(DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier {
+                    uri: Url::from_file_path(closing).unwrap(),
+                },
+            })
+            .await;
+
+        // Resolves to `real/doc.md`, which neither remaining buffer is keyed by.
+        let hover = server
+            .hover(HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: Url::from_file_path(link_a.join("index.md")).unwrap(),
+                    },
+                    position: Position { line: 2, character: 8 },
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .expect("hover should succeed");
+
+        let rendered = format!("{hover:?}");
+        assert!(
+            rendered.contains(expected),
+            "closing the {} spelling lost the buffer still open under the other, wanted {expected}: {rendered}",
+            if closed_first { "first-opened" } else { "last-opened" }
+        );
+    }
+}
+
+/// The index worker reuses one index configuration per directory even when a
+/// project opts into `.editorconfig`, whose globs can distinguish two files in
+/// that directory. That optimization rests on an assumption this pins: `.editorconfig`
+/// reaches MD007, MD009, MD010, MD013 and MD047, none of which is
+/// workspace-scoped, while the index is built from the workspace-scoped rules
+/// and the file's flavor alone. So two files a `.editorconfig` genuinely
+/// separates still index identically, and the gate costs a rule-set
+/// construction per file for no difference. Should a workspace-scoped rule ever
+/// read a setting `.editorconfig` supplies, this fails and the cache must become
+/// sensitive to the file.
+#[tokio::test]
+async fn test_index_is_independent_of_editorconfig_settings() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let temp = tempdir().unwrap();
+    let root = temp.path().resolve_like_server();
+    let user_config_dir = root.join("userconfig");
+    let home_dir = root.join("fakehome");
+    fs::create_dir_all(&user_config_dir).unwrap();
+    fs::create_dir_all(&home_dir).unwrap();
+
+    fs::write(
+        root.join(".rumdl.toml"),
+        "[global]\neditorconfig = true\n\n[MD051]\nanchor-style = \"github\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".editorconfig"),
+        "root = true\n\n[a.md]\nmax_line_length = 40\nindent_size = 2\n\n[b.md]\nmax_line_length = 120\nindent_size = 8\n",
+    )
+    .unwrap();
+
+    let a = root.join("a.md");
+    let b = root.join("b.md");
+    let content = "# Heading One\n\nSee [x](other.md#anchor) and [y](#heading-one).\n\n* item\n  * nested\n";
+    fs::write(&a, content).unwrap();
+    fs::write(&b, content).unwrap();
+
+    let server = create_test_server();
+    *server.workspace_roots.write().await = vec![root.clone()];
+    server
+        .load_configuration_impl(false, Some(&user_config_dir), Some(&home_dir))
+        .await;
+
+    let ca = server
+        .resolve_config_for_file_impl(&a, Some(&user_config_dir), Some(&home_dir))
+        .await;
+    let cb = server
+        .resolve_config_for_file_impl(&b, Some(&user_config_dir), Some(&home_dir))
+        .await;
+
+    // Control: the two files really are separated, or the comparison below is
+    // vacuous. MD013's limit arrives as the global one, MD007's as its own.
+    let indent = |c: &crate::config::Config| {
+        c.rules
+            .get("MD007")
+            .and_then(|r| r.values.get("indent"))
+            .map(ToString::to_string)
+    };
+    assert_ne!(indent(&ca), indent(&cb), "control: editorconfig must reach the configs");
+    assert_ne!(
+        ca.global.line_length, cb.global.line_length,
+        "control: editorconfig must reach the configs"
+    );
+
+    let index_of = |c: &crate::config::Config, p: &std::path::Path| {
+        let rules = crate::lsp::index_worker::cross_file_rules(c);
+        let index =
+            crate::lsp::index_worker::IndexWorker::build_file_index(content, &rules, c.get_flavor_for_file(p), Some(p));
+        assert!(
+            !index.headings.is_empty() && !index.cross_file_links.is_empty(),
+            "control: the index must hold something for the comparison to mean anything"
+        );
+        format!("{:?}{:?}", index.headings, index.cross_file_links)
+    };
+    assert_eq!(
+        index_of(&ca, &a),
+        index_of(&cb, &b),
+        "no editorconfig setting reaches a workspace-scoped rule, so the index cannot differ"
+    );
+}
+
+/// The manual "Reflow paragraph" action measures the paragraph on LF text:
+/// its byte offsets count one byte per line ending, and it joins the reflowed
+/// lines with `\n`. Offered on a CRLF buffer as-is, the range drifted one
+/// column per preceding line ending (here it began on the blank line above the
+/// paragraph and ended inside "second line") and the replacement was LF, so
+/// applying it swallowed text and mixed the endings.
+#[tokio::test]
+async fn test_reflow_action_on_crlf_document_matches_the_lf_action() {
+    let server = create_test_server();
+    let uri = Url::parse("file:///reflow-crlf.md").unwrap();
+    let long = "word ".repeat(30);
+    let lf = format!("# Title\n\nintro\n{long}text\nsecond line\n\ntail\n");
+    let crlf = lf.replace('\n', "\r\n");
+    let range = Range {
+        start: Position { line: 3, character: 0 },
+        end: Position { line: 3, character: 0 },
+    };
+
+    async fn reflow_edit(server: &RumdlLanguageServer, uri: &Url, text: &str, range: Range) -> TextEdit {
+        let actions = server.get_code_actions(uri, text, range).await.unwrap();
+        let action = actions
+            .into_iter()
+            .find(|a| a.title == "Reflow paragraph")
+            .expect("MD013 must offer the reflow action on line 4");
+        let mut edits = action.edit.unwrap().changes.unwrap().remove(uri).unwrap();
+        assert_eq!(edits.len(), 1);
+        edits.pop().unwrap()
+    }
+
+    let lf_edit = reflow_edit(&server, &uri, &lf, range).await;
+    let crlf_edit = reflow_edit(&server, &uri, &crlf, range).await;
+
+    // Control: the LF action covers exactly the three-line paragraph.
+    assert_eq!(lf_edit.range.start, Position { line: 2, character: 0 });
+    assert_eq!(lf_edit.range.end, Position { line: 5, character: 0 });
+    assert!(lf_edit.new_text.starts_with("intro word") && lf_edit.new_text.ends_with("second line\n"));
+
+    assert_eq!(
+        crlf_edit.range, lf_edit.range,
+        "the CRLF action must cover the same lines"
+    );
+    assert_eq!(
+        crlf_edit.new_text,
+        lf_edit.new_text.replace('\n', "\r\n"),
+        "the CRLF action must reflow in the document's own line ending"
+    );
+}

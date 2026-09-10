@@ -1,0 +1,369 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      # mise-action installs the latest mise release when no version is given,
+      # so an unpinned step puts a same-week mise on every runner. The version
+      # is pinned at every call site across the workflows and moved
+      # deliberately.
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.8.14 # upd: github-releases jdx/mise
+          experimental: true
+          install: false
+
+      - name: Install mise tools
+        # Only what this job runs: the toolchain for rustfmt, clippy and the
+        # fuzz type-check, python for check-versions, actionlint and uv (for
+        # zizmor) for lint-actions. A bare install compiles cargo-binstall
+        # and cargo-edit from source, five minutes this job never used.
+        run: ./scripts/mise-install.sh rust python uv actionlint
+
+      - name: Install Rust components
+        run: rustup component add rustfmt clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+
+      - name: Check version references in sync with Cargo.toml
+        run: make check-versions
+
+      - name: Check Rust formatting
+        run: make fmt-check
+
+      - name: Run linting
+        run: make lint
+
+      - name: Check fuzz targets compile
+        run: make check-fuzz
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.8.14 # upd: github-releases jdx/mise
+          experimental: true
+          install: false
+
+      # mise installs a cargo: tool through cargo-binstall only when a
+      # cargo-binstall binary already exists, and cargo-binstall is itself a
+      # cargo: tool, so a fresh runner compiled it from source (four minutes
+      # here, eight on Windows) before anything could be binstalled. A prebuilt
+      # cargo-binstall on PATH breaks that loop: mise finds it and every
+      # cargo: tool, cargo-binstall's own mise copy included, installs in
+      # seconds.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-binstall
+
+      - name: Install mise tools
+        # The toolchain and nextest for the test run, python for the
+        # check-rule-docs script. cargo-binstall is named even though
+        # .mise.toml already declares it: mise resolves a cargo: tool's
+        # install dependency only when that dependency is itself in the
+        # requested set, and reports the shortfall as an offline failure.
+        run: ./scripts/mise-install.sh rust python "cargo:cargo-binstall" "cargo:cargo-nextest"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+
+      - name: Run tests
+        run: make test-ci
+
+      - name: Run doctests
+        run: make test-doc
+
+      # The checks below run the rumdl binary the test run just built, so
+      # they cost seconds here. Each used to sit in a job of its own or in
+      # Lint, where the same binary was built again from scratch.
+      - name: Check rule-count docs in sync with registry
+        run: make check-rule-docs
+
+      - name: Check code-block-tools docs in sync with registry
+        run: make check-code-block-tools
+
+      - name: Check rumdl.schema.json in sync with config
+        run: make check-schema
+
+      - name: Assert docs/ is fmt-clean
+        run: make docs-check
+
+  # Run the full test suite on Windows to catch platform-divergent behavior.
+  # Part of `all-checks-passed`, so a Windows failure fails the aggregate check on
+  # pushes to main. Skipped on pull requests (`if` below) to limit Windows runner
+  # minutes; on PRs it reports `skipped`, which the gate treats as a pass.
+  test-windows:
+    name: Test (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    if: github.event_name != 'pull_request'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.8.14 # upd: github-releases jdx/mise
+          experimental: true
+          install: false
+
+      # Prebuilt cargo-binstall so mise does not compile it first; see the
+      # Test job above.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-binstall
+
+      - name: Install mise tools
+        # Only what the test run needs. A bare install also pulls
+        # cargo-zigbuild, lychee and friends, and Windows has no prebuilt
+        # binaries for several of them, so cargo-binstall falls back to building
+        # from source and blows past the installer's 600s per-attempt timeout.
+        # That failed this job twice on unrelated commits.
+        #
+        # cargo-binstall is named even though .mise.toml already declares it:
+        # mise resolves a cargo: tool's install dependency only when that
+        # dependency is itself in the requested set, and reports the shortfall
+        # as an offline failure.
+        run: ./scripts/mise-install.sh rust "cargo:cargo-binstall" "cargo:cargo-nextest"
+
+      - name: Put the installed tools ahead of the mise shims on PATH
+        # mise-action puts its shims directory on PATH, so every rustc, rustup
+        # and cargo invocation goes through a mise shim. On Windows with mise
+        # 2026.8.x that makes rust-cache's silent toolchain probes (rustc -vV,
+        # rustup toolchain list, cargo metadata) take 7 to 17 minutes; the
+        # same job on mise 2025.8.18 took 5 seconds. Listing the tools' real
+        # bin directories ahead of the shims takes the shims out of every
+        # later step, and make's child shell then finds cargo-nextest without
+        # a `mise exec` wrapper. The shim also exported RUSTUP_TOOLCHAIN;
+        # rust-toolchain.toml pins the same toolchain for the bare rustup
+        # proxies.
+        run: mise bin-paths >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-windows
+
+      - name: Install make
+        run: choco install make --no-progress -y
+
+      - name: Run tests
+        # Use the no-fail-fast target so one canary run enumerates every
+        # Windows failure.
+        run: make test-ci-no-fail-fast
+
+  code-block-tools:
+    name: Code-block tools
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      # Provision the fast-to-install built-in tools so the execution harness actually
+      # exercises them here. Heavy toolchains (ormolu/Haskell, ktfmt/JVM, swift-format,
+      # nixfmt) and cargo-compile tools (taplo, stylua, oxfmt) are left out: their
+      # harness tests skip, and the coverage gate still accounts for them. mise is not
+      # used here so its `uv` shim cannot shadow pipx; Python tools go in a clean venv.
+      - name: Install external code-block tools
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck clang-format
+          python3 -m venv "$HOME/cbt-venv"
+          # Pin code-block-tool versions so CI stays reproducible and an upstream
+          # release cannot break the job; bump these deliberately.
+          "$HOME/cbt-venv/bin/pip" install --quiet ruff==0.15.22 black==26.5.1 sqlfluff==4.2.2 djlint==1.40.10 beautysh==6.4.3
+          echo "$HOME/cbt-venv/bin" >> "$GITHUB_PATH"
+          npm install -g prettier elm-format
+          go install mvdan.cc/sh/v3/cmd/shfmt@latest
+          go install github.com/google/yamlfmt/cmd/yamlfmt@latest
+          go install golang.org/x/tools/cmd/goimports@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          # shuck ships prebuilt binaries (the linter is the shuck-cli package;
+          # `shuck check -` needs >= 0.0.43 for stdin support, `shuck format -`
+          # is exercised by shuck:format; latest covers both).
+          curl -fsSL https://github.com/ewhauser/shuck/releases/latest/download/shuck-cli-x86_64-unknown-linux-gnu.tar.xz | tar -xJ -C /tmp
+          sudo install /tmp/shuck-cli-x86_64-unknown-linux-gnu/shuck /usr/local/bin/
+
+      - name: Run code-block tools execution harness
+        run: make test-code-block-tools
+
+  # Validates the container machinery (Dockerfile, make targets, both image
+  # platforms actually run) on every push, so image regressions surface here
+  # instead of mid-release. Stages the latest *released* musl binaries; no
+  # compilation happens, the current code itself is covered by `test`.
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Stage latest released binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: make docker-binaries-release
+
+      - name: Register QEMU binfmt handlers
+        run: make docker-binfmt
+
+      - name: Verify image on all platforms
+        run: make docker-verify
+
+  # Build the CLI for WASI on every push so the wasm32 build guards (the `wasi`
+  # feature, the pid/jemalloc/LSP cfgs) can't silently regress between releases.
+  build-wasi:
+    name: Build (WASI)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.8.14 # upd: github-releases jdx/mise
+          experimental: true
+          install: false
+
+      - name: Install Rust toolchain
+        run: ./scripts/mise-install.sh rust
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-wasi
+
+      # Pinned below v47.0.0, which turns the wasi-threads `-S threads` flag into
+      # a hard error. Bump alongside the smoke-wasi invocation when migrating.
+      - name: Install wasmtime
+        run: |
+          set -eux
+          curl -sSfL https://github.com/bytecodealliance/wasmtime/releases/download/v46.0.1/wasmtime-v46.0.1-x86_64-linux.tar.xz \
+            | tar -xJ
+          echo "${PWD}/wasmtime-v46.0.1-x86_64-linux" >> "$GITHUB_PATH"
+
+      - name: Build and smoke-test the WASI CLI under wasmtime
+        run: make smoke-wasi
+
+  # Build the browser/npm wasm package on every push so the `wasm` feature path
+  # (published to npm) can't silently regress between releases. Mirrors the
+  # release build via the shared `make build-wasm` target.
+  build-wasm:
+    name: Build (browser wasm)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.8.14 # upd: github-releases jdx/mise
+          experimental: true
+          install: false
+
+      - name: Install Rust toolchain
+        run: ./scripts/mise-install.sh rust
+
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@wasm-pack
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-wasm
+
+      - name: Build browser wasm package
+        run: make build-wasm
+
+      - name: Test wasm bindings (host)
+        run: make test-wasm
+
+  # Verify the crate still builds on its declared MSRV (Cargo.toml
+  # `rust-version`). CI otherwise builds on a newer pinned toolchain, so a
+  # feature stabilized after the MSRV floor would pass every other job while
+  # silently breaking users pinned to the MSRV.
+  msrv:
+    name: MSRV build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-msrv
+
+      - name: Check build on the declared MSRV
+        run: make msrv-check
+
+  all-checks-passed:
+    name: All checks passed
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [lint, test, test-windows, code-block-tools, docker, build-wasi, build-wasm, msrv]
+    if: always()
+    steps:
+      - name: Verify all checks passed
+        run: |
+          if [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" == "true" ]; then
+            echo "❌ Some checks failed or were cancelled"
+            exit 1
+          fi
+          echo "✅ All checks passed!"

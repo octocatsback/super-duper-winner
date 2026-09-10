@@ -1,0 +1,1121 @@
+#![warn(unreachable_pub)]
+#![warn(clippy::pedantic)]
+// Style-only pedantic lints we don't enforce. Each one generated >5 occurrences
+// that were either deliberate design choices or too noisy for the value
+// delivered. Categories that flag potential bugs stay on.
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::must_use_candidate)]
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::missing_panics_doc)]
+#![allow(clippy::too_many_lines)]
+#![allow(clippy::if_not_else)]
+#![allow(clippy::similar_names)]
+#![allow(clippy::wildcard_imports)]
+#![allow(clippy::case_sensitive_file_extension_comparisons)]
+#![allow(clippy::doc_link_with_quotes)]
+#![allow(clippy::needless_raw_string_hashes)]
+#![allow(clippy::trivially_copy_pass_by_ref)]
+#![allow(clippy::struct_excessive_bools)]
+#![allow(clippy::fn_params_excessive_bools)]
+#![allow(clippy::elidable_lifetime_names)]
+#![allow(clippy::return_self_not_must_use)]
+#![allow(clippy::redundant_else)]
+#![allow(clippy::single_match_else)]
+#![allow(clippy::needless_continue)]
+#![allow(clippy::semicolon_if_nothing_returned)]
+#![allow(clippy::ignored_unit_patterns)]
+#![allow(clippy::unreadable_literal)]
+#![allow(clippy::implicit_hasher)]
+#![allow(clippy::ref_option)]
+#![allow(clippy::struct_field_names)]
+#![allow(clippy::unused_self)]
+#![allow(clippy::unnested_or_patterns)]
+#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::cast_sign_loss)]
+#![allow(clippy::cast_possible_wrap)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_lossless)]
+#![allow(clippy::items_after_statements)]
+#![allow(clippy::match_same_arms)]
+#![allow(clippy::format_push_string)]
+// Test smoke-constructors like `let _formatter = Foo;` fire this lint,
+// but are acceptable: they verify the type exists without asserting behavior.
+#![allow(clippy::no_effect_underscore_binding)]
+// Style-only: `Default::default()` vs `T::default()`. Both are readable.
+#![allow(clippy::default_trait_access)]
+// Style-only: `"".to_string()` vs `String::new()`. Tests favor the former
+// for symmetry with non-empty string literals.
+#![allow(clippy::manual_string_new)]
+
+pub mod code_block_tools;
+pub mod config;
+pub mod discovery;
+pub mod doc_comment_lint;
+pub mod document_run;
+pub mod embedded_lint;
+pub mod exit_codes;
+pub mod filtered_lines;
+pub mod fix_coordinator;
+pub mod inline_config;
+pub mod linguist_data;
+pub mod lint_context;
+pub mod markdownlint_config;
+pub mod profiling;
+pub mod rule;
+#[cfg(feature = "colored")]
+pub mod vscode;
+pub mod workspace_index;
+#[macro_use]
+pub mod rule_config;
+#[macro_use]
+pub mod rule_config_serde;
+pub mod rules;
+pub mod types;
+pub mod utils;
+
+// Native-only modules (require tokio, tower-lsp, etc.)
+#[cfg(feature = "native")]
+pub mod lsp;
+#[cfg(feature = "colored")]
+pub mod output;
+
+// WASM module
+#[cfg(feature = "wasm")]
+pub mod wasm;
+
+pub use rules::heading_utils::HeadingStyle;
+pub use rules::*;
+
+pub use crate::lint_context::{LineInfo, LintContext, ListItemInfo};
+use crate::rule::{LintResult, Rule, RuleCategory};
+use crate::utils::calculate_indentation_width_default;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+
+/// Content characteristics for efficient rule filtering
+#[derive(Debug, Default)]
+struct ContentCharacteristics {
+    has_headings: bool,    // # or setext headings
+    has_lists: bool,       // *, -, +, 1. etc
+    has_links: bool,       // [text](url) or [text][ref]
+    has_code: bool,        // ``` or ~~~ or indented code
+    has_emphasis: bool,    // * or _ for emphasis
+    has_html: bool,        // < > tags
+    has_tables: bool,      // | pipes
+    has_blockquotes: bool, // > markers
+    has_images: bool,      // ![alt](url)
+}
+
+/// Check if a line has enough leading whitespace to be an indented code block.
+/// Indented code blocks require 4+ columns of leading whitespace (with proper tab expansion).
+fn has_potential_indented_code_indent(line: &str) -> bool {
+    calculate_indentation_width_default(line) >= 4
+}
+
+impl ContentCharacteristics {
+    fn analyze(content: &str) -> Self {
+        let mut chars = Self { ..Default::default() };
+
+        // Quick single-pass analysis
+        let mut has_atx_heading = false;
+        let mut has_setext_heading = false;
+
+        for line in content.lines() {
+            let trimmed = line.trim();
+
+            // Headings: ATX (#) or Setext (underlines). A blockquoted ATX
+            // heading (`> ## Title`) still emits a fragment anchor, so rules
+            // like MD051/MD080 must run for blockquote-only documents too.
+            // Stripping `>`/space/tab is a coarse, deliberately
+            // over-inclusive prefilter check (it must never skip a rule that
+            // has work; `parse_blockquote_prefix` also accepts a tab marker).
+            if !has_atx_heading
+                && (trimmed.starts_with('#') || trimmed.trim_start_matches(['>', ' ', '\t']).starts_with('#'))
+            {
+                has_atx_heading = true;
+            }
+            if !has_setext_heading && (trimmed.chars().all(|c| c == '=' || c == '-') && trimmed.len() > 1) {
+                has_setext_heading = true;
+            }
+
+            // Quick character-based detection (more efficient than regex)
+            // Include patterns without spaces to enable user-intention detection (MD030)
+            if !chars.has_lists
+                && (line.contains("* ")
+                    || line.contains("- ")
+                    || line.contains("+ ")
+                    || trimmed.starts_with("* ")
+                    || trimmed.starts_with("- ")
+                    || trimmed.starts_with("+ ")
+                    || trimmed.starts_with('*')
+                    || trimmed.starts_with('-')
+                    || trimmed.starts_with('+'))
+            {
+                chars.has_lists = true;
+            }
+            // Ordered lists: a line whose text starts with a digit (a marker may
+            // be indented), or a blockquote line holding one, and either marker
+            // delimiter (`.` or `)`) after it
+            if !chars.has_lists
+                && ((trimmed.chars().next().is_some_and(|c| c.is_ascii_digit()) && trimmed.contains(['.', ')']))
+                    || (trimmed.starts_with('>')
+                        && trimmed.chars().any(|c| c.is_ascii_digit())
+                        && trimmed.contains(['.', ')'])))
+            {
+                chars.has_lists = true;
+            }
+            if !chars.has_links
+                && (line.contains('[')
+                    || line.contains("http://")
+                    || line.contains("https://")
+                    || line.contains("ftp://")
+                    || line.contains("www."))
+            {
+                chars.has_links = true;
+            }
+            if !chars.has_images && line.contains("![") {
+                chars.has_images = true;
+            }
+            if !chars.has_code
+                && (line.contains('`') || line.contains("~~~") || has_potential_indented_code_indent(line))
+            {
+                chars.has_code = true;
+            }
+            if !chars.has_emphasis && (line.contains('*') || line.contains('_')) {
+                chars.has_emphasis = true;
+            }
+            if !chars.has_html && line.contains('<') {
+                chars.has_html = true;
+            }
+            if !chars.has_tables && line.contains('|') {
+                chars.has_tables = true;
+            }
+            if !chars.has_blockquotes && line.starts_with('>') {
+                chars.has_blockquotes = true;
+            }
+        }
+
+        chars.has_headings = has_atx_heading || has_setext_heading;
+        chars
+    }
+
+    /// Check if a rule should be skipped based on content characteristics
+    fn should_skip_rule(&self, rule: &dyn Rule) -> bool {
+        match rule.category() {
+            RuleCategory::Heading => !self.has_headings,
+            RuleCategory::List => !self.has_lists,
+            RuleCategory::Link => !self.has_links && !self.has_images,
+            RuleCategory::Image => !self.has_images,
+            RuleCategory::CodeBlock => !self.has_code,
+            RuleCategory::Html => !self.has_html,
+            RuleCategory::Emphasis => !self.has_emphasis,
+            RuleCategory::Blockquote => !self.has_blockquotes,
+            RuleCategory::Table => !self.has_tables,
+            // Always check these categories as they apply to all content
+            RuleCategory::Whitespace | RuleCategory::FrontMatter | RuleCategory::Other => false,
+        }
+    }
+}
+
+/// Compute content hash for incremental indexing change detection
+///
+/// Uses blake3 for native builds (fast, cryptographic-strength hash)
+/// Falls back to std::hash for WASM builds
+#[cfg(feature = "native")]
+fn compute_content_hash(content: &str) -> String {
+    #[cfg(feature = "profiling")]
+    let start = std::time::Instant::now();
+    let hash = blake3::hash(content.as_bytes()).to_hex().to_string();
+    #[cfg(feature = "profiling")]
+    profiling::record_duration("index: hash content", start.elapsed());
+    hash
+}
+
+/// Compute content hash for WASM builds using std::hash
+#[cfg(not(feature = "native"))]
+fn compute_content_hash(content: &str) -> String {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    content.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// Lint a file against the given rules with intelligent rule filtering
+/// Assumes the provided `rules` vector contains the final,
+/// configured, and filtered set of rules to be executed.
+pub fn lint(
+    content: &str,
+    rules: &[Box<dyn Rule>],
+    verbose: bool,
+    flavor: crate::config::MarkdownFlavor,
+    source_file: Option<std::path::PathBuf>,
+    config: Option<&crate::config::Config>,
+) -> LintResult {
+    let (result, _file_index) = lint_and_index(content, rules, verbose, flavor, source_file, config);
+    result
+}
+
+/// Build FileIndex only (no linting) for cross-file analysis on cache hits
+///
+/// This is a lightweight function that only builds the FileIndex without running
+/// any rules. Used when we have a cache hit but still need the FileIndex for
+/// cross-file validation.
+///
+/// This avoids the overhead of re-running all rules when only the index data is needed.
+pub fn build_file_index_only(
+    content: &str,
+    rules: &[Box<dyn Rule>],
+    flavor: crate::config::MarkdownFlavor,
+    source_file: Option<std::path::PathBuf>,
+) -> crate::workspace_index::FileIndex {
+    // Compute content hash for change detection
+    let content_hash = compute_content_hash(content);
+    let mut file_index = crate::workspace_index::FileIndex::with_hash(content_hash);
+
+    // Early return for empty content
+    if content.is_empty() {
+        return file_index;
+    }
+
+    // Parse LintContext once with the provided flavor
+    let lint_ctx = time_function!(
+        "index: parse lint context",
+        crate::lint_context::LintContext::new(content, flavor, source_file)
+    );
+
+    // Export inline disable data to the FileIndex so cross-file checks honor
+    // `<!-- rumdl-disable -->` blocks on the lint-cache fast path, exactly as
+    // lint_and_index does on the normal path.
+    let (file_disabled, persistent_transitions, line_disabled) = lint_ctx.inline_config().export_for_file_index();
+    file_index.file_disabled_rules = file_disabled;
+    file_index.persistent_transitions = persistent_transitions;
+    file_index.line_disabled_rules = line_disabled;
+
+    // Only call contribute_to_index for cross-file rules (no rule checking!)
+    time_section!("index: contribute cross-file data", {
+        for rule in rules {
+            if rule.cross_file_scope() == crate::rule::CrossFileScope::Workspace {
+                rule.contribute_to_index(&lint_ctx, &mut file_index);
+            }
+        }
+    });
+
+    file_index
+}
+
+/// Rewrite every fix replacement in the document's own line ending.
+///
+/// Rules build a fix on LF text, so a line ending they insert is `\n`, and the
+/// CLI really does hand them LF: it normalises a file on read and restores the
+/// ending on write. The LSP and wasm lint the editor's or host's text as it is,
+/// and a quick fix that inserted a bare `\n` into a CRLF document left it with
+/// mixed endings. Conforming here, where every rule's warnings meet, settles it
+/// for every caller and every rule at once. A document with mixed endings has no
+/// single convention to conform to and keeps the fix as the rule wrote it.
+fn conform_fix_line_endings(content: &str, warnings: &mut [crate::rule::LintWarning]) {
+    if !content.contains('\r') || crate::utils::detect_line_ending_enum(content) != crate::utils::LineEnding::Crlf {
+        return;
+    }
+    fn conform(fix: &mut crate::rule::Fix) {
+        if fix.replacement.contains('\n') {
+            fix.replacement =
+                crate::utils::normalize_line_ending(&fix.replacement, crate::utils::LineEnding::Crlf).into_owned();
+        }
+        for extra in &mut fix.additional_edits {
+            conform(extra);
+        }
+    }
+    for fix in warnings.iter_mut().filter_map(|warning| warning.fix.as_mut()) {
+        conform(fix);
+    }
+}
+
+/// Drop the warnings a document silences, and apply any configured severity override
+/// to the rest.
+///
+/// A warning is dropped when it sits in a kramdown extension block or when an inline
+/// comment disables its rule somewhere in its range. `suppressed`, when given,
+/// collects what the inline comments removed, for the rules that report on them. A
+/// kramdown extension block is not an inline comment, so what it drops is left out.
+fn retain_reportable_warnings(
+    lint_ctx: &crate::lint_context::LintContext,
+    config: Option<&crate::config::Config>,
+    rule_name: &str,
+    rule_warnings: Vec<crate::rule::LintWarning>,
+    mut suppressed: Option<&mut Vec<crate::rule::SuppressedWarning>>,
+) -> Vec<crate::rule::LintWarning> {
+    let inline_config = lint_ctx.inline_config();
+    let mut kept = Vec::with_capacity(rule_warnings.len());
+
+    for mut warning in rule_warnings {
+        if lint_ctx
+            .line_info(warning.line)
+            .is_some_and(|info| info.in_kramdown_extension_block)
+        {
+            continue;
+        }
+
+        // Use the warning's rule_name if available, otherwise use the rule's name
+        let rule_name_to_check = warning.rule_name.as_deref().unwrap_or(rule_name);
+
+        // Extract the base rule name for sub-rules like "MD029-style" -> "MD029"
+        let base_rule_name = if let Some(dash_pos) = rule_name_to_check.find('-') {
+            &rule_name_to_check[..dash_pos]
+        } else {
+            rule_name_to_check
+        };
+
+        // Check if the rule is disabled at any line in the warning's range.
+        // Multi-line warnings (e.g., reflow) report on the first line,
+        // but inline disable comments may appear later in the range.
+        // Guard: if end_line < line (e.g., end_line=0), fall back to
+        // checking only the warning's line to match original behavior.
+        let end = if warning.end_line >= warning.line {
+            warning.end_line
+        } else {
+            warning.line
+        };
+        let disabled_at = (warning.line..=end).find_map(|line| {
+            inline_config
+                .disabling_layer(base_rule_name, line)
+                .map(|layer| (line, layer))
+        });
+        if let Some((line, layer)) = disabled_at {
+            if let Some(record) = suppressed.as_deref_mut() {
+                record.push(crate::rule::SuppressedWarning {
+                    rule_name: base_rule_name.to_string(),
+                    line,
+                    layer,
+                });
+            }
+            continue;
+        }
+
+        // Apply severity override from config if present
+        if let Some(cfg) = config
+            && let Some(override_severity) = cfg.get_rule_severity(rule_name_to_check)
+        {
+            warning.severity = override_severity;
+        }
+
+        kept.push(warning);
+    }
+
+    kept
+}
+
+/// Lint a file and contribute to workspace index for cross-file analysis
+///
+/// This variant performs linting and optionally populates a `FileIndex` with data
+/// needed for cross-file validation. The FileIndex is populated during linting,
+/// avoiding duplicate parsing.
+///
+/// Returns: (warnings, FileIndex) - the FileIndex contains headings/links for cross-file rules
+#[cfg_attr(test, allow(unused_variables))]
+#[allow(clippy::needless_pass_by_value)] // Public compatibility: callers already pass an owned path.
+pub fn lint_and_index(
+    content: &str,
+    rules: &[Box<dyn Rule>],
+    verbose: bool,
+    flavor: crate::config::MarkdownFlavor,
+    source_file: Option<std::path::PathBuf>,
+    config: Option<&crate::config::Config>,
+) -> (LintResult, crate::workspace_index::FileIndex) {
+    lint_and_index_with_paths(
+        content,
+        rules,
+        verbose,
+        flavor,
+        DocumentPaths::same(source_file.as_deref()),
+        config,
+    )
+}
+
+/// The two path roles involved in document processing.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DocumentPaths<'a> {
+    /// Logical path used for per-file configuration matching.
+    pub config_path: Option<&'a std::path::Path>,
+    /// Native path exposed to filesystem-aware rules.
+    pub source_file: Option<&'a std::path::Path>,
+    /// Run-scoped virtual paths visible to filesystem-aware link rules.
+    pub link_target_policy: Option<&'a crate::lint_context::LinkTargetPolicy>,
+}
+
+impl<'a> DocumentPaths<'a> {
+    /// Use one native path for both roles.
+    pub fn same(path: Option<&'a std::path::Path>) -> Self {
+        Self {
+            config_path: path,
+            source_file: path,
+            link_target_policy: None,
+        }
+    }
+}
+
+/// Lint a document while keeping configuration matching separate from filesystem context.
+///
+/// `paths.config_path` selects per-file ignores and other path-scoped configuration.
+/// `paths.source_file` is exposed to rules that need a real filesystem location. Native
+/// adapters normally pass the same path for both; virtual adapters can supply only
+/// `config_path` without accidentally enabling filesystem-dependent rule behavior.
+#[cfg_attr(test, allow(unused_variables))]
+pub fn lint_and_index_with_paths(
+    content: &str,
+    rules: &[Box<dyn Rule>],
+    verbose: bool,
+    flavor: crate::config::MarkdownFlavor,
+    paths: DocumentPaths<'_>,
+    config: Option<&crate::config::Config>,
+) -> (LintResult, crate::workspace_index::FileIndex) {
+    let mut warnings = Vec::new();
+    // Compute content hash for change detection
+    let content_hash = compute_content_hash(content);
+    let mut file_index = crate::workspace_index::FileIndex::with_hash(content_hash);
+
+    // Early return for empty content
+    if content.is_empty() {
+        return (Ok(warnings), file_index);
+    }
+
+    // The rules `per-file-ignores` takes away for this file. It decides what this
+    // file REPORTS, and nothing else: the index contribution at the end of this
+    // function deliberately keeps running every cross-file rule, because a file's
+    // headings and links belong to the workspace rather than to its own report.
+    // Dropping a rule from the index instead would break the links pointing HERE,
+    // in files that never named it.
+    let ignored_for_file = match (config, paths.config_path) {
+        (Some(cfg), Some(path)) => cfg.get_ignored_rules_for_file(path),
+        _ => std::collections::HashSet::new(),
+    };
+
+    // Parse LintContext once (includes inline config parsing)
+    let lint_ctx = time_function!(
+        "lint: parse lint context",
+        crate::lint_context::LintContext::new(content, flavor, paths.source_file.map(std::path::Path::to_path_buf))
+    );
+    let lint_ctx = match paths.link_target_policy {
+        Some(policy) => lint_ctx.with_link_target_policy(policy.clone()),
+        None => lint_ctx,
+    };
+    let inline_config = lint_ctx.inline_config();
+
+    // Export inline config data to FileIndex for cross-file rule filtering
+    let (file_disabled, persistent_transitions, line_disabled) = inline_config.export_for_file_index();
+    file_index.file_disabled_rules = file_disabled;
+    file_index.persistent_transitions = persistent_transitions;
+    file_index.line_disabled_rules = line_disabled;
+
+    // Analyze content characteristics for rule filtering
+    let characteristics = time_function!(
+        "lint: analyze content characteristics",
+        ContentCharacteristics::analyze(content)
+    );
+
+    // Filter rules based on per-file-ignores and content characteristics
+    let applicable_rules: Vec<_> = rules
+        .iter()
+        .filter(|rule| !ignored_for_file.contains(rule.name()))
+        .filter(|rule| !(rule.skippable_by_category() && characteristics.should_skip_rule(rule.as_ref())))
+        .collect();
+
+    // Calculate skipped rules count before consuming applicable_rules
+    #[cfg(not(test))]
+    let total_rules = rules.len();
+    #[cfg(not(test))]
+    let applicable_count = applicable_rules.len();
+
+    #[cfg(not(target_arch = "wasm32"))]
+    let profile_rules = std::env::var("RUMDL_PROFILE_RULES").is_ok();
+
+    // Automatic inline config support: merge inline overrides into config once,
+    // then recreate only the affected rules. Works for ALL rules without per-rule changes.
+    let inline_overrides = inline_config.get_all_rule_configs();
+    let merged_config = if !inline_overrides.is_empty() {
+        config.map(|c| c.merge_with_inline_config(inline_config))
+    } else {
+        None
+    };
+    let effective_config = merged_config.as_ref().or(config);
+
+    // Cache recreated rules for rules with inline overrides
+    let mut recreated_rules: std::collections::HashMap<String, Box<dyn crate::rule::Rule>> =
+        std::collections::HashMap::new();
+
+    // Pre-create rules that have inline config overrides
+    if let Some(cfg) = effective_config {
+        for rule_name in inline_overrides.keys() {
+            if let Some(recreated) = crate::rules::create_rule_by_name(rule_name, cfg) {
+                recreated_rules.insert(rule_name.clone(), recreated);
+            }
+        }
+    }
+
+    // A rule reporting on the run's inline disable comments needs to know what they
+    // removed, which costs a record per suppressed warning, so it is only kept when
+    // such a rule is going to read it.
+    let suppression_observers: Vec<_> = applicable_rules
+        .iter()
+        .filter(|rule| rule.observes_suppressions() && !rule.should_skip(&lint_ctx))
+        .collect();
+    let mut suppressed = Vec::new();
+
+    {
+        let _timer = profiling::ScopedTimer::new("lint: run single-file rules");
+        for rule in &applicable_rules {
+            #[cfg(not(target_arch = "wasm32"))]
+            let rule_start = Instant::now();
+
+            // Skip rules that indicate they should be skipped (opt-in rules, content-based skipping)
+            if rule.should_skip(&lint_ctx) {
+                continue;
+            }
+
+            // Use recreated rule if inline config overrides exist for this rule
+            let effective_rule: &dyn crate::rule::Rule = recreated_rules
+                .get(rule.name())
+                .map_or(rule.as_ref(), std::convert::AsRef::as_ref);
+
+            // Run single-file check with the effective rule (possibly with inline config applied)
+            let result = effective_rule.check(&lint_ctx);
+
+            match result {
+                Ok(rule_warnings) => {
+                    let record = if suppression_observers.is_empty() {
+                        None
+                    } else {
+                        Some(&mut suppressed)
+                    };
+                    let filtered_warnings =
+                        retain_reportable_warnings(&lint_ctx, config, rule.name(), rule_warnings, record);
+                    warnings.extend(filtered_warnings);
+                }
+                Err(e) => {
+                    log::error!("Error checking rule {}: {}", rule.name(), e);
+                    return (Err(e), file_index);
+                }
+            }
+
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let rule_duration = rule_start.elapsed();
+                if profile_rules {
+                    eprintln!("[RULE] {:6} {:?}", rule.name(), rule_duration);
+                }
+
+                #[cfg(not(test))]
+                if verbose && rule_duration.as_millis() > 500 {
+                    log::debug!("Rule {} took {:?}", rule.name(), rule_duration);
+                }
+            }
+        }
+    }
+
+    // Report on the inline disable comments, now that every single-file rule has run
+    // and the suppressions are complete.
+    if !suppression_observers.is_empty() {
+        let _timer = profiling::ScopedTimer::new("lint: run suppression rules");
+
+        // A workspace-scope rule has its warnings filtered after this point, and for a
+        // single-file run not at all, so its findings never reach the report and
+        // nothing can be concluded about a comment naming it. A rule this file
+        // ignores does not report either, for the same reason.
+        let report = crate::rule::SuppressionReport {
+            suppressed,
+            judged_rules: rules
+                .iter()
+                .filter(|rule| rule.cross_file_scope() != crate::rule::CrossFileScope::Workspace)
+                .filter(|rule| !ignored_for_file.contains(rule.name()))
+                .map(|rule| rule.name().to_string())
+                .collect(),
+        };
+
+        for rule in &suppression_observers {
+            match rule.check_suppressions(&lint_ctx, &report) {
+                Ok(rule_warnings) => {
+                    let filtered_warnings =
+                        retain_reportable_warnings(&lint_ctx, config, rule.name(), rule_warnings, None);
+                    warnings.extend(filtered_warnings);
+                }
+                Err(e) => {
+                    log::error!("Error checking rule {}: {}", rule.name(), e);
+                    return (Err(e), file_index);
+                }
+            }
+        }
+    }
+
+    // Contribute to index for cross-file rules (done after all rules checked)
+    // NOTE: We iterate over ALL rules (not just applicable_rules) because cross-file
+    // rules need to extract data from every file in the workspace, regardless of whether
+    // that file has content that would trigger the rule, and regardless of what this
+    // file's own configuration reports. For example, MD051 needs to index headings from
+    // files that have no links (like target.md) so that links FROM other files TO those
+    // headings can be validated - including from a file that ignores MD051 itself.
+    time_section!("lint: contribute cross-file data", {
+        for rule in rules {
+            if rule.cross_file_scope() == crate::rule::CrossFileScope::Workspace {
+                rule.contribute_to_index(&lint_ctx, &mut file_index);
+            }
+        }
+    });
+
+    #[cfg(not(test))]
+    if verbose {
+        let skipped_rules = total_rules - applicable_count;
+        if skipped_rules > 0 {
+            log::debug!("Skipped {skipped_rules} of {total_rules} rules based on content analysis");
+        }
+    }
+
+    conform_fix_line_endings(content, &mut warnings);
+
+    (Ok(warnings), file_index)
+}
+
+/// Run cross-file checks for rules that need workspace-wide validation
+///
+/// This should be called after all files have been linted and the WorkspaceIndex
+/// has been built from the accumulated FileIndex data.
+///
+/// Note: This takes the FileIndex instead of content to avoid re-parsing each file.
+/// The FileIndex was already populated during contribute_to_index in the linting phase.
+///
+/// Rules can use workspace_index methods for cross-file validation:
+/// - `get_file(path)` - to look up headings in target files (for MD051)
+///
+/// Returns additional warnings from cross-file validation.
+pub fn run_cross_file_checks(
+    file_path: &std::path::Path,
+    file_index: &crate::workspace_index::FileIndex,
+    rules: &[Box<dyn Rule>],
+    workspace_index: &crate::workspace_index::WorkspaceIndex,
+    config: Option<&crate::config::Config>,
+) -> LintResult {
+    use crate::rule::CrossFileScope;
+
+    let mut warnings = Vec::new();
+
+    // Honor `per-file-ignores` for cross-file rules. Cross-file warnings are
+    // attributed to `file_path` (the file holding the link), so a rule ignored
+    // for that file must not emit them. This applies on every path; single-file
+    // rule filtering does not cover cross-file checks because they run over the
+    // config group's full rule set, and cross-file rules share link data.
+    let ignored_rules_for_file = config.map(|cfg| cfg.get_ignored_rules_for_file(file_path));
+
+    // Only check rules that need cross-file analysis
+    for rule in rules {
+        if rule.cross_file_scope() != CrossFileScope::Workspace {
+            continue;
+        }
+
+        if ignored_rules_for_file
+            .as_ref()
+            .is_some_and(|ignored| ignored.contains(rule.name()))
+        {
+            continue;
+        }
+
+        match time_function!(
+            "workspace: cross-file rule check",
+            rule.cross_file_check(file_path, file_index, workspace_index)
+        ) {
+            Ok(rule_warnings) => {
+                // Filter cross-file warnings based on inline config stored in file_index
+                let filtered: Vec<_> = rule_warnings
+                    .into_iter()
+                    .filter(|w| !file_index.is_rule_disabled_at_line(rule.name(), w.line))
+                    .map(|mut warning| {
+                        // Apply severity override from config if present
+                        if let Some(cfg) = config
+                            && let Some(override_severity) = cfg.get_rule_severity(rule.name())
+                        {
+                            warning.severity = override_severity;
+                        }
+                        warning
+                    })
+                    .collect();
+                warnings.extend(filtered);
+            }
+            Err(e) => {
+                log::error!("Error in cross-file check for rule {}: {}", rule.name(), e);
+                return Err(e);
+            }
+        }
+    }
+
+    Ok(warnings)
+}
+
+/// Get the profiling report
+pub fn get_profiling_report() -> String {
+    profiling::get_report()
+}
+
+/// Reset the profiling data
+pub fn reset_profiling() {
+    profiling::reset()
+}
+
+/// Get regex cache statistics for performance monitoring
+pub fn get_regex_cache_stats() -> std::collections::HashMap<String, u64> {
+    crate::utils::regex_cache::get_cache_stats()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rule::Rule;
+    use crate::rules::{MD001HeadingIncrement, MD009TrailingSpaces};
+
+    #[test]
+    fn test_content_characteristics_analyze() {
+        // Test empty content
+        let chars = ContentCharacteristics::analyze("");
+        assert!(!chars.has_headings);
+        assert!(!chars.has_lists);
+        assert!(!chars.has_links);
+        assert!(!chars.has_code);
+        assert!(!chars.has_emphasis);
+        assert!(!chars.has_html);
+        assert!(!chars.has_tables);
+        assert!(!chars.has_blockquotes);
+        assert!(!chars.has_images);
+
+        // Test content with headings
+        let chars = ContentCharacteristics::analyze("# Heading");
+        assert!(chars.has_headings);
+
+        // Test setext headings
+        let chars = ContentCharacteristics::analyze("Heading\n=======");
+        assert!(chars.has_headings);
+
+        // Blockquoted ATX headings emit fragment anchors, so Heading-category
+        // rules (MD051/MD080) must run for blockquote-only documents.
+        let chars = ContentCharacteristics::analyze("> ## Alpha\n>\n> ## Alpha");
+        assert!(chars.has_headings, "blockquoted ATX heading must set has_headings");
+        let chars = ContentCharacteristics::analyze(">> # Nested");
+        assert!(
+            chars.has_headings,
+            "nested-blockquote ATX heading must set has_headings"
+        );
+        // A tab after the blockquote marker is also a valid heading
+        // (`parse_blockquote_prefix` accepts it).
+        let chars = ContentCharacteristics::analyze(">\t## Tabbed");
+        assert!(
+            chars.has_headings,
+            "tab-separated blockquote ATX heading must set has_headings"
+        );
+
+        // Test lists
+        let chars = ContentCharacteristics::analyze("* Item\n- Item 2\n+ Item 3");
+        assert!(chars.has_lists);
+
+        // Test ordered lists
+        let chars = ContentCharacteristics::analyze("1. First\n2. Second");
+        assert!(chars.has_lists);
+
+        // Test links
+        let chars = ContentCharacteristics::analyze("[link](url)");
+        assert!(chars.has_links);
+
+        // Test URLs
+        let chars = ContentCharacteristics::analyze("Visit https://example.com");
+        assert!(chars.has_links);
+
+        // Test images
+        let chars = ContentCharacteristics::analyze("![alt text](image.png)");
+        assert!(chars.has_images);
+
+        // Test code
+        let chars = ContentCharacteristics::analyze("`inline code`");
+        assert!(chars.has_code);
+
+        let chars = ContentCharacteristics::analyze("~~~\ncode block\n~~~");
+        assert!(chars.has_code);
+
+        // Test indented code blocks (4 spaces)
+        let chars = ContentCharacteristics::analyze("Text\n\n    indented code\n\nMore text");
+        assert!(chars.has_code);
+
+        // Test tab-indented code blocks
+        let chars = ContentCharacteristics::analyze("Text\n\n\ttab indented code\n\nMore text");
+        assert!(chars.has_code);
+
+        // Test mixed whitespace indented code (2 spaces + tab = 4 columns)
+        let chars = ContentCharacteristics::analyze("Text\n\n  \tmixed indent code\n\nMore text");
+        assert!(chars.has_code);
+
+        // Test 1 space + tab (also 4 columns due to tab expansion)
+        let chars = ContentCharacteristics::analyze("Text\n\n \ttab after space\n\nMore text");
+        assert!(chars.has_code);
+
+        // Test emphasis
+        let chars = ContentCharacteristics::analyze("*emphasis* and _more_");
+        assert!(chars.has_emphasis);
+
+        // Test HTML
+        let chars = ContentCharacteristics::analyze("<div>HTML content</div>");
+        assert!(chars.has_html);
+
+        // Test tables
+        let chars = ContentCharacteristics::analyze("| Header | Header |\n|--------|--------|");
+        assert!(chars.has_tables);
+
+        // Test blockquotes
+        let chars = ContentCharacteristics::analyze("> Quote");
+        assert!(chars.has_blockquotes);
+
+        // Test mixed content
+        let content = "# Heading\n* List item\n[link](url)\n`code`\n*emphasis*\n<p>html</p>\n| table |\n> quote\n![image](img.png)";
+        let chars = ContentCharacteristics::analyze(content);
+        assert!(chars.has_headings);
+        assert!(chars.has_lists);
+        assert!(chars.has_links);
+        assert!(chars.has_code);
+        assert!(chars.has_emphasis);
+        assert!(chars.has_html);
+        assert!(chars.has_tables);
+        assert!(chars.has_blockquotes);
+        assert!(chars.has_images);
+    }
+
+    #[test]
+    fn test_content_characteristics_parenthesized_ordered_list() {
+        assert!(ContentCharacteristics::analyze("1) first\n2) second").has_lists);
+        assert!(ContentCharacteristics::analyze("  1) indented first\n  2) second").has_lists);
+        assert!(ContentCharacteristics::analyze("> 1) quoted item").has_lists);
+    }
+
+    #[test]
+    fn test_content_characteristics_should_skip_rule() {
+        let chars = ContentCharacteristics {
+            has_headings: true,
+            has_lists: false,
+            has_links: true,
+            has_code: false,
+            has_emphasis: true,
+            has_html: false,
+            has_tables: true,
+            has_blockquotes: false,
+            has_images: false,
+        };
+
+        // Create test rules for different categories
+        let heading_rule = MD001HeadingIncrement::default();
+        assert!(!chars.should_skip_rule(&heading_rule));
+
+        let trailing_spaces_rule = MD009TrailingSpaces::new(2, false);
+        assert!(!chars.should_skip_rule(&trailing_spaces_rule)); // Whitespace rules always run
+
+        // Test skipping based on content
+        let chars_no_headings = ContentCharacteristics {
+            has_headings: false,
+            ..Default::default()
+        };
+        assert!(chars_no_headings.should_skip_rule(&heading_rule));
+    }
+
+    #[test]
+    fn test_lint_empty_content() {
+        let rules: Vec<Box<dyn Rule>> = vec![Box::new(MD001HeadingIncrement::default())];
+
+        let result = lint("", &rules, false, crate::config::MarkdownFlavor::Standard, None, None);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_lint_with_violations() {
+        let content = "## Level 2\n#### Level 4"; // Skips level 3
+        let rules: Vec<Box<dyn Rule>> = vec![Box::new(MD001HeadingIncrement::default())];
+
+        let result = lint(
+            content,
+            &rules,
+            false,
+            crate::config::MarkdownFlavor::Standard,
+            None,
+            None,
+        );
+        assert!(result.is_ok());
+        let warnings = result.unwrap();
+        assert!(!warnings.is_empty());
+        // Check the rule field of LintWarning struct
+        assert_eq!(warnings[0].rule_name.as_deref(), Some("MD001"));
+    }
+
+    #[test]
+    fn test_lint_with_inline_disable() {
+        let content = "<!-- rumdl-disable MD001 -->\n## Level 2\n#### Level 4";
+        let rules: Vec<Box<dyn Rule>> = vec![Box::new(MD001HeadingIncrement::default())];
+
+        let result = lint(
+            content,
+            &rules,
+            false,
+            crate::config::MarkdownFlavor::Standard,
+            None,
+            None,
+        );
+        assert!(result.is_ok());
+        let warnings = result.unwrap();
+        assert!(warnings.is_empty()); // Should be disabled by inline comment
+    }
+
+    #[test]
+    fn test_lint_rule_filtering() {
+        // Content with no lists
+        let content = "# Heading\nJust text";
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(MD001HeadingIncrement::default()),
+            // A list-related rule would be skipped
+        ];
+
+        let result = lint(
+            content,
+            &rules,
+            false,
+            crate::config::MarkdownFlavor::Standard,
+            None,
+            None,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_get_profiling_report() {
+        // Just test that it returns a string without panicking
+        let report = get_profiling_report();
+        assert!(!report.is_empty());
+        assert!(report.contains("Profiling"));
+    }
+
+    #[test]
+    fn test_reset_profiling() {
+        // Test that reset_profiling doesn't panic
+        reset_profiling();
+
+        // After reset, report should indicate no measurements or profiling disabled
+        let report = get_profiling_report();
+        assert!(report.contains("disabled") || report.contains("no measurements"));
+    }
+
+    #[test]
+    fn test_get_regex_cache_stats() {
+        let stats = get_regex_cache_stats();
+        // Stats should be a valid HashMap (might be empty)
+        assert!(stats.is_empty() || !stats.is_empty());
+
+        // If not empty, all values should be positive
+        for count in stats.values() {
+            assert!(*count > 0);
+        }
+    }
+
+    #[test]
+    fn test_content_characteristics_edge_cases() {
+        // Test setext heading edge case
+        let chars = ContentCharacteristics::analyze("-"); // Single dash, not a heading
+        assert!(!chars.has_headings);
+
+        let chars = ContentCharacteristics::analyze("--"); // Two dashes, valid setext
+        assert!(chars.has_headings);
+
+        // Test list detection - we now include potential list patterns (with or without space)
+        // to support user-intention detection in MD030
+        let chars = ContentCharacteristics::analyze("*emphasis*"); // Could be list or emphasis
+        assert!(chars.has_lists); // Run list rules to be safe
+
+        let chars = ContentCharacteristics::analyze("1.Item"); // Could be list without space
+        assert!(chars.has_lists); // Run list rules for user-intention detection
+
+        // Test blockquote must be at start of line
+        let chars = ContentCharacteristics::analyze("text > not a quote");
+        assert!(!chars.has_blockquotes);
+    }
+
+    /// One document that draws a line-inserting fix from every rule known to
+    /// write a bare `\n` into its replacement: MD071 (blank line after front
+    /// matter), MD022 (blank lines around headings), MD032 (around lists),
+    /// MD031 (around fences), MD014 (dollar prompts), MD058 (around tables) and
+    /// MD047 (final newline).
+    const LINE_INSERTING_FIXES: &str = "---\ntitle: x\n---\n# Heading\ntext\n## Sub\n- item\ntext\n```sh\n$ ls\n```\ntext\n| a | b |\n|---|---|\n| 1 | 2 |\ntext";
+
+    /// Every fix replacement (and additional edit) of every warning, keyed by rule.
+    fn fix_replacements(content: &str) -> Vec<(String, String)> {
+        let config = crate::config::Config::default();
+        let rules = crate::rules::all_rules(&config);
+        let warnings = lint(
+            content,
+            &rules,
+            false,
+            crate::config::MarkdownFlavor::Standard,
+            None,
+            Some(&config),
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        for warning in warnings {
+            let Some(fix) = warning.fix else { continue };
+            let rule = warning.rule_name.clone().unwrap_or_default();
+            let mut stack = vec![fix];
+            while let Some(fix) = stack.pop() {
+                out.push((rule.clone(), fix.replacement.clone()));
+                stack.extend(fix.additional_edits);
+            }
+        }
+        out
+    }
+
+    fn has_bare_lf(text: &str) -> bool {
+        let bytes = text.as_bytes();
+        bytes
+            .iter()
+            .enumerate()
+            .any(|(i, b)| *b == b'\n' && (i == 0 || bytes[i - 1] != b'\r'))
+    }
+
+    #[test]
+    fn fix_replacements_use_the_documents_crlf_line_ending() {
+        let crlf = LINE_INSERTING_FIXES.replace('\n', "\r\n");
+        let replacements = fix_replacements(&crlf);
+
+        let bare: Vec<_> = replacements.iter().filter(|(_, r)| has_bare_lf(r)).collect();
+        assert!(bare.is_empty(), "bare LF in a fix for a CRLF document: {bare:?}");
+
+        // Positive control: the rules this document was written for did fire and
+        // did insert a line ending, so the assertion above examined real fixes.
+        let mut crlf_rules: Vec<_> = replacements
+            .iter()
+            .filter(|(_, r)| r.contains("\r\n"))
+            .map(|(rule, _)| rule.as_str())
+            .collect();
+        crlf_rules.sort_unstable();
+        crlf_rules.dedup();
+        for rule in ["MD014", "MD022", "MD031", "MD032", "MD047", "MD058", "MD071"] {
+            assert!(
+                crlf_rules.contains(&rule),
+                "{rule} inserted no CRLF line ending; got {crlf_rules:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fix_replacements_stay_lf_for_lf_and_mixed_documents() {
+        // The same rules on the LF document write `\n`, untouched.
+        let lf = fix_replacements(LINE_INSERTING_FIXES);
+        assert!(lf.iter().any(|(_, r)| has_bare_lf(r)));
+        assert!(!lf.iter().any(|(_, r)| r.contains('\r')));
+
+        // A document with mixed endings has no convention to conform to, so
+        // its fixes are left exactly as the rules wrote them.
+        let mixed = LINE_INSERTING_FIXES.replacen('\n', "\r\n", 1);
+        assert_eq!(
+            crate::utils::detect_line_ending_enum(&mixed),
+            crate::utils::LineEnding::Mixed
+        );
+        let mixed = fix_replacements(&mixed);
+        assert!(mixed.iter().any(|(_, r)| has_bare_lf(r)));
+    }
+}
