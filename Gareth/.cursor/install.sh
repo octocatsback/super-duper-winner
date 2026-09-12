@@ -7,7 +7,13 @@ source "${SCRIPT_DIR}/lib.sh"
 
 SITE_DIR="$(find_gareth_site)"
 echo "[install] Checking that secret-like files are not tracked..."
-tracked_secrets="$(git ls-files | grep -E '(^|/)\.env$|(^|/)\.env\.[^/]+$|\.pem$|(^|/)id_rsa$|(^|/)id_ed25519$|(^|/)id_ecdsa$' | grep -vE '\.example$' || true)"
+# In the umbrella checkout, only scan Gareth/. Vendored trees (adk-docs
+# tutorials) ship placeholder .env files that are not live credentials.
+secret_scope=()
+if [[ -d Gareth && -f Gareth/.cursor/install.sh ]]; then
+  secret_scope=(Gareth)
+fi
+tracked_secrets="$(git ls-files "${secret_scope[@]}" | grep -E '(^|/)\.env$|(^|/)\.env\.[^/]+$|\.pem$|(^|/)id_rsa$|(^|/)id_ed25519$|(^|/)id_ecdsa$' | grep -vE '\.example$' || true)"
 if [[ -n "${tracked_secrets}" ]]; then
   echo "[install] error: refusing to continue; secret-like files are tracked in git:" >&2
   echo "${tracked_secrets}" >&2
