@@ -1,0 +1,115 @@
+# Public octocatsback inventory for this umbrella.
+# Copyright (c) 2026 Gareth Kirman
+umbrella: super-duper-winner
+copyright: Copyright (c) 2026 Gareth Kirman
+source_org: octocatsback
+packages:
+  - name: About-Us
+    path: About-Us/
+    source: https://github.com/octocatsback/About-Us
+    method: squash-subtree
+    ref: main
+    sha: 7d4c49c101315a33791ed5ca220c2ad60fca2f0a
+  - name: adk-docs
+    path: adk-docs/
+    source: https://github.com/octocatsback/adk-docs
+    method: squash-subtree
+    ref: main
+    sha: 1203686bb4a30351393d3bccea06abd91f008e19
+  - name: camo
+    path: camo/
+    source: https://github.com/octocatsback/camo
+    method: squash-subtree
+    ref: master
+    sha: e59df56a01c023850962fac16905269d264fba50
+  - name: cli
+    path: cli/
+    source: https://github.com/octocatsback/cli
+    method: squash-subtree
+    ref: latest
+    sha: c9876d7ea7150b0702e4151210b9fa1a8dbc7fbf
+  - name: distributed-uncensorable-frontend
+    path: distributed-uncensorable-frontend/
+    source: https://github.com/octocatsback/distributed-uncensorable-frontend
+    method: squash-subtree
+    ref: main
+    sha: 60938e3e06e630ab33fa31e6c6d0d0781a763f4a
+  - name: docs
+    path: docs/
+    source: https://github.com/octocatsback/docs
+    method: shallow-submodule
+    ref: main
+    sha: 8ace643960a44057d30230337cabbda1d175c1c0
+    note: Multi-GB GitHub Docs fork; pin as a shallow submodule.
+  - name: Gareth
+    path: Gareth/
+    source: https://github.com/octocatsback/Gareth
+    method: squash-subtree
+    ref: cursor/lock-down-environment-7a39
+    sha: 60d4b8559413583cb6c27b72766d0fc1c6a2928d
+    note: Refreshed in place from the default branch, including the Sep 11 upload.
+  - name: GitGoat
+    path: GitGoat/
+    source: https://github.com/octocatsback/GitGoat
+    method: squash-subtree
+    ref: main
+    sha: 616ebbc4bbfe152be52c093cd9f8ba0841fdc3d8
+    note: Refreshed in place.
+  - name: hello-world
+    path: hello-world/
+    source: https://github.com/octocatsback/hello-world
+    method: squash-subtree
+    ref: master
+    sha: 1ea2de3f90bed40be93cf5f04b5c390d1aa8cf47
+  - name: node
+    path: node/
+    source: https://github.com/octocatsback/node
+    method: shallow-submodule
+    ref: main
+    sha: bbf51ad24cbd80d5cf7b5a4df6e2ae1692c33d85
+    note: Multi-GB Node.js fork; pin as a shallow submodule.
+  - name: OriginTrials
+    path: OriginTrials/
+    source: https://github.com/octocatsback/OriginTrials
+    method: squash-subtree
+    ref: gh-pages
+    sha: 43e4684a0c1c1c2bfdbf310af727406b314f9be0
+    note: Already current on main; no refresh required.
+  - name: plugins
+    path: plugins/
+    source: https://github.com/octocatsback/plugins
+    method: squash-subtree
+    ref: main
+    sha: 9bd4a8289f1c3fe870d518051772762a78b66ea0
+  - name: potential-octo-doodle
+    path: potential-octo-doodle/
+    source: https://github.com/octocatsback/potential-octo-doodle
+    method: squash-subtree
+    ref: main
+    sha: 58a3ee1a7923e7bdf7e1b6e2998de4e838fa6efd
+  - name: rumdl
+    path: rumdl/
+    source: https://github.com/octocatsback/rumdl
+    method: squash-subtree
+    ref: main
+    sha: fd83c4b339bdf0eab9a5e495e12f623c6b768de1
+  - name: threat-finder
+    path: threat-finder/
+    source: https://github.com/octocatsback/threat-finder
+    method: squash-subtree
+    ref: main
+    sha: a81e0698136a9f1f2bccca7086b8f895513575ae
+  - name: tryhackme
+    path: tryhackme/
+    source: https://github.com/octocatsback/tryhackme
+    method: shallow-submodule
+    ref: main
+    sha: 3949051d86d5582f26eaa90c134dd44d213a49b7
+    note: Room notes trip GitHub push protection if vendored as blobs.
+skipped:
+  - name: super-duper-winner
+    source: https://github.com/octocatsback/super-duper-winner
+    reason: This umbrella repository; not nested inside itself.
+  - name: skills-agentic-workflows-that-read-the-room
+    source: https://github.com/octocatsback/skills-agentic-workflows-that-read-the-room
+    reason: Private; not part of the public-repo import.
