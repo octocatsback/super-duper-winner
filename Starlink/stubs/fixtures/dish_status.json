@@ -1,0 +1,11 @@
+{
+  "command": "get_status",
+  "grpcurl": "grpcurl -plaintext -d '{\"get_status\":{}}' 192.168.100.1:9200 SpaceX.API.Device.Device/Handle",
+  "dishGetStatus": {
+    "deviceInfo": {
+      "id": "fixture-user-terminal",
+      "hardwareVersion": "fixture"
+    }
+  },
+  "note": "Offline fixture. Live dish id comes from a LAN get_status call."
+}
