@@ -17,10 +17,17 @@ jobs:
       - name: Fail if live secret filenames are tracked
         run: |
           set -euo pipefail
-          tracked="$(git ls-files | grep -E '(^|/)\.env$|(^|/)\.env\.[^/]+$|(^|/)id_rsa$|(^|/)id_ed25519$|(^|/)id_ecdsa$' | grep -vE '\.example$' || true)"
+          # Umbrella-owned paths only (repo root, .github/, .cursor/).
+          # Vendored project trees may ship tutorial .env placeholders
+          # (e.g. adk-docs examples) that are not live credentials.
+          tracked="$(
+            git ls-files | grep -E '^(\.github/|\.cursor/|[^/]+$)' \
+              | grep -E '(^|/)\.env$|(^|/)\.env\.[^/]+$|(^|/)id_rsa$|(^|/)id_ed25519$|(^|/)id_ecdsa$' \
+              | grep -vE '\.example$' || true
+          )"
           if [ -n "$tracked" ]; then
-            echo "Live secret filenames must not be tracked:" >&2
+            echo "Live secret filenames must not be tracked in umbrella-owned paths:" >&2
             echo "$tracked" >&2
             exit 1
           fi
-          echo "No tracked live secret filenames."
+          echo "No tracked live secret filenames in umbrella-owned paths."

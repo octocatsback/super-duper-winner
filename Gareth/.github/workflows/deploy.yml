@@ -1,0 +1,50 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+        with:
+          # Best-effort auto-enable. Note: this requires the token used here
+          # to have repo admin rights (a PAT with the `repo` scope, or a
+          # GitHub App token with `administration:write`); the default
+          # `GITHUB_TOKEN` cannot enable Pages on its own. If this step still
+          # fails with "Get Pages site failed", enable Pages once manually in
+          # Settings > Pages > Build and deployment > Source: GitHub Actions.
+          enablement: true
+
+      - name: Install, build, and upload site
+        uses: withastro/action@v6
+        with:
+          path: site
+          node-version: 22
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

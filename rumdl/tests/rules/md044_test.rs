@@ -1,0 +1,872 @@
+use rumdl_lib::rule::Rule;
+use rumdl_lib::rules::MD044ProperNames;
+
+#[test]
+fn test_correct_names() {
+    let names = vec!["JavaScript".to_string(), "TypeScript".to_string()];
+    let rule = MD044ProperNames::new(names, true);
+    let content = "# Guide to JavaScript and TypeScript\n\nJavaScript is awesome!";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert!(result.is_empty());
+}
+
+#[test]
+fn test_incorrect_names() {
+    let names = vec!["JavaScript".to_string(), "TypeScript".to_string()];
+    let rule = MD044ProperNames::new(names, true);
+    let content = "# Guide to javascript and typescript\n\njavascript is awesome!";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert_eq!(result.len(), 3);
+    let fixed = rule.fix(&ctx).unwrap();
+    assert_eq!(fixed, "# Guide to JavaScript and TypeScript\n\nJavaScript is awesome!");
+}
+
+#[test]
+fn test_code_block_excluded() {
+    let names = vec!["JavaScript".to_string()];
+    let rule = MD044ProperNames::new(names, false); // false = skip code blocks
+    let content = "# JavaScript Guide\n\n```javascript\nconst x = 'javascript';\n```";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert!(result.is_empty());
+}
+
+#[test]
+fn test_code_block_included() {
+    let names = vec!["JavaScript".to_string()];
+    let rule = MD044ProperNames::new(names, true); // true = check code blocks
+    let content = "# JavaScript Guide\n\n```javascript\nconst x = 'javascript';\n```";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert!(!result.is_empty(), "Should detect 'javascript' in the code block");
+    let fixed = rule.fix(&ctx).unwrap();
+    assert!(
+        fixed.contains("const x = 'JavaScript';"),
+        "Should replace 'javascript' with 'JavaScript' in code blocks"
+    );
+}
+
+#[test]
+fn test_indented_code_block() {
+    let names = vec!["JavaScript".to_string()];
+    let rule = MD044ProperNames::new(names, false); // false = skip code blocks
+    let content = "# JavaScript Guide\n\n    const x = 'javascript';\n    console.log(x);";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    if !result.is_empty() {
+        eprintln!("Test failed - found violations:");
+        for warning in &result {
+            eprintln!("  Line {}: {}", warning.line, warning.message);
+        }
+        eprintln!("Code blocks detected: {:?}", ctx.code_blocks);
+        eprintln!("Content: {content:?}");
+        let mut byte_pos = 0;
+        for (i, line) in content.lines().enumerate() {
+            eprintln!(
+                "Line {}: byte_pos={}, in_code_block={}, content={:?}",
+                i + 1,
+                byte_pos,
+                ctx.is_in_code_block_or_span(byte_pos),
+                line
+            );
+            byte_pos += line.len() + 1;
+        }
+    }
+    assert!(result.is_empty());
+}
+
+#[test]
+fn test_multiple_occurrences() {
+    let names = vec!["JavaScript".to_string(), "Node.js".to_string()];
+    let rule = MD044ProperNames::new(names, true);
+    let content = "javascript with nodejs\njavascript and nodejs again";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+
+    // Add debug output
+    println!("Number of warnings: {}", result.len());
+    for (i, warning) in result.iter().enumerate() {
+        println!(
+            "Warning {}: Line {}, Column {}, Message: {}",
+            i + 1,
+            warning.line,
+            warning.column,
+            warning.message
+        );
+    }
+
+    // The important part is that it finds the occurrences, the exact count may vary
+    assert!(!result.is_empty(), "Should detect multiple improper names");
+
+    let fixed = rule.fix(&ctx).unwrap();
+    println!("Original content: '{content}'");
+    println!("Fixed content: '{fixed}'");
+
+    // More lenient assertions
+    assert!(
+        fixed.contains("JavaScript"),
+        "Should replace 'javascript' with 'JavaScript'"
+    );
+    assert!(fixed.contains("Node.js"), "Should replace 'nodejs' with 'Node.js'");
+}
+
+#[test]
+fn test_word_boundaries() {
+    let names = vec!["Git".to_string()];
+    let rule = MD044ProperNames::new(names, true);
+    let content = "Using git and github with gitflow";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert_eq!(result.len(), 1); // Only "git" should be flagged, not "github" or "gitflow"
+    let fixed = rule.fix(&ctx).unwrap();
+    assert_eq!(fixed, "Using Git and github with gitflow");
+}
+
+#[test]
+fn test_fix_multiple_on_same_line() {
+    let names = vec!["Rust".to_string(), "Cargo".to_string()];
+    let rule = MD044ProperNames::new(names, true);
+    let content = "Using rust and cargo is fun. rust is fast.";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let fixed = rule.fix(&ctx).unwrap();
+    assert_eq!(fixed, "Using Rust and Cargo is fun. Rust is fast.");
+}
+
+#[test]
+fn test_fix_adjacent_to_markdown() {
+    let names = vec!["Markdown".to_string()];
+    let rule = MD044ProperNames::new(names, false); // false = skip code blocks
+    let content = "*markdown* _markdown_ `markdown` [markdown](link)";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let fixed = rule.fix(&ctx).unwrap();
+    // When code_blocks=false, inline code should not be fixed
+    // Link TEXT should be corrected, link URLs should not
+    assert_eq!(fixed, "*Markdown* _Markdown_ `markdown` [Markdown](link)");
+}
+
+#[test]
+fn test_fix_with_dots() {
+    let names = vec!["Node.js".to_string()];
+    let rule = MD044ProperNames::new(names, true);
+    let content = "Using node.js or sometimes nodejs.";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let fixed = rule.fix(&ctx).unwrap();
+    assert_eq!(fixed, "Using Node.js or sometimes Node.js.");
+}
+
+#[test]
+fn test_fix_code_block_included() {
+    let names = vec!["Rust".to_string()];
+    let rule = MD044ProperNames::new(names, true); // true = check code blocks
+    let content = "```rust\nlet lang = \"rust\";\n```\n\nThis is rust code.";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let fixed = rule.fix(&ctx).unwrap();
+    assert_eq!(fixed, "```rust\nlet lang = \"Rust\";\n```\n\nThis is Rust code.");
+}
+
+#[test]
+fn test_code_fence_language_identifiers_preserved() {
+    // Test that language identifiers in code fences are not modified
+    let names = vec!["Rust".to_string(), "Python".to_string(), "JavaScript".to_string()];
+    let rule = MD044ProperNames::new(names, true); // true = check code blocks
+
+    let content = r#"```rust
+// This is rust code
+let rust = "rust";
+```
+
+```python
+# This is python code
+python = "python"
+```
+
+```javascript
+// This is javascript code
+const javascript = "javascript";
+```"#;
+
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let fixed = rule.fix(&ctx).unwrap();
+
+    // Language identifiers should remain lowercase
+    assert!(fixed.contains("```rust"), "rust identifier should stay lowercase");
+    assert!(fixed.contains("```python"), "python identifier should stay lowercase");
+    assert!(
+        fixed.contains("```javascript"),
+        "javascript identifier should stay lowercase"
+    );
+
+    // When code_blocks = true (check code blocks), content inside should be capitalized
+    assert!(
+        fixed.contains("let Rust = \"Rust\""),
+        "Variable names should be capitalized"
+    );
+    assert!(
+        fixed.contains("# This is Python code"),
+        "Comments should be capitalized"
+    );
+    assert!(
+        fixed.contains("Python = \"Python\""),
+        "Variable names should be capitalized"
+    );
+    assert!(
+        fixed.contains("const JavaScript = \"JavaScript\""),
+        "Variable names should be capitalized"
+    );
+}
+
+#[test]
+fn test_tilde_fence_language_identifiers() {
+    // Test with tilde fences
+    let names = vec!["Ruby".to_string()];
+    let rule = MD044ProperNames::new(names, true); // true = check code blocks
+
+    let content = "~~~ruby\nputs 'ruby'\n~~~";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let fixed = rule.fix(&ctx).unwrap();
+
+    assert!(
+        fixed.contains("~~~ruby"),
+        "Tilde fence identifier should stay lowercase"
+    );
+    assert!(fixed.contains("puts 'Ruby'"), "Content should be capitalized");
+}
+
+#[test]
+fn test_fence_with_attributes() {
+    // Test fences with additional attributes
+    let names = vec!["JSON".to_string()];
+    let rule = MD044ProperNames::new(names, true); // true = check code blocks
+
+    let content = "```json {highlight: [2]}\n{\n  \"json\": \"value\"\n}\n```";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let fixed = rule.fix(&ctx).unwrap();
+
+    assert!(
+        fixed.contains("```json {highlight: [2]}"),
+        "Fence with attributes preserved"
+    );
+    assert!(fixed.contains("\"JSON\""), "Content should be capitalized");
+}
+
+#[test]
+fn test_mixed_fence_types() {
+    // Test document with both fence types
+    let names = vec!["Go".to_string()];
+    let rule = MD044ProperNames::new(names, true);
+
+    let content = "```go\nfmt.Println(\"go\")\n```\n\n~~~go\nfmt.Println(\"go\")\n~~~";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let fixed = rule.fix(&ctx).unwrap();
+
+    assert!(fixed.contains("```go"), "Backtick fence preserved");
+    assert!(fixed.contains("~~~go"), "Tilde fence preserved");
+    assert_eq!(fixed.matches("\"Go\"").count(), 2, "Both contents capitalized");
+}
+
+#[test]
+fn test_html_comments() {
+    // Since the html_comments configuration is not accessible via the public API,
+    // and the default is true (check HTML comments), we can test that behavior
+    let names = vec!["JavaScript".to_string(), "TypeScript".to_string()];
+    let rule = MD044ProperNames::new(names, true);
+    let content = "# JavaScript Guide\n\n<!-- javascript and typescript are mentioned here -->\n\nJavaScript is great!";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+
+    // By default (html_comments=true), it should detect names inside HTML comments
+    assert_eq!(
+        result.len(),
+        2,
+        "Should detect 'javascript' and 'typescript' in HTML comments by default"
+    );
+
+    let fixed = rule.fix(&ctx).unwrap();
+    assert!(
+        fixed.contains("<!-- JavaScript and TypeScript are mentioned here -->"),
+        "Should fix names in HTML comments by default"
+    );
+}
+
+#[test]
+fn test_html_comments_backtick_code_skipped() {
+    // Backtick-wrapped text in HTML comments should be treated as code
+    // when code_blocks is false (the default for MD044ProperNames::new)
+    let names = vec!["JavaScript".to_string()];
+    let rule = MD044ProperNames::new(names, false);
+    let content = "# Heading\n\n<!-- Use javascript here -->\n<!-- Use `javascript` here -->";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+
+    // Line 3: "javascript" not in backticks -> flagged
+    // Line 4: "javascript" in backticks -> skipped (treated as code)
+    assert_eq!(
+        result.len(),
+        1,
+        "Should only flag 'javascript' in non-backtick HTML comment, got: {result:?}",
+    );
+    assert_eq!(result[0].line, 3);
+}
+
+#[test]
+fn test_html_comments_double_backtick_code_skipped() {
+    let names = vec!["JavaScript".to_string()];
+    let rule = MD044ProperNames::new(names, false);
+    let content = "# Heading\n\n<!-- This is a ``javascript`` command. -->";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+
+    // "javascript" inside double backticks should be skipped
+    assert_eq!(
+        result.len(),
+        0,
+        "Should skip name inside double backticks in HTML comment"
+    );
+}
+
+#[test]
+fn test_html_comments_unclosed_backtick_not_code() {
+    let names = vec!["JavaScript".to_string()];
+    let rule = MD044ProperNames::new(names, false);
+    let content = "# Heading\n\n<!-- This is a `javascript command. -->";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+
+    // Unclosed backtick should NOT be treated as code
+    assert_eq!(result.len(), 1, "Unclosed backtick should not suppress the violation");
+}
+
+#[test]
+fn test_html_comments_multiple_code_spans() {
+    let names = vec!["JavaScript".to_string()];
+    let rule = MD044ProperNames::new(names, false);
+    let content = "# Heading\n\n<!-- `javascript` and `javascript` are both code -->";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+
+    // Both occurrences are in backticks, should both be skipped
+    assert_eq!(result.len(), 0, "Both backtick-wrapped occurrences should be skipped");
+}
+
+#[test]
+fn test_html_comments_mixed_code_and_prose() {
+    let names = vec!["JavaScript".to_string()];
+    let rule = MD044ProperNames::new(names, false);
+    let content = "# Heading\n\n<!-- javascript and `javascript` in same comment -->";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+
+    // First "javascript" is NOT in backticks (flagged), second IS (skipped)
+    assert_eq!(result.len(), 1, "Should only flag the non-backtick occurrence");
+}
+
+#[test]
+fn test_regular_markdown_backticks_still_work() {
+    // Ensure we didn't break regular markdown code span handling
+    let names = vec!["JavaScript".to_string()];
+    let rule = MD044ProperNames::new(names, false);
+    let content = "# Heading\n\nThis is javascript and `javascript` in backticks.";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+
+    // "javascript" in regular text flagged, "javascript" in backticks skipped (by pulldown-cmark)
+    assert_eq!(result.len(), 1, "Regular markdown backtick handling should still work");
+}
+
+#[test]
+fn test_html_block_backtick_code_skipped() {
+    // Backtick-wrapped text in HTML blocks should also be treated as code
+    let names = vec!["JavaScript".to_string()];
+    let rule = MD044ProperNames::new(names, false);
+    let content = "# Heading\n\n<div>\nUse javascript here and `javascript` in backticks.\n</div>";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+
+    // "javascript" bare in HTML block -> flagged; in backticks -> skipped
+    assert_eq!(
+        result.len(),
+        1,
+        "Should only flag bare name in HTML block, not backtick-wrapped"
+    );
+}
+
+#[test]
+fn test_html_comments_backtick_code_blocks_true() {
+    // When code_blocks = true, backtick-wrapped text should still be flagged
+    // MD044ProperNames::new(names, true) sets code_blocks = true
+    let names = vec!["JavaScript".to_string()];
+    let rule = MD044ProperNames::new(names, true);
+    let content = "# Heading\n\n<!-- Use `javascript` here -->";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+
+    // code_blocks = true means check inside code too, so backticks don't help
+    assert_eq!(
+        result.len(),
+        1,
+        "With code_blocks=true, backtick-wrapped text should still be flagged"
+    );
+}
+
+#[test]
+fn test_html_comments_backtick_autofix() {
+    // Autofix should fix bare names but leave backtick-wrapped names unchanged
+    let names = vec!["JavaScript".to_string()];
+    let rule = MD044ProperNames::new(names, false);
+    let content = "# Heading\n\n<!-- Use javascript here and `javascript` in backticks. -->";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let fixed = rule.fix(&ctx).unwrap();
+
+    // Bare "javascript" fixed to "JavaScript", backtick-wrapped left alone
+    assert_eq!(
+        fixed,
+        "# Heading\n\n<!-- Use JavaScript here and `javascript` in backticks. -->"
+    );
+}
+
+#[test]
+fn test_html_comments_multiline_with_backticks() {
+    // Multi-line HTML comment where backtick code is on an interior line
+    let names = vec!["JavaScript".to_string()];
+    let rule = MD044ProperNames::new(names, false);
+    let content = "# Heading\n\n<!--\nUse javascript here.\nUse `javascript` as code.\n-->";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+
+    // Line 4: bare "javascript" -> flagged
+    // Line 5: backtick-wrapped -> skipped
+    assert_eq!(result.len(), 1, "Should only flag bare name in multi-line HTML comment");
+    assert_eq!(result[0].line, 4);
+}
+
+#[test]
+fn test_html_comments_inline_link_url_skipped() {
+    // Issue #532: inline link URLs in HTML comments should not be flagged
+    let names = vec!["Test".to_string()];
+    let rule = MD044ProperNames::new(names, false);
+    let content = "# Heading\n\nThis is a Test.\n\n<!-- For more information, see the [relevant page](test.md). -->\n<!-- For more information, see `test.md` -->";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+
+    // Line 3: "Test" is already correct
+    // Line 5: "test" in (test.md) is a URL -> skipped
+    // Line 6: "test" in `test.md` is code -> skipped
+    assert_eq!(
+        result.len(),
+        0,
+        "Should not flag names inside link URLs in HTML comments. Got: {result:?}",
+    );
+}
+
+#[test]
+fn test_html_comments_inline_link_text_still_flagged() {
+    // Link text IS prose and should be checked for proper names
+    let names = vec!["Test".to_string()];
+    let rule = MD044ProperNames::new(names, false);
+    let content = "# Heading\n\n<!-- See the [test page](docs.md) for details -->";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+
+    // "test" in link text [test page] should still be flagged
+    assert_eq!(
+        result.len(),
+        1,
+        "Should flag improper name in link text within HTML comments. Got: {result:?}",
+    );
+}
+
+#[test]
+fn test_html_comments_multiple_inline_links() {
+    let names = vec!["Test".to_string()];
+    let rule = MD044ProperNames::new(names, false);
+    let content = "# Heading\n\n<!-- [a](test.md) and [b](test2.md) -->";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+
+    assert_eq!(
+        result.len(),
+        0,
+        "Should skip names in multiple link URLs. Got: {result:?}",
+    );
+}
+
+#[test]
+fn test_html_comments_link_with_title() {
+    let names = vec!["Test".to_string()];
+    let rule = MD044ProperNames::new(names, false);
+    let content = "# Heading\n\n<!-- [page](test.md \"test title\") -->";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+
+    // Both "test" in URL and "test" in title are within the (...) portion
+    assert_eq!(
+        result.len(),
+        0,
+        "Should skip names in link URL with title. Got: {result:?}",
+    );
+}
+
+#[test]
+fn test_html_comments_relative_link_paths() {
+    let names = vec!["Test".to_string()];
+    let rule = MD044ProperNames::new(names, false);
+    let content = "# Heading\n\n<!-- See [page](../test/file.md) and [other](./test.md) -->";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+
+    assert_eq!(
+        result.len(),
+        0,
+        "Should skip names in relative link paths. Got: {result:?}",
+    );
+}
+
+#[test]
+fn test_html_block_inline_link_url_skipped() {
+    // Same behavior in HTML blocks, not just comments
+    let names = vec!["Test".to_string()];
+    let rule = MD044ProperNames::new(names, false);
+    let content = "# Heading\n\n<div>\nSee [relevant page](test.md) for details.\n</div>";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+
+    assert_eq!(
+        result.len(),
+        0,
+        "Should skip names in link URLs inside HTML blocks. Got: {result:?}",
+    );
+}
+
+#[test]
+fn test_regular_markdown_link_url_still_handled() {
+    // Regular Markdown links (outside HTML comments) are handled by is_in_link()
+    let names = vec!["Test".to_string()];
+    let rule = MD044ProperNames::new(names, false);
+    let content = "# Heading\n\nSee [relevant page](test.md) for details.";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+
+    assert_eq!(
+        result.len(),
+        0,
+        "Regular Markdown link URLs should still be skipped. Got: {result:?}",
+    );
+}
+
+#[test]
+fn test_html_comments_not_a_link() {
+    // Bare text that looks like it could be a link part shouldn't be skipped
+    let names = vec!["Test".to_string()];
+    let rule = MD044ProperNames::new(names, false);
+    let content = "# Heading\n\n<!-- test is mentioned here -->";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+
+    assert_eq!(
+        result.len(),
+        1,
+        "Bare name in HTML comment should still be flagged. Got: {result:?}",
+    );
+}
+
+#[test]
+fn test_html_comments_inline_link_autofix() {
+    // Autofix should fix link text but leave URL alone
+    let names = vec!["Test".to_string()];
+    let rule = MD044ProperNames::new(names, false);
+    let content = "# Heading\n\n<!-- See the [test page](test.md) -->";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let fixed = rule.fix(&ctx).unwrap();
+
+    // "test" in link text should be fixed; "test" in URL should remain
+    assert_eq!(fixed, "# Heading\n\n<!-- See the [Test page](test.md) -->",);
+}
+
+#[test]
+fn test_html_comments_image_link_url_skipped() {
+    // Image URLs in HTML comments should also be skipped
+    let names = vec!["Test".to_string()];
+    let rule = MD044ProperNames::new(names, false);
+    let content = "# Heading\n\n<!-- ![screenshot](test-screenshot.png) -->";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+
+    assert_eq!(
+        result.len(),
+        0,
+        "Should skip names in image URLs in HTML comments. Got: {result:?}",
+    );
+}
+
+#[test]
+fn test_html_comments_multiline_with_link() {
+    // Multi-line HTML comment with inline link
+    let names = vec!["Test".to_string()];
+    let rule = MD044ProperNames::new(names, false);
+    let content = "# Heading\n\n<!--\nFor details, see [the guide](test.md).\n-->";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+
+    assert_eq!(
+        result.len(),
+        0,
+        "Should skip names in link URLs in multi-line HTML comments. Got: {result:?}",
+    );
+}
+
+#[test]
+fn test_html_comments_link_with_nested_brackets() {
+    let names = vec!["Test".to_string()];
+    let rule = MD044ProperNames::new(names, false);
+    let content = "# Heading\n\n<!-- [see [this] page](test.md) -->";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+
+    assert_eq!(
+        result.len(),
+        0,
+        "Should handle nested brackets in link text and skip URL. Got: {result:?}",
+    );
+}
+
+#[test]
+fn test_html_comments_link_with_balanced_parens_in_url() {
+    let names = vec!["Test".to_string()];
+    let rule = MD044ProperNames::new(names, false);
+    let content = "# Heading\n\n<!-- [page](https://example.com/test_(section)) -->";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+
+    assert_eq!(
+        result.len(),
+        0,
+        "Should handle balanced parentheses in URLs. Got: {result:?}",
+    );
+}
+
+#[test]
+fn test_html_comments_reference_link_skipped() {
+    // Reference-style links [text][ref] in HTML comments: ref portion should be skipped
+    let names = vec!["Test".to_string()];
+    let rule = MD044ProperNames::new(names, false);
+    let content = "# Heading\n\n<!-- See the [relevant page][test-ref] for details -->";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+
+    assert_eq!(
+        result.len(),
+        0,
+        "Should skip names in reference link labels in HTML comments. Got: {result:?}",
+    );
+}
+
+#[test]
+fn test_html_comments_reference_link_text_still_flagged() {
+    // Reference link text IS prose and should be checked
+    let names = vec!["Test".to_string()];
+    let rule = MD044ProperNames::new(names, false);
+    let content = "# Heading\n\n<!-- See the [test page][ref] for details -->";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+
+    assert_eq!(
+        result.len(),
+        1,
+        "Should flag improper name in reference link text. Got: {result:?}",
+    );
+}
+
+#[test]
+fn test_html_comments_mixed_link_styles() {
+    // Both inline and reference links in one comment
+    let names = vec!["Test".to_string()];
+    let rule = MD044ProperNames::new(names, false);
+    let content = "# Heading\n\n<!-- [page](test.md) and [other][test-ref] -->";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+
+    assert_eq!(
+        result.len(),
+        0,
+        "Should skip names in both inline and reference link URLs. Got: {result:?}",
+    );
+}
+
+#[test]
+fn test_frontmatter_inline_link_url_skipped() {
+    // YAML frontmatter can contain markdown-like link syntax in values
+    let names = vec!["Test".to_string()];
+    let rule = MD044ProperNames::new(names, false);
+    let content = "---\ndescription: See [relevant page](test.md) for details\n---\n\n# Heading\n";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+
+    assert_eq!(
+        result.len(),
+        0,
+        "Should skip names in link URLs within frontmatter. Got: {result:?}",
+    );
+}
+
+#[test]
+fn test_frontmatter_link_text_still_flagged() {
+    // Link text in frontmatter IS prose and should be checked
+    let names = vec!["Test".to_string()];
+    let rule = MD044ProperNames::new(names, false);
+    let content = "---\ndescription: See [test page](example.md) for details\n---\n\n# Heading\n";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+
+    assert_eq!(
+        result.len(),
+        1,
+        "Should flag improper name in link text within frontmatter. Got: {result:?}",
+    );
+}
+
+#[test]
+fn test_html_comments_double_escaped_bracket_link() {
+    // \\[text](url) — the backslash is escaped, so [ starts a real link
+    let names = vec!["Test".to_string()];
+    let rule = MD044ProperNames::new(names, false);
+    let content = "# Heading\n\n<!-- \\\\[page](test.md) -->";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+
+    assert_eq!(
+        result.len(),
+        0,
+        "Should skip names in link URLs even with double-escaped preceding backslash. Got: {result:?}",
+    );
+}
+
+#[test]
+fn test_html_block_reference_link_url_skipped() {
+    // Reference link inside an HTML block
+    let names = vec!["Test".to_string()];
+    let rule = MD044ProperNames::new(names, false);
+    let content = "# Heading\n\n<div>\n[relevant page][test-ref]\n</div>\n";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+
+    assert_eq!(
+        result.len(),
+        0,
+        "Should skip names in reference link labels in HTML blocks. Got: {result:?}",
+    );
+}
+
+#[test]
+fn test_wiki_embed_target_is_never_renamed() {
+    // A wiki embed names a file. Rewriting any part of it changes what the embed
+    // resolves to, so `rumdl fmt` must leave the whole construct alone: it used to
+    // read the piped dimensions as alt text and turn `![[javascript.png|300]]` into
+    // `![[JavaScript.png|300]]`, breaking the embed.
+    let names = vec!["JavaScript".to_string()];
+    let rule = MD044ProperNames::new(names, false);
+    let content = "![[javascript.png]]\n\
+                   ![[javascript.png|300]]\n\
+                   ![[subfolder/javascript.png|640x480]]\n\
+                   ![[javascript.png|A javascript diagram]]\n\
+                   Plain javascript prose.\n";
+    // The last line is the positive control. Without it, byte-identical output would
+    // also be what a rule that simply never ran produces.
+    let expected = "![[javascript.png]]\n\
+                    ![[javascript.png|300]]\n\
+                    ![[subfolder/javascript.png|640x480]]\n\
+                    ![[javascript.png|A javascript diagram]]\n\
+                    Plain JavaScript prose.\n";
+
+    // Wikilinks are enabled for every flavor, so the embeds parse the same way in both.
+    for flavor in [
+        rumdl_lib::config::MarkdownFlavor::Obsidian,
+        rumdl_lib::config::MarkdownFlavor::Standard,
+    ] {
+        let ctx = rumdl_lib::lint_context::LintContext::new(content, flavor, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(
+            result.len(),
+            1,
+            "{flavor:?}: only the prose line warns. Got: {result:?}"
+        );
+        assert_eq!(result[0].line, 5, "{flavor:?}");
+        assert_eq!(rule.fix(&ctx).unwrap(), expected, "{flavor:?}");
+    }
+}
+
+#[test]
+fn test_wikilink_display_text_is_checked_and_the_target_is_not() {
+    // `[[page|text]]` shows only the text, so the page name is a reference like a URL:
+    // renaming it changes what the link resolves to without changing what a reader
+    // sees. The window used to be measured from the opening `[[`, which put it over
+    // the page name and left the displayed text unchecked.
+    let names = vec!["JavaScript".to_string()];
+    let rule = MD044ProperNames::new(names, false);
+    let content = "[[javascript]]\n\
+                   [[javascript-page|A javascript guide]]\n\
+                   [[Page|javascript]]\n\
+                   [[docs/javascript|see the javascript notes]]\n";
+    // Line 1 has no display text, so its page name is also what the reader sees.
+    let expected = "[[JavaScript]]\n\
+                    [[javascript-page|A JavaScript guide]]\n\
+                    [[Page|JavaScript]]\n\
+                    [[docs/javascript|see the JavaScript notes]]\n";
+
+    for flavor in [
+        rumdl_lib::config::MarkdownFlavor::Obsidian,
+        rumdl_lib::config::MarkdownFlavor::Standard,
+    ] {
+        let ctx = rumdl_lib::lint_context::LintContext::new(content, flavor, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 4, "{flavor:?}: one per line. Got: {result:?}");
+        assert_eq!(
+            result.iter().map(|w| (w.line, w.column)).collect::<Vec<_>>(),
+            vec![(1, 3), (2, 21), (3, 8), (4, 27)],
+            "{flavor:?}"
+        );
+        assert_eq!(rule.fix(&ctx).unwrap(), expected, "{flavor:?}");
+    }
+}
+
+#[test]
+fn test_image_nested_in_link_text_keeps_its_destination() {
+    // Displayed link text can hold an image, whose destination is a URL like any
+    // other: renaming inside it breaks the image. The nested image used to be
+    // invisible to the check, because a position inside link text was answered
+    // from the link alone and never reached the image it sat in.
+    let names = vec!["JavaScript".to_string()];
+    let rule = MD044ProperNames::new(names, false);
+    let content = "[[Target|Display ![alt](javascript.png) more]]\n\
+                   [Display ![alt](javascript.png) more](target.md)\n\
+                   ![alt](javascript.png)\n\
+                   [[Target|Display [inner](javascript.md) more]]\n\
+                   [[Target|Display ![javascript](img.png) more]]\n\
+                   [Display ![javascript](img.png) more](target.md)\n\
+                   Plain javascript prose.\n";
+    // Only the two alt texts and the prose change. Alt text is what a reader sees
+    // when the image fails to load, so it is checked wherever it appears; the last
+    // line is the positive control, since a rule that never ran also changes nothing.
+    let expected = "[[Target|Display ![alt](javascript.png) more]]\n\
+                    [Display ![alt](javascript.png) more](target.md)\n\
+                    ![alt](javascript.png)\n\
+                    [[Target|Display [inner](javascript.md) more]]\n\
+                    [[Target|Display ![JavaScript](img.png) more]]\n\
+                    [Display ![JavaScript](img.png) more](target.md)\n\
+                    Plain JavaScript prose.\n";
+
+    for flavor in [
+        rumdl_lib::config::MarkdownFlavor::Obsidian,
+        rumdl_lib::config::MarkdownFlavor::Standard,
+    ] {
+        let ctx = rumdl_lib::lint_context::LintContext::new(content, flavor, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(
+            result.iter().map(|w| (w.line, w.column)).collect::<Vec<_>>(),
+            vec![(5, 20), (6, 12), (7, 7)],
+            "{flavor:?}: alt text twice, then the prose. Got: {result:?}"
+        );
+        assert_eq!(rule.fix(&ctx).unwrap(), expected, "{flavor:?}");
+    }
+}

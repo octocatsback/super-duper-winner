@@ -45,3 +45,19 @@ site/.vercel/
 site/.netlify/
 site/.env
 site/.env.*
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Credentials and keys — never commit these
+*.pem
+*.p12
+*.pfx
+id_rsa
+id_ecdsa
+id_ed25519
+*.id_rsa
+secrets.local.*
+credentials.json
+auth.json

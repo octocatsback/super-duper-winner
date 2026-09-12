@@ -1,0 +1,2186 @@
+//! WebAssembly bindings for rumdl
+//!
+//! This module provides a `Linter` class for linting markdown content
+//! in browser environments, with full configuration support including
+//! rule-specific options.
+//!
+//! # Basic Usage
+//!
+//! ```javascript
+//! import init, { Linter, get_version, get_available_rules } from 'rumdl-wasm';
+//!
+//! await init();
+//!
+//! // Create a linter with configuration
+//! const linter = new Linter({
+//!   disable: ["MD041"],       // Disable specific rules
+//!   "line-length": 120,       // Set line length limit
+//!   flavor: "mkdocs"          // Use MkDocs markdown flavor
+//! });
+//!
+//! // Check for issues (path is optional; when provided, excludes are applied)
+//! const warnings = JSON.parse(linter.check(content, "docs/page.md"));
+//!
+//! // Apply all fixes
+//! const fixed = linter.fix(content, "docs/page.md");
+//! ```
+//!
+//! # Rule-specific Configuration
+//!
+//! Rules can be configured individually using their rule name as a key:
+//!
+//! ```javascript
+//! const linter = new Linter({
+//!   "MD060": {
+//!     "enabled": true,
+//!     "style": "aligned"
+//!   },
+//!   "MD013": {
+//!     "line-length": 120,
+//!     "code-blocks": false,
+//!     "tables": false
+//!   },
+//!   "MD044": {
+//!     "names": ["JavaScript", "TypeScript", "React"]
+//!   }
+//! });
+//! ```
+
+use serde::{Deserialize, Serialize};
+use wasm_bindgen::prelude::*;
+
+use crate::config::file_source::{ConfigFileSource, InMemoryConfigFiles};
+use crate::config::{Config, ConfigError, ConfigLoaded, ConfigSource, MarkdownFlavor, SourcedConfig};
+use crate::rule::{LintWarning, Severity};
+use crate::rule_config_serde::{is_rule_name, json_to_rule_config_with_warnings, toml_value_to_json};
+use crate::rules::{all_rules, filter_rules};
+use crate::types::LineLength;
+use crate::utils::utf8_offsets::byte_offset_to_char_offset;
+
+/// Warning with fix range converted to character offsets for JavaScript
+#[derive(Serialize)]
+struct JsWarning {
+    message: String,
+    line: usize,
+    column: usize,
+    end_line: usize,
+    end_column: usize,
+    severity: Severity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fix: Option<JsFix>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rule_name: Option<String>,
+}
+
+/// Fix with character offsets instead of byte offsets
+#[derive(Serialize)]
+struct JsFix {
+    range: JsRange,
+    replacement: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    additional_edits: Vec<JsFix>,
+}
+
+/// Range with character offsets for JavaScript
+#[derive(Serialize)]
+struct JsRange {
+    start: usize,
+    end: usize,
+}
+
+/// Convert a LintWarning to a JsWarning with character offsets
+fn convert_warning_for_js(warning: &LintWarning, content: &str) -> JsWarning {
+    fn fix_to_js(fix: &crate::rule::Fix, content: &str) -> JsFix {
+        JsFix {
+            range: JsRange {
+                start: byte_offset_to_char_offset(content, fix.range.start),
+                end: byte_offset_to_char_offset(content, fix.range.end),
+            },
+            replacement: fix.replacement.clone(),
+            additional_edits: fix.additional_edits.iter().map(|e| fix_to_js(e, content)).collect(),
+        }
+    }
+    let js_fix = warning.fix.as_ref().map(|fix| fix_to_js(fix, content));
+
+    // rumdl reports columns as character positions already (see LintContext and
+    // #670), so they pass straight through. Do NOT run byte->char conversion here:
+    // that would double-adjust the column and under-count on lines with multi-byte
+    // characters. Only the fix range below needs conversion, since Fix ranges are
+    // byte offsets into the content.
+    let column = warning.column;
+    let end_column = warning.end_column;
+
+    JsWarning {
+        message: warning.message.clone(),
+        line: warning.line,
+        column,
+        end_line: warning.end_line,
+        end_column,
+        severity: warning.severity,
+        fix: js_fix,
+        rule_name: warning.rule_name.clone(),
+    }
+}
+
+/// Initialize the WASM module with better panic messages
+#[wasm_bindgen(start)]
+pub fn init() {
+    console_error_panic_hook::set_once();
+}
+
+/// Human-readable name for a TOML value's variant. Used in config warnings.
+fn toml_type_name(value: &toml::Value) -> &'static str {
+    match value {
+        toml::Value::String(_) => "string",
+        toml::Value::Integer(_) => "integer",
+        toml::Value::Float(_) => "float",
+        toml::Value::Boolean(_) => "boolean",
+        toml::Value::Array(_) => "array",
+        toml::Value::Table(_) => "table",
+        toml::Value::Datetime(_) => "datetime",
+    }
+}
+
+/// Return true if `path` matches any of the exclude patterns.
+///
+/// Uses the shared discovery matcher so `.rumdl.toml` entries like
+/// `exclude = [".git"]` expand and match the same way everywhere.
+fn path_matches_exclude(exclude_patterns: &[String], path: &str) -> bool {
+    if exclude_patterns.is_empty() {
+        return false;
+    }
+    // Normalize: drop leading `./` so `./q2/foo.md` matches `q2/**/*.md`
+    let normalized = path.strip_prefix("./").unwrap_or(path);
+    crate::discovery::ExcludeMatchers::new(exclude_patterns).is_match(normalized)
+}
+
+/// Configuration options for the Linter
+///
+/// All fields are optional. If not specified, defaults are used.
+///
+/// # Rule-specific configuration
+///
+/// Rules can be configured individually using their rule name (e.g., "MD060")
+/// as a key with an object containing rule-specific options:
+///
+/// ```javascript
+/// const linter = new Linter({
+///   "MD060": {
+///     "enabled": true,
+///     "style": "aligned"
+///   },
+///   "MD013": {
+///     "line-length": 120,
+///     "code-blocks": false
+///   }
+/// });
+/// ```
+#[derive(Deserialize, Default, Debug)]
+#[serde(rename_all = "kebab-case", default)]
+pub struct LinterConfig {
+    /// Rules to disable (e.g., ["MD041", "MD013"])
+    pub disable: Option<Vec<String>>,
+
+    /// Rules to enable (if empty, all rules enabled except disabled)
+    pub enable: Option<Vec<String>>,
+
+    /// Additional rules to enable (e.g., opt-in rules like ["MD060", "MD063"])
+    pub extend_enable: Option<Vec<String>>,
+
+    /// Additional rules to disable
+    pub extend_disable: Option<Vec<String>>,
+
+    /// Line length limit (default: 80)
+    pub line_length: Option<u64>,
+
+    /// Markdown flavor: "standard", "mkdocs", "mdx", "pandoc", "quarto", "obsidian", "kramdown", "azure_devops", "myst", "hugo", "mdg", or preview flavor "gh-aw"
+    pub flavor: Option<String>,
+
+    /// Rules allowed to apply fixes (if specified, only these rules are fixed)
+    pub fixable: Option<Vec<String>>,
+
+    /// Rules that should never apply fixes (takes precedence over fixable)
+    pub unfixable: Option<Vec<String>>,
+
+    /// File path patterns to exclude from linting. Matched against the optional
+    /// `path` argument of `check`/`fix`. Bare directory names (e.g. `.git`) are
+    /// expanded to also match their contents.
+    pub exclude: Option<Vec<String>>,
+
+    /// Rule-specific configurations
+    /// Keys are rule names (e.g., "MD060", "MD013") and values are rule options
+    #[serde(flatten)]
+    pub rules: Option<std::collections::HashMap<String, serde_json::Value>>,
+}
+
+impl LinterConfig {
+    /// Convert to internal Config (discards any config parse warnings)
+    #[cfg(test)]
+    fn to_config(&self) -> Config {
+        self.to_config_with_warnings().0
+    }
+
+    /// Convert to internal Config, collecting any warnings about invalid configuration
+    fn to_config_with_warnings(&self) -> (Config, Vec<String>) {
+        let mut config = Config::default();
+        let mut warnings = Vec::new();
+
+        // Apply disabled rules
+        if let Some(ref disable) = self.disable {
+            config.global.disable.clone_from(disable);
+        }
+
+        // Apply enabled rules (presence of `enable` key means explicit mode)
+        if let Some(ref enable) = self.enable {
+            config.global.enable.clone_from(enable);
+            config.global.enable_is_explicit = true;
+        }
+
+        // Apply extend-enable / extend-disable
+        if let Some(ref extend_enable) = self.extend_enable {
+            config.global.extend_enable.clone_from(extend_enable);
+        }
+        if let Some(ref extend_disable) = self.extend_disable {
+            config.global.extend_disable.clone_from(extend_disable);
+        }
+
+        // Apply line length
+        if let Some(line_length) = self.line_length {
+            config.global.line_length = LineLength::new(line_length as usize);
+        }
+
+        // Apply flavor
+        config.global.flavor = self.markdown_flavor();
+
+        // Apply fixable / unfixable
+        if let Some(ref fixable) = self.fixable {
+            config.global.fixable.clone_from(fixable);
+        }
+        if let Some(ref unfixable) = self.unfixable {
+            config.global.unfixable.clone_from(unfixable);
+        }
+
+        // Apply exclude patterns
+        if let Some(ref exclude) = self.exclude {
+            config.global.exclude.clone_from(exclude);
+        }
+
+        // Apply rule-specific configurations
+        if let Some(ref rules) = self.rules {
+            // A flat options object cannot carry a file chain; `extends` is only
+            // meaningful to `Linter.from_config_files`. Say so instead of dropping it.
+            if rules.contains_key("extends") {
+                warnings.push(
+                    "'extends' is ignored by new Linter(...): load the config file with \
+                     Linter.from_config_files() to follow it"
+                        .to_string(),
+                );
+            }
+            let registry = crate::config::registry::default_registry();
+            for (rule_name, json_value) in rules {
+                // Only process keys that look like rule names (MD###)
+                if !is_rule_name(rule_name) {
+                    continue;
+                }
+                let canonical = rule_name.to_ascii_uppercase();
+
+                // Convert JSON value to RuleConfig, collecting warnings
+                let result = json_to_rule_config_with_warnings(json_value);
+                for warning in result.warnings {
+                    warnings.push(format!("[{canonical}] {warning}"));
+                }
+                if let Some(rule_config) = result.config {
+                    // Validate value types against the rule's known schema.
+                    // Emits a warning when a provided value type doesn't match
+                    // what the rule expects (e.g. `line-length = "not-a-number"`).
+                    for (field, actual) in &rule_config.values {
+                        if let Some(expected) = registry.expected_value_for(&canonical, field)
+                            && std::mem::discriminant(actual) != std::mem::discriminant(expected)
+                        {
+                            warnings.push(format!(
+                                "[{canonical}] Invalid type for '{field}': expected {}, got {}",
+                                toml_type_name(expected),
+                                toml_type_name(actual),
+                            ));
+                        }
+                    }
+                    config.rules.insert(canonical, rule_config);
+                }
+            }
+        }
+
+        // Apply per-rule `enabled = true/false` to global enable/disable lists
+        config.apply_per_rule_enabled();
+
+        // Re-establish the canonical-rule-IDs invariant: WASM callers can pass
+        // aliases (`"no-inline-html"`) in disable/enable/extend_*/fixable/unfixable
+        // and we must normalise them so `rules::filter_rules` matches against
+        // `Rule::name()` correctly.
+        config.canonicalize_rule_lists();
+
+        (config, warnings)
+    }
+
+    /// Parse markdown flavor from config, delegating to `MarkdownFlavor::from_str`
+    /// to support all aliases (e.g., "qmd"/"rmd" → Quarto, "gfm" → Standard)
+    fn markdown_flavor(&self) -> MarkdownFlavor {
+        self.flavor
+            .as_deref()
+            .and_then(|s| s.parse::<MarkdownFlavor>().ok())
+            .unwrap_or_default()
+    }
+}
+
+/// Config files an embedder has read, for [`resolve_config_chain`] and
+/// [`Linter::from_config_files`].
+///
+/// ```javascript
+/// {
+///   root: ".rumdl.toml",                       // the config to load
+///   files: { ".rumdl.toml": "extends = \"base/.rumdl.toml\"\n" },
+///   env: { HOME: "/Users/me" },                // optional, for `$VAR` in `extends`
+///   home: "/Users/me",                         // optional, for `~/` in `extends`
+///   "default-flavor": "obsidian"               // optional, used when no file sets one
+/// }
+/// ```
+///
+/// `files` maps each path the loader asks for to its contents, or to `null` for
+/// a path the embedder looked up and found missing. Paths are as the loader
+/// names them: `root` as given, and each `extends` target resolved against the
+/// directory of the file declaring it (`$VAR` expanded from `env`, `~/` from
+/// `home`), so an embedder should read exactly the path it is asked for and store
+/// it under that key.
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "kebab-case", default)]
+struct ConfigFilesRequest {
+    root: String,
+    files: std::collections::HashMap<String, Option<String>>,
+    env: std::collections::HashMap<String, String>,
+    home: Option<String>,
+    default_flavor: Option<String>,
+}
+
+/// How loading a config chain from supplied contents ended.
+enum ChainOutcome {
+    /// The chain reaches a file the embedder has not supplied yet.
+    NeedFile(std::path::PathBuf),
+    /// Every file was available and parsed; the chain is listed root first.
+    Loaded {
+        sourced: Box<SourcedConfig<ConfigLoaded>>,
+        chain: Vec<String>,
+    },
+    /// A config error the embedder cannot fix by supplying more files.
+    Failed(ConfigError),
+}
+
+fn parse_request(request: JsValue) -> Result<ConfigFilesRequest, JsValue> {
+    let request: ConfigFilesRequest = serde_wasm_bindgen::from_value(request)
+        .map_err(|e| JsValue::from_str(&format!("Invalid config file request: {e}")))?;
+    if request.root.is_empty() {
+        return Err(JsValue::from_str("Invalid config file request: 'root' is required"));
+    }
+    Ok(request)
+}
+
+fn load_chain(request: ConfigFilesRequest) -> ChainOutcome {
+    let source = InMemoryConfigFiles::new(request.files, request.env, request.home.map(std::path::PathBuf::from));
+    let loaded = SourcedConfig::load_chain_from(std::path::Path::new(&request.root), &source);
+    // Ask the source first: a load that stopped at an unsupplied file also
+    // carries a not-found error, which is not the embedder's problem to show.
+    if let Some(path) = source.needed() {
+        return ChainOutcome::NeedFile(path);
+    }
+    match loaded {
+        Ok(sourced) => {
+            // The loader records files in merge order (base first); the chain
+            // reads more naturally from the file the embedder named, and
+            // normalized so `docs/../base.toml` shows as `base.toml`.
+            let chain = sourced
+                .loaded_files
+                .iter()
+                .rev()
+                .map(|p| {
+                    source
+                        .canonicalize(std::path::Path::new(p))
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            ChainOutcome::Loaded {
+                sourced: Box::new(sourced),
+                chain,
+            }
+        }
+        Err(e) => ChainOutcome::Failed(e),
+    }
+}
+
+/// Find out which config files a chain needs before building a `Linter` from it.
+///
+/// Embedders that can only read files asynchronously call this in a loop: start
+/// with the root file's contents, add whatever path the result asks for, and
+/// repeat until the chain is complete. Returns a JSON object with `status`:
+///
+/// - `{"status": "need-file", "path": "base/.rumdl.toml"}`: read this path
+///   (relative paths are relative to wherever `root` is relative to), add it to
+///   `files` (or `null` if it does not exist), and call again.
+/// - `{"status": "complete", "files": [".rumdl.toml", "base/.rumdl.toml"]}`:
+///   every file is present; `files` lists the chain root first.
+/// - `{"status": "error", "message": "..."}`: the chain cannot be loaded
+///   (parse error, missing `extends` target, cycle, undefined `$VAR`, ...).
+///
+/// ```javascript
+/// const files = { [root]: await read(root) };
+/// for (;;) {
+///   const r = JSON.parse(resolve_config_chain({ root, files }));
+///   if (r.status === "need-file") { files[r.path] = await readOrNull(r.path); continue; }
+///   if (r.status === "error") throw new Error(r.message);
+///   break;
+/// }
+/// const linter = Linter.from_config_files({ root, files });
+/// ```
+#[wasm_bindgen]
+pub fn resolve_config_chain(request: JsValue) -> Result<String, JsValue> {
+    Ok(chain_status_json(parse_request(request)?))
+}
+
+fn chain_status_json(request: ConfigFilesRequest) -> String {
+    let result = match load_chain(request) {
+        ChainOutcome::NeedFile(path) => serde_json::json!({
+            "status": "need-file",
+            "path": path.to_string_lossy(),
+        }),
+        ChainOutcome::Loaded { chain, .. } => serde_json::json!({
+            "status": "complete",
+            "files": chain,
+        }),
+        ChainOutcome::Failed(e) => serde_json::json!({
+            "status": "error",
+            "message": e.to_string(),
+        }),
+    };
+    result.to_string()
+}
+
+/// Build a `Linter` from a complete config chain. See [`Linter::from_config_files`].
+fn linter_from_request(request: ConfigFilesRequest) -> Result<Linter, String> {
+    let default_flavor = request
+        .default_flavor
+        .as_deref()
+        .map(|f| {
+            f.parse::<MarkdownFlavor>()
+                .map_err(|_| format!("Invalid config file request: unknown default-flavor '{f}'"))
+        })
+        .transpose()?;
+
+    let mut sourced = match load_chain(request) {
+        ChainOutcome::NeedFile(path) => {
+            return Err(format!(
+                "Config file '{}' was not provided; resolve the chain with resolve_config_chain first",
+                path.display()
+            ));
+        }
+        ChainOutcome::Failed(e) => return Err(e.to_string()),
+        ChainOutcome::Loaded { sourced, .. } => *sourced,
+    };
+
+    // A flavor no file in the chain sets falls back to the embedder's, not to
+    // the CLI default: an Obsidian vault is Obsidian markdown unless told otherwise.
+    if let Some(flavor) = default_flavor
+        && sourced.global.flavor.source == ConfigSource::Default
+    {
+        sourced.global.flavor.value = flavor;
+    }
+
+    let registry = crate::config::registry::default_registry();
+    let (config, validation_warnings) = sourced.validate_into(registry).map_err(|e| e.to_string())?;
+    let flavor = config.global.flavor;
+
+    Ok(Linter {
+        config,
+        flavor,
+        config_warnings: validation_warnings.into_iter().map(|w| w.message).collect(),
+    })
+}
+
+/// A markdown linter with configuration
+///
+/// Create a new `Linter` with a configuration object, then use
+/// `check()` to lint content and `fix()` to auto-fix issues.
+#[wasm_bindgen]
+pub struct Linter {
+    config: Config,
+    flavor: MarkdownFlavor,
+    /// Warnings generated during configuration parsing
+    config_warnings: Vec<String>,
+}
+
+#[wasm_bindgen]
+impl Linter {
+    /// Create a new Linter with the given configuration
+    ///
+    /// # Arguments
+    ///
+    /// * `options` - Configuration object (see LinterConfig)
+    ///
+    /// # Example
+    ///
+    /// ```javascript
+    /// const linter = new Linter({
+    ///   disable: ["MD041"],
+    ///   "line-length": 120
+    /// });
+    /// ```
+    #[wasm_bindgen(constructor)]
+    pub fn new(options: JsValue) -> Result<Linter, JsValue> {
+        let linter_config: LinterConfig = if options.is_undefined() || options.is_null() {
+            LinterConfig::default()
+        } else {
+            serde_wasm_bindgen::from_value(options).map_err(|e| JsValue::from_str(&format!("Invalid config: {e}")))?
+        };
+
+        let (config, config_warnings) = linter_config.to_config_with_warnings();
+
+        Ok(Linter {
+            config,
+            flavor: linter_config.markdown_flavor(),
+            config_warnings,
+        })
+    }
+
+    /// Get any warnings generated during configuration parsing
+    ///
+    /// Returns a JSON array of warning strings. Each warning is prefixed
+    /// with the rule name (e.g., "[MD060] Invalid severity: critical").
+    ///
+    /// Useful for debugging configuration issues or providing user feedback.
+    pub fn get_config_warnings(&self) -> String {
+        serde_json::to_string(&self.config_warnings).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    /// Create a Linter from config file contents, following `extends`.
+    ///
+    /// Takes the same request object as [`resolve_config_chain`], which must
+    /// already report the chain complete: every file the chain reaches has to
+    /// be in `files`. The files are parsed, merged and validated exactly as the
+    /// rumdl CLI does it (`[global]` section, rule sections and aliases,
+    /// `extends` precedence, per-rule `enabled`), so a `.rumdl.toml` means the
+    /// same thing in an embedding as on the command line. Validation warnings
+    /// are available from `get_config_warnings()`.
+    ///
+    /// Fails with a message when a file is missing from `files` or the chain
+    /// has a config error; `resolve_config_chain` reports both beforehand.
+    pub fn from_config_files(request: JsValue) -> Result<Linter, JsValue> {
+        linter_from_request(parse_request(request)?).map_err(|e| JsValue::from_str(&e))
+    }
+
+    /// Lint markdown content and return warnings as JSON
+    ///
+    /// # Arguments
+    /// * `content` - Markdown content to lint
+    /// * `path` - Optional file path (e.g. vault-relative). When provided, the
+    ///   path is matched against configured `exclude` patterns; excluded files
+    ///   return `"[]"` without linting.
+    ///
+    /// Returns a JSON array of warnings, each with:
+    /// - `rule_name`: Rule name (e.g., "MD001")
+    /// - `message`: Warning message
+    /// - `line`: 1-indexed line number
+    /// - `column`: 1-indexed column number
+    /// - `fix`: Optional fix object with `range.start`, `range.end`, `replacement`
+    ///
+    /// Note: Fix ranges use character offsets (not byte offsets) for JavaScript compatibility.
+    /// This is important for multi-byte UTF-8 characters like `æ` or emoji.
+    // `path: Option<String>` is the wasm_bindgen boundary signature the npm/browser API
+    // exposes; taking an owned Option is idiomatic there and must stay stable for JS
+    // callers, so the by-value pass is intentional rather than a missed borrow.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn check(&self, content: &str, path: Option<String>) -> String {
+        if let Some(ref p) = path
+            && path_matches_exclude(&self.config.global.exclude, p)
+        {
+            return "[]".to_string();
+        }
+
+        let all = all_rules(&self.config);
+        let rules = filter_rules(&all, &self.config.global);
+        let run = crate::document_run::DocumentRun::new(content, &rules, &self.config)
+            .config_path(path.as_deref().map(std::path::Path::new));
+
+        match run.analyze().map(|analysis| analysis.warnings) {
+            Ok(warnings) => {
+                // Convert byte offsets to character offsets for JavaScript
+                let js_warnings: Vec<JsWarning> = warnings.iter().map(|w| convert_warning_for_js(w, content)).collect();
+                serde_json::to_string(&js_warnings).unwrap_or_else(|_| "[]".to_string())
+            }
+            Err(e) => format!(r#"[{{"error": "{e}"}}]"#),
+        }
+    }
+
+    /// Apply all auto-fixes to the content and return the fixed content
+    ///
+    /// # Arguments
+    /// * `content` - Markdown content to fix
+    /// * `path` - Optional file path. When provided and matching an `exclude`
+    ///   pattern, the content is returned unchanged.
+    ///
+    /// Uses the same fix coordinator as the CLI for consistent behavior.
+    // `path: Option<String>` mirrors `check`: the owned Option is the stable wasm_bindgen
+    // boundary signature for JS callers, so passing by value here is intentional.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn fix(&self, content: &str, path: Option<String>) -> String {
+        if let Some(ref p) = path
+            && path_matches_exclude(&self.config.global.exclude, p)
+        {
+            return content.to_string();
+        }
+
+        let all = all_rules(&self.config);
+        let rules = filter_rules(&all, &self.config.global);
+
+        let run = crate::document_run::DocumentRun::new(content, &rules, &self.config)
+            .config_path(path.as_deref().map(std::path::Path::new));
+        match run.fix(10) {
+            Ok((fixed_content, _)) => fixed_content,
+            Err(_) => content.to_string(),
+        }
+    }
+
+    /// Get the current configuration as JSON
+    ///
+    /// Returns an object with global settings and rule-specific configurations.
+    pub fn get_config(&self) -> String {
+        // Convert rule configs to JSON-serializable format
+        let rules_json: serde_json::Map<String, serde_json::Value> = self
+            .config
+            .rules
+            .iter()
+            .map(|(name, rule_config)| {
+                let values: serde_json::Map<String, serde_json::Value> = rule_config
+                    .values
+                    .iter()
+                    .filter_map(|(k, v)| toml_value_to_json(v).map(|json_val| (k.clone(), json_val)))
+                    .collect();
+                (name.clone(), serde_json::Value::Object(values))
+            })
+            .collect();
+
+        serde_json::json!({
+            "disable": self.config.global.disable,
+            "enable": self.config.global.enable,
+            "extend_enable": self.config.global.extend_enable,
+            "extend_disable": self.config.global.extend_disable,
+            "fixable": self.config.global.fixable,
+            "unfixable": self.config.global.unfixable,
+            "line_length": self.config.global.line_length.get(),
+            "flavor": self.flavor.to_string(),
+            "rules": rules_json
+        })
+        .to_string()
+    }
+}
+
+/// Get the rumdl version
+#[wasm_bindgen]
+pub fn get_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+/// Get list of available rules as JSON
+///
+/// Returns a JSON array of rule info objects, each with:
+/// - `name`: Rule name (e.g., "MD001")
+/// - `description`: Rule description
+#[wasm_bindgen]
+pub fn get_available_rules() -> String {
+    let config = Config::default();
+    let rules = all_rules(&config);
+
+    let rule_info: Vec<serde_json::Value> = rules
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "name": r.name(),
+                "description": r.description()
+            })
+        })
+        .collect();
+
+    serde_json::to_string(&rule_info).unwrap_or_else(|_| "[]".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn request(root: &str, files: &[(&str, Option<&str>)]) -> ConfigFilesRequest {
+        ConfigFilesRequest {
+            root: root.to_string(),
+            files: files
+                .iter()
+                .map(|(p, c)| (p.to_string(), c.map(str::to_string)))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn status(json: &str) -> serde_json::Value {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn flat_config_with_extends_warns_instead_of_dropping_it() {
+        let config = LinterConfig {
+            rules: Some(HashMap::from([
+                ("extends".to_string(), serde_json::json!("../base.rumdl.toml")),
+                ("MD013".to_string(), serde_json::json!({"line-length": 200})),
+            ])),
+            ..Default::default()
+        };
+        let (config, warnings) = config.to_config_with_warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("'extends' is ignored") && w.contains("from_config_files")),
+            "expected an extends warning, got {warnings:?}"
+        );
+        assert_eq!(
+            config.rules["MD013"].values["line-length"],
+            toml::Value::Integer(200),
+            "the rule options beside `extends` still apply"
+        );
+    }
+
+    #[test]
+    fn resolve_config_chain_walks_the_chain_one_file_at_a_time() {
+        // Round 1: only the root is known; the loader asks for its base.
+        let r = status(&chain_status_json(request(
+            ".rumdl.toml",
+            &[(".rumdl.toml", Some("extends = \"docs/../shared/base.toml\"\n"))],
+        )));
+        assert_eq!(r["status"], "need-file");
+        assert_eq!(r["path"], "shared/base.toml", "asked for in normalized form");
+
+        // Round 2: the base extends a third file.
+        let r = status(&chain_status_json(request(
+            ".rumdl.toml",
+            &[
+                (".rumdl.toml", Some("extends = \"docs/../shared/base.toml\"\n")),
+                ("shared/base.toml", Some("extends = \"org.toml\"\n")),
+            ],
+        )));
+        assert_eq!(r["status"], "need-file");
+        assert_eq!(
+            r["path"], "shared/org.toml",
+            "resolved against the declaring file's directory"
+        );
+
+        // Round 3: everything supplied; the chain is listed root first.
+        let r = status(&chain_status_json(request(
+            ".rumdl.toml",
+            &[
+                (".rumdl.toml", Some("extends = \"docs/../shared/base.toml\"\n")),
+                ("shared/base.toml", Some("extends = \"org.toml\"\n")),
+                ("shared/org.toml", Some("[global]\nline-length = 66\n")),
+            ],
+        )));
+        assert_eq!(r["status"], "complete", "{r}");
+        assert_eq!(
+            r["files"],
+            serde_json::json!([".rumdl.toml", "shared/base.toml", "shared/org.toml"])
+        );
+    }
+
+    #[test]
+    fn resolve_config_chain_reports_errors_the_embedder_cannot_fix() {
+        // The embedder looked for the base and it is not there.
+        let r = status(&chain_status_json(request(
+            ".rumdl.toml",
+            &[(".rumdl.toml", Some("extends = \"base.toml\"\n")), ("base.toml", None)],
+        )));
+        assert_eq!(r["status"], "error", "{r}");
+        assert!(
+            r["message"].as_str().unwrap().contains("base.toml"),
+            "error names the missing file: {r}"
+        );
+
+        // A cycle.
+        let r = status(&chain_status_json(request(
+            ".rumdl.toml",
+            &[
+                (".rumdl.toml", Some("extends = \"a.toml\"\n")),
+                ("a.toml", Some("extends = \".rumdl.toml\"\n")),
+            ],
+        )));
+        assert_eq!(r["status"], "error", "{r}");
+        assert!(
+            r["message"].as_str().unwrap().to_lowercase().contains("circular"),
+            "{r}"
+        );
+
+        // A parse error in the root.
+        let r = status(&chain_status_json(request(
+            ".rumdl.toml",
+            &[(".rumdl.toml", Some("[global\nline-length = 1\n"))],
+        )));
+        assert_eq!(r["status"], "error", "{r}");
+    }
+
+    #[test]
+    fn from_config_files_merges_the_chain_like_the_cli() {
+        let req = request(
+            ".rumdl.toml",
+            &[
+                (
+                    ".rumdl.toml",
+                    Some(
+                        "extends = \"base/.rumdl.toml\"\n[global]\nextend-disable = [\"MD041\"]\n[MD013]\nline-length = 100\n",
+                    ),
+                ),
+                (
+                    "base/.rumdl.toml",
+                    Some(
+                        "[global]\ndisable = [\"MD033\"]\nflavor = \"mkdocs\"\n[MD013]\nline-length = 80\n[MD007]\nindent = 4\n",
+                    ),
+                ),
+            ],
+        );
+        let linter = linter_from_request(req).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&linter.get_config()).unwrap();
+        assert_eq!(
+            config["rules"]["MD013"]["line-length"], 100,
+            "child overrides base: {config}"
+        );
+        assert_eq!(
+            config["rules"]["MD007"]["indent"], 4,
+            "base rule config inherited: {config}"
+        );
+        let disabled = config["disable"].as_array().unwrap();
+        assert!(
+            disabled.iter().any(|d| d == "MD033"),
+            "base disable inherited: {config}"
+        );
+        let extend_disabled = config["extend_disable"].as_array().unwrap();
+        assert!(
+            extend_disabled.iter().any(|d| d == "MD041"),
+            "child extend-disable applied: {config}"
+        );
+        assert_eq!(linter.flavor, MarkdownFlavor::MkDocs, "flavor set by the base applies");
+        assert!(
+            linter.get_config_warnings().contains("[]"),
+            "{}",
+            linter.get_config_warnings()
+        );
+
+        // The merged config is what lints: a long line passes at 100, MD033 is off.
+        let long = format!("# T\n\n{}\n", "x".repeat(95));
+        let result = linter.check(&long, None);
+        assert!(
+            !result.contains("MD013"),
+            "line-length 100 from the child applies: {result}"
+        );
+        let html = "# T\n\n<b>bold</b>\n";
+        let result = linter.check(html, None);
+        assert!(!result.contains("MD033"), "MD033 disabled by the base: {result}");
+        let no_heading = "plain first line\n";
+        let result = linter.check(no_heading, None);
+        assert!(!result.contains("MD041"), "MD041 disabled by the child: {result}");
+    }
+
+    #[test]
+    fn from_config_files_applies_default_flavor_only_when_no_file_sets_one() {
+        let mut req = request(".rumdl.toml", &[(".rumdl.toml", Some("[global]\nline-length = 120\n"))]);
+        req.default_flavor = Some("obsidian".to_string());
+        let linter = linter_from_request(req).unwrap();
+        assert_eq!(
+            linter.flavor,
+            MarkdownFlavor::Obsidian,
+            "embedder default used when unset"
+        );
+
+        let mut req = request(
+            ".rumdl.toml",
+            &[(".rumdl.toml", Some("[global]\nflavor = \"standard\"\n"))],
+        );
+        req.default_flavor = Some("obsidian".to_string());
+        let linter = linter_from_request(req).unwrap();
+        assert_eq!(
+            linter.flavor,
+            MarkdownFlavor::Standard,
+            "a file's flavor wins over the default"
+        );
+
+        let mut req = request(".rumdl.toml", &[(".rumdl.toml", Some(""))]);
+        req.default_flavor = Some("not-a-flavor".to_string());
+        let err = linter_from_request(req)
+            .err()
+            .expect("unknown default-flavor is rejected");
+        assert!(err.contains("default-flavor"), "{err}");
+    }
+
+    #[test]
+    fn from_config_files_rejects_an_unresolved_chain() {
+        let req = request(".rumdl.toml", &[(".rumdl.toml", Some("extends = \"base.toml\"\n"))]);
+        let err = linter_from_request(req).err().expect("an unresolved chain is rejected");
+        assert!(
+            err.contains("base.toml") && err.contains("resolve_config_chain"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn from_config_files_surfaces_validation_warnings() {
+        let req = request(
+            ".rumdl.toml",
+            &[(".rumdl.toml", Some("[MD013]\nline-length = 100\nnot-an-option = 1\n"))],
+        );
+        let linter = linter_from_request(req).unwrap();
+        let warnings = linter.get_config_warnings();
+        assert!(
+            warnings.contains("not-an-option"),
+            "unknown rule option reported: {warnings}"
+        );
+    }
+
+    #[test]
+    fn test_get_version() {
+        let version = get_version();
+        assert!(!version.is_empty());
+    }
+
+    #[test]
+    fn test_get_available_rules() {
+        let rules_json = get_available_rules();
+        let rules: Vec<serde_json::Value> = serde_json::from_str(&rules_json).unwrap();
+        assert!(!rules.is_empty());
+
+        let has_md001 = rules.iter().any(|r| r["name"] == "MD001");
+        assert!(has_md001);
+    }
+
+    #[test]
+    fn test_per_file_ignores_honored_by_check_and_fix() {
+        // The npm/browser surface must honor [per-file-ignores] on both check and
+        // fix when the host supplies a path, matching the CLI (issue #707).
+        let mut config = crate::config::Config::default();
+        config
+            .per_file_ignores
+            .insert("slides/**/*.md".to_string(), vec!["MD004".to_string()]);
+        config.canonicalize_rule_lists();
+        let linter = Linter {
+            config,
+            flavor: MarkdownFlavor::Standard,
+            config_warnings: vec![],
+        };
+
+        let content = "# Title\n\ntext\n- parent\n  * child\n";
+
+        // check: MD032 (non-ignored) reported; MD004 (ignored for slides/**) not.
+        let json = linter.check(content, Some("slides/deck.md".to_string()));
+        assert!(json.contains("MD032"), "MD032 should be reported: {json}");
+        assert!(
+            !json.contains("MD004"),
+            "MD004 is per-file-ignored for slides/** and must not be reported: {json}"
+        );
+
+        // fix: the nested `*` marker (MD004) must survive; the MD032 blank line is added.
+        let fixed = linter.fix(content, Some("slides/deck.md".to_string()));
+        assert_eq!(
+            fixed, "# Title\n\ntext\n\n- parent\n  * child\n",
+            "fix must apply only the non-ignored MD032 fix, preserving the MD004 marker"
+        );
+
+        // Control: without a slides path, MD004 is reported and applied.
+        let json_other = linter.check(content, Some("docs/other.md".to_string()));
+        assert!(
+            json_other.contains("MD004"),
+            "MD004 should be reported when not ignored: {json_other}"
+        );
+    }
+
+    #[test]
+    fn test_linter_default_config() {
+        let config = LinterConfig::default();
+        assert!(config.disable.is_none());
+        assert!(config.enable.is_none());
+        assert!(config.line_length.is_none());
+        assert!(config.flavor.is_none());
+    }
+
+    #[test]
+    fn test_linter_config_to_config() {
+        let config = LinterConfig {
+            disable: Some(vec!["MD041".to_string()]),
+            enable: None,
+            line_length: Some(100),
+            flavor: Some("mkdocs".to_string()),
+            ..Default::default()
+        };
+
+        let internal = config.to_config();
+        assert!(internal.global.disable.contains(&"MD041".to_string()));
+        assert_eq!(internal.global.line_length.get(), 100);
+    }
+
+    #[test]
+    fn test_linter_config_flavor() {
+        assert_eq!(
+            LinterConfig {
+                flavor: Some("standard".to_string()),
+                ..Default::default()
+            }
+            .markdown_flavor(),
+            MarkdownFlavor::Standard
+        );
+        assert_eq!(
+            LinterConfig {
+                flavor: Some("mkdocs".to_string()),
+                ..Default::default()
+            }
+            .markdown_flavor(),
+            MarkdownFlavor::MkDocs
+        );
+        assert_eq!(
+            LinterConfig {
+                flavor: Some("mdx".to_string()),
+                ..Default::default()
+            }
+            .markdown_flavor(),
+            MarkdownFlavor::MDX
+        );
+        assert_eq!(
+            LinterConfig {
+                flavor: Some("pandoc".to_string()),
+                ..Default::default()
+            }
+            .markdown_flavor(),
+            MarkdownFlavor::Pandoc
+        );
+        assert_eq!(
+            LinterConfig {
+                flavor: Some("quarto".to_string()),
+                ..Default::default()
+            }
+            .markdown_flavor(),
+            MarkdownFlavor::Quarto
+        );
+        assert_eq!(
+            LinterConfig {
+                flavor: Some("obsidian".to_string()),
+                ..Default::default()
+            }
+            .markdown_flavor(),
+            MarkdownFlavor::Obsidian
+        );
+        assert_eq!(
+            LinterConfig {
+                flavor: Some("kramdown".to_string()),
+                ..Default::default()
+            }
+            .markdown_flavor(),
+            MarkdownFlavor::Kramdown
+        );
+        assert_eq!(
+            LinterConfig {
+                flavor: Some("jekyll".to_string()),
+                ..Default::default()
+            }
+            .markdown_flavor(),
+            MarkdownFlavor::Kramdown
+        );
+        assert_eq!(
+            LinterConfig {
+                flavor: None,
+                ..Default::default()
+            }
+            .markdown_flavor(),
+            MarkdownFlavor::Standard
+        );
+        assert_eq!(
+            LinterConfig {
+                flavor: Some("markdown_with_gherkin".to_string()),
+                ..Default::default()
+            }
+            .markdown_flavor(),
+            MarkdownFlavor::MDG
+        );
+    }
+
+    /// This test ensures all MarkdownFlavor variants are handled in WASM.
+    /// If a new flavor is added to the enum, this test will fail to compile
+    /// until the WASM code is updated.
+    #[test]
+    fn test_all_flavors_handled_in_wasm() {
+        // Exhaustive match ensures compile-time check for new variants
+        let flavors = [
+            MarkdownFlavor::Standard,
+            MarkdownFlavor::MkDocs,
+            MarkdownFlavor::MDX,
+            MarkdownFlavor::Pandoc,
+            MarkdownFlavor::Quarto,
+            MarkdownFlavor::Obsidian,
+            MarkdownFlavor::Kramdown,
+            MarkdownFlavor::AzureDevOps,
+            MarkdownFlavor::MyST,
+            MarkdownFlavor::Hugo,
+            MarkdownFlavor::MDG,
+            MarkdownFlavor::GhAw,
+        ];
+
+        for flavor in flavors {
+            // Verify round-trip: flavor -> string -> flavor
+            let flavor_str = match flavor {
+                MarkdownFlavor::Standard => "standard",
+                MarkdownFlavor::MkDocs => "mkdocs",
+                MarkdownFlavor::MDX => "mdx",
+                MarkdownFlavor::Pandoc => "pandoc",
+                MarkdownFlavor::Quarto => "quarto",
+                MarkdownFlavor::Obsidian => "obsidian",
+                MarkdownFlavor::Kramdown => "kramdown",
+                MarkdownFlavor::AzureDevOps => "azure_devops",
+                MarkdownFlavor::MyST => "myst",
+                MarkdownFlavor::Hugo => "hugo",
+                MarkdownFlavor::MDG => "mdg",
+                MarkdownFlavor::GhAw => "gh-aw",
+            };
+
+            let config = LinterConfig {
+                flavor: Some(flavor_str.to_string()),
+                ..Default::default()
+            };
+
+            assert_eq!(
+                config.markdown_flavor(),
+                flavor,
+                "Round-trip failed for flavor: {flavor:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_gh_aw_wasm_check_and_fix_preserve_runtime_import() {
+        let config = LinterConfig {
+            enable: Some(vec!["MD034".to_string()]),
+            flavor: Some("gh-aw".to_string()),
+            ..Default::default()
+        };
+        let linter = Linter {
+            config: config.to_config(),
+            flavor: config.markdown_flavor(),
+            config_warnings: Vec::new(),
+        };
+        let content = "{{#runtime-import https://example.com/shared.md}}\n";
+
+        let warnings: Vec<serde_json::Value> = serde_json::from_str(&linter.check(content, None)).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(linter.fix(content, None), content);
+    }
+
+    #[test]
+    fn test_linter_check_empty() {
+        let config = LinterConfig::default();
+        let linter = Linter {
+            config: config.to_config(),
+            flavor: config.markdown_flavor(),
+            config_warnings: Vec::new(),
+        };
+
+        let result = linter.check("", None);
+        let warnings: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_linter_check_with_issue() {
+        let config = LinterConfig::default();
+        let linter = Linter {
+            config: config.to_config(),
+            flavor: config.markdown_flavor(),
+            config_warnings: Vec::new(),
+        };
+
+        // Heading increment violation: ## followed by ####
+        let content = "## Level 2\n\n#### Level 4";
+        let result = linter.check(content, None);
+        let warnings: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert!(!warnings.is_empty());
+    }
+
+    #[test]
+    fn test_linter_check_with_disabled_rule() {
+        let config = LinterConfig {
+            disable: Some(vec!["MD001".to_string()]),
+            ..Default::default()
+        };
+        let linter = Linter {
+            config: config.to_config(),
+            flavor: config.markdown_flavor(),
+            config_warnings: Vec::new(),
+        };
+
+        // This would normally trigger MD001 (heading increment)
+        let content = "## Level 2\n\n#### Level 4";
+        let result = linter.check(content, None);
+        let warnings: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+
+        // MD001 should be disabled
+        let has_md001 = warnings.iter().any(|w| w["rule_name"] == "MD001");
+        assert!(!has_md001, "MD001 should be disabled");
+    }
+
+    #[test]
+    fn test_linter_fix() {
+        let config = LinterConfig::default();
+        let linter = Linter {
+            config: config.to_config(),
+            flavor: config.markdown_flavor(),
+            config_warnings: Vec::new(),
+        };
+
+        // Content with trailing spaces that MD009 will fix
+        let content = "Hello   \nWorld";
+        let result = linter.fix(content, None);
+        assert!(!result.contains("   \n"));
+    }
+
+    #[test]
+    fn test_linter_fix_adjacent_blocks() {
+        let config = LinterConfig::default();
+        let linter = Linter {
+            config: config.to_config(),
+            flavor: config.markdown_flavor(),
+            config_warnings: Vec::new(),
+        };
+
+        let content = "# Heading\n```code\nblock\n```\n| Header |\n|--------|\n| Cell   |";
+        let result = linter.fix(content, None);
+
+        // Should NOT have double blank lines
+        assert!(!result.contains("\n\n\n"), "Should not have double blank lines");
+    }
+
+    #[test]
+    fn test_linter_get_config() {
+        let config = LinterConfig {
+            disable: Some(vec!["MD041".to_string()]),
+            flavor: Some("mkdocs".to_string()),
+            ..Default::default()
+        };
+        let linter = Linter {
+            config: config.to_config(),
+            flavor: config.markdown_flavor(),
+            config_warnings: Vec::new(),
+        };
+
+        let result = linter.get_config();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["flavor"], "mkdocs");
+        assert!(
+            parsed["disable"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::Value::String("MD041".to_string()))
+        );
+    }
+
+    // byte_offset_to_char_offset tests are in utils/utf8_offsets.rs
+
+    #[test]
+    fn test_check_norwegian_letter_fix_offset() {
+        // This is the exact bug case: Norwegian letter at end of file without trailing newline
+        let content = "# Heading\n\nContent with Norwegian letter \"æ\".";
+        assert_eq!(content.len(), 46); // 46 bytes (æ is 2 bytes)
+        assert_eq!(content.chars().count(), 45); // 45 characters (æ is 1 char)
+
+        let config = LinterConfig::default();
+        let linter = Linter {
+            config: config.to_config(),
+            flavor: config.markdown_flavor(),
+            config_warnings: Vec::new(),
+        };
+
+        let result = linter.check(content, None);
+        let warnings: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+
+        // Should have MD047 warning (missing trailing newline)
+        let md047 = warnings.iter().find(|w| w["rule_name"] == "MD047");
+        assert!(md047.is_some(), "Should have MD047 warning");
+
+        // The fix range should use character offsets, not byte offsets
+        let fix = md047.unwrap()["fix"].as_object().unwrap();
+        let range = fix["range"].as_object().unwrap();
+
+        // Character offset should be 45 (not byte offset 46)
+        assert_eq!(
+            range["start"].as_u64().unwrap(),
+            45,
+            "Fix start should be character offset 45, not byte offset 46"
+        );
+        assert_eq!(
+            range["end"].as_u64().unwrap(),
+            45,
+            "Fix end should be character offset 45"
+        );
+    }
+
+    #[test]
+    fn test_fix_norwegian_letter() {
+        // Verify the fix() method works correctly with Norwegian letters
+        let content = "# Heading\n\nContent with Norwegian letter \"æ\".";
+
+        let config = LinterConfig::default();
+        let linter = Linter {
+            config: config.to_config(),
+            flavor: config.markdown_flavor(),
+            config_warnings: Vec::new(),
+        };
+
+        let fixed = linter.fix(content, None);
+
+        // Should add trailing newline
+        assert!(fixed.ends_with('\n'), "Should end with newline");
+        assert_eq!(fixed, "# Heading\n\nContent with Norwegian letter \"æ\".\n");
+    }
+
+    #[test]
+    fn test_check_norwegian_letter_column_offset() {
+        // Regression test for the WASM column offset (rvben/obsidian-rumdl#4).
+        let content = "# Heading\n\nContent with Norwegian letter \"æ\".";
+
+        // Line 3 is "Content with Norwegian letter \"æ\".", which is 34 chars, 35 bytes
+        // (æ is 2 bytes / 1 char). rumdl reports columns as character positions, so MD047's
+        // "position after the last char" is char column 35. The WASM surface must
+        // surface that value unchanged; it previously re-ran a byte->char conversion
+        // on the already-char-based column and under-counted to 34.
+
+        let config = LinterConfig::default();
+        let linter = Linter {
+            config: config.to_config(),
+            flavor: config.markdown_flavor(),
+            config_warnings: Vec::new(),
+        };
+
+        let result = linter.check(content, None);
+        let warnings: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+
+        let md047 = warnings.iter().find(|w| w["rule_name"] == "MD047");
+        assert!(md047.is_some(), "Should have MD047 warning");
+
+        let warning = md047.unwrap();
+
+        // Column should be character-based (35), not byte-based (36)
+        assert_eq!(
+            warning["column"].as_u64().unwrap(),
+            35,
+            "Column should be char offset 35, not byte offset 36"
+        );
+        assert_eq!(
+            warning["end_column"].as_u64().unwrap(),
+            35,
+            "End column should also be char offset 35"
+        );
+
+        // Verify line is correct
+        assert_eq!(warning["line"].as_u64().unwrap(), 3);
+        assert_eq!(warning["end_line"].as_u64().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_check_multiple_multibyte_chars_column() {
+        // Test with multiple multi-byte characters to ensure column conversion works
+        // throughout a line, not just at the end
+        let content = "# æøå\n\nLine with æ and ø here.";
+
+        let config = LinterConfig {
+            disable: Some(vec!["MD047".to_string()]), // Disable MD047 to focus on other warnings
+            ..Default::default()
+        };
+        let linter = Linter {
+            config: config.to_config(),
+            flavor: config.markdown_flavor(),
+            config_warnings: Vec::new(),
+        };
+
+        let result = linter.check(content, None);
+        let warnings: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+
+        // Any warning on line 1 should have correct character-based column
+        // The heading "# æøå" is 6 bytes but 5 characters
+        for warning in &warnings {
+            let line = warning["line"].as_u64().unwrap();
+            let column = warning["column"].as_u64().unwrap();
+
+            if line == 1 {
+                // Column should never exceed character count + 1
+                // "# æøå" has 5 chars, so max column is 6
+                assert!(column <= 6, "Column {column} on line 1 exceeds char count (max 6)");
+            }
+        }
+    }
+
+    #[test]
+    fn test_check_emoji_column() {
+        // Test with emoji (4-byte UTF-8) to verify column conversion
+        let content = "# Test 👋\n\nHello";
+
+        let config = LinterConfig::default();
+        let linter = Linter {
+            config: config.to_config(),
+            flavor: config.markdown_flavor(),
+            config_warnings: Vec::new(),
+        };
+
+        let result = linter.check(content, None);
+        let warnings: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+
+        // Verify any warnings have character-based columns
+        // Line 1 "# Test 👋" is 11 bytes but 8 characters
+        for warning in &warnings {
+            let line = warning["line"].as_u64().unwrap();
+            let column = warning["column"].as_u64().unwrap();
+
+            if line == 1 {
+                assert!(
+                    column <= 9, // 8 chars + 1 for position after
+                    "Column {column} on line 1 with emoji should be char-based (max 9), not byte-based"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_check_japanese_column() {
+        // Test with Japanese characters (3-byte UTF-8 each)
+        let content = "# 日本語\n\nTest";
+
+        let config = LinterConfig::default();
+        let linter = Linter {
+            config: config.to_config(),
+            flavor: config.markdown_flavor(),
+            config_warnings: Vec::new(),
+        };
+
+        let result = linter.check(content, None);
+        let warnings: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+
+        // Line 1 "# 日本語" is 11 bytes but 5 characters
+        for warning in &warnings {
+            let line = warning["line"].as_u64().unwrap();
+            let column = warning["column"].as_u64().unwrap();
+
+            if line == 1 {
+                assert!(
+                    column <= 6, // 5 chars + 1 for position after
+                    "Column {column} on line 1 with Japanese should be char-based (max 6), not byte-based (would be 12)"
+                );
+            }
+        }
+    }
+
+    // ========== WASM Rule Configuration Integration Tests ==========
+    // Note: Unit tests for is_rule_name and json_to_rule_config are in rule_config_serde.rs
+
+    #[test]
+    fn test_linter_config_with_rule_configs() {
+        let mut rules = std::collections::HashMap::new();
+        rules.insert(
+            "MD060".to_string(),
+            serde_json::json!({
+                "enabled": true,
+                "style": "aligned"
+            }),
+        );
+        rules.insert(
+            "MD013".to_string(),
+            serde_json::json!({
+                "line-length": 120,
+                "code-blocks": false
+            }),
+        );
+
+        let config = LinterConfig {
+            rules: Some(rules),
+            ..Default::default()
+        };
+
+        let internal = config.to_config();
+
+        // Check MD060 config was applied
+        let md060 = internal.rules.get("MD060");
+        assert!(md060.is_some(), "MD060 should be in rules");
+        let md060_config = md060.unwrap();
+        assert_eq!(md060_config.values.get("enabled"), Some(&toml::Value::Boolean(true)));
+        assert_eq!(
+            md060_config.values.get("style"),
+            Some(&toml::Value::String("aligned".to_string()))
+        );
+
+        // Check MD013 config was applied
+        let md013 = internal.rules.get("MD013");
+        assert!(md013.is_some(), "MD013 should be in rules");
+        let md013_config = md013.unwrap();
+        assert_eq!(md013_config.values.get("line-length"), Some(&toml::Value::Integer(120)));
+        assert_eq!(
+            md013_config.values.get("code-blocks"),
+            Some(&toml::Value::Boolean(false))
+        );
+    }
+
+    #[test]
+    fn test_linter_config_rule_name_case_normalization() {
+        // Rule names should be normalized to uppercase
+        let mut rules = std::collections::HashMap::new();
+        rules.insert(
+            "md060".to_string(), // lowercase
+            serde_json::json!({ "enabled": true }),
+        );
+        rules.insert(
+            "Md013".to_string(), // mixed case
+            serde_json::json!({ "enabled": true }),
+        );
+
+        let config = LinterConfig {
+            rules: Some(rules),
+            ..Default::default()
+        };
+
+        let internal = config.to_config();
+
+        // Both should be normalized to uppercase
+        assert!(internal.rules.contains_key("MD060"), "MD060 should be uppercase");
+        assert!(internal.rules.contains_key("MD013"), "MD013 should be uppercase");
+    }
+
+    #[test]
+    fn test_linter_config_ignores_non_rule_keys() {
+        // Non-rule keys in the rules map should be ignored
+        let mut rules = std::collections::HashMap::new();
+        rules.insert("MD060".to_string(), serde_json::json!({ "enabled": true }));
+        rules.insert("not-a-rule".to_string(), serde_json::json!({ "value": 123 }));
+        rules.insert("global".to_string(), serde_json::json!({ "key": "value" }));
+
+        let config = LinterConfig {
+            rules: Some(rules),
+            ..Default::default()
+        };
+
+        let internal = config.to_config();
+
+        // Only MD060 should be in rules
+        assert!(internal.rules.contains_key("MD060"));
+        assert!(!internal.rules.contains_key("not-a-rule"));
+        assert!(!internal.rules.contains_key("global"));
+    }
+
+    #[test]
+    fn test_get_config_includes_rules() {
+        let mut rules = std::collections::HashMap::new();
+        rules.insert(
+            "MD060".to_string(),
+            serde_json::json!({
+                "enabled": true,
+                "style": "aligned"
+            }),
+        );
+
+        let config = LinterConfig {
+            disable: Some(vec!["MD041".to_string()]),
+            rules: Some(rules),
+            flavor: Some("mkdocs".to_string()),
+            ..Default::default()
+        };
+
+        let linter = Linter {
+            config: config.to_config(),
+            flavor: config.markdown_flavor(),
+            config_warnings: Vec::new(),
+        };
+
+        let result = linter.get_config();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+        // Check global settings
+        assert_eq!(parsed["flavor"], "mkdocs");
+
+        // Check rules are included
+        assert!(parsed["rules"].is_object(), "rules should be an object");
+        let rules_obj = parsed["rules"].as_object().unwrap();
+        assert!(rules_obj.contains_key("MD060"), "MD060 should be in rules");
+
+        let md060 = &rules_obj["MD060"];
+        assert_eq!(md060["enabled"], true);
+        assert_eq!(md060["style"], "aligned");
+    }
+
+    #[test]
+    fn test_linter_config_deserializes_from_json() {
+        // Test that serde deserializes the config correctly including flattened rules
+        let json = serde_json::json!({
+            "disable": ["MD041"],
+            "line-length": 100,
+            "flavor": "mkdocs",
+            "MD060": {
+                "enabled": true,
+                "style": "aligned"
+            },
+            "MD013": {
+                "tables": false
+            }
+        });
+
+        let config: LinterConfig = serde_json::from_value(json).unwrap();
+
+        assert_eq!(config.disable, Some(vec!["MD041".to_string()]));
+        assert_eq!(config.line_length, Some(100));
+        assert_eq!(config.flavor, Some("mkdocs".to_string()));
+
+        let rules = config.rules.as_ref().unwrap();
+        assert!(rules.contains_key("MD060"));
+        assert!(rules.contains_key("MD013"));
+
+        let md060 = &rules["MD060"];
+        assert_eq!(md060["enabled"], true);
+        assert_eq!(md060["style"], "aligned");
+    }
+
+    #[test]
+    fn test_linter_with_md044_names_config() {
+        // Test MD044 proper names configuration (array values)
+        let mut rules = std::collections::HashMap::new();
+        rules.insert(
+            "MD044".to_string(),
+            serde_json::json!({
+                "names": ["JavaScript", "TypeScript", "GitHub"],
+                "code-blocks": false
+            }),
+        );
+
+        let config = LinterConfig {
+            rules: Some(rules),
+            ..Default::default()
+        };
+
+        let internal = config.to_config();
+
+        let md044 = internal.rules.get("MD044").unwrap();
+        let names = md044.values.get("names").unwrap();
+
+        // Verify the array was converted correctly
+        if let toml::Value::Array(arr) = names {
+            assert_eq!(arr.len(), 3);
+            assert_eq!(arr[0], toml::Value::String("JavaScript".to_string()));
+            assert_eq!(arr[1], toml::Value::String("TypeScript".to_string()));
+            assert_eq!(arr[2], toml::Value::String("GitHub".to_string()));
+        } else {
+            panic!("names should be an array");
+        }
+    }
+
+    #[test]
+    fn test_linter_check_with_md060_config() {
+        // Integration test: verify MD060 config affects linting behavior
+        let mut rules = std::collections::HashMap::new();
+        rules.insert(
+            "MD060".to_string(),
+            serde_json::json!({
+                "enabled": true,
+                "style": "aligned"
+            }),
+        );
+
+        let config = LinterConfig {
+            rules: Some(rules),
+            ..Default::default()
+        };
+
+        let linter = Linter {
+            config: config.to_config(),
+            flavor: config.markdown_flavor(),
+            config_warnings: Vec::new(),
+        };
+
+        // Table with inconsistent formatting (should trigger MD060 with aligned style)
+        let content = "# Heading\n\n| a | b |\n|---|---|\n|1|2|";
+
+        let result = linter.check(content, None);
+        let warnings: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+
+        // Should have MD060 warning because table cells aren't aligned
+        let has_md060 = warnings.iter().any(|w| w["rule_name"] == "MD060");
+        assert!(has_md060, "Should have MD060 warning for unaligned table");
+    }
+
+    #[test]
+    fn test_linter_fix_with_rule_config() {
+        // Integration test: verify rule config affects fix behavior
+        let mut rules = std::collections::HashMap::new();
+        rules.insert(
+            "MD060".to_string(),
+            serde_json::json!({
+                "enabled": true,
+                "style": "compact"
+            }),
+        );
+
+        let config = LinterConfig {
+            rules: Some(rules),
+            ..Default::default()
+        };
+
+        let linter = Linter {
+            config: config.to_config(),
+            flavor: config.markdown_flavor(),
+            config_warnings: Vec::new(),
+        };
+
+        // Table with extra spacing
+        let content = "# Heading\n\n| a  |  b |\n|---|---|\n| 1 | 2 |";
+
+        let fixed = linter.fix(content, None);
+
+        // With compact style, the table should have minimal spacing
+        assert!(
+            fixed.contains("|a|b|") || fixed.contains("| a | b |"),
+            "Table should be formatted according to MD060 config"
+        );
+    }
+
+    #[test]
+    fn test_linter_config_empty_rules() {
+        // Empty rules map should work fine
+        let config = LinterConfig {
+            rules: Some(std::collections::HashMap::new()),
+            ..Default::default()
+        };
+
+        let internal = config.to_config();
+        assert!(internal.rules.is_empty());
+    }
+
+    #[test]
+    fn test_linter_config_no_rules() {
+        // None rules should work fine
+        let config = LinterConfig {
+            rules: None,
+            ..Default::default()
+        };
+
+        let internal = config.to_config();
+        assert!(internal.rules.is_empty());
+    }
+
+    #[test]
+    fn test_config_warnings_valid_config() {
+        // Valid config should produce no warnings
+        let mut rules = std::collections::HashMap::new();
+        rules.insert(
+            "MD060".to_string(),
+            serde_json::json!({
+                "enabled": true,
+                "style": "aligned",
+                "severity": "warning"
+            }),
+        );
+
+        let config = LinterConfig {
+            rules: Some(rules),
+            ..Default::default()
+        };
+
+        let (_, warnings) = config.to_config_with_warnings();
+        assert!(warnings.is_empty(), "Valid config should produce no warnings");
+    }
+
+    #[test]
+    fn test_config_warnings_invalid_severity() {
+        // Invalid severity should produce a warning
+        let mut rules = std::collections::HashMap::new();
+        rules.insert(
+            "MD060".to_string(),
+            serde_json::json!({
+                "severity": "critical"  // Invalid - should be error/warning/info
+            }),
+        );
+
+        let config = LinterConfig {
+            rules: Some(rules),
+            ..Default::default()
+        };
+
+        let (internal, warnings) = config.to_config_with_warnings();
+
+        // Config should still be applied (minus invalid severity)
+        assert!(internal.rules.contains_key("MD060"));
+
+        // Should have a warning about invalid severity
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("[MD060]"), "Warning should include rule name");
+        assert!(warnings[0].contains("severity"), "Warning should mention severity");
+        assert!(warnings[0].contains("critical"), "Warning should mention invalid value");
+    }
+
+    #[test]
+    fn test_config_warnings_invalid_value_type() {
+        // Invalid value type should produce a warning
+        let mut rules = std::collections::HashMap::new();
+        rules.insert(
+            "MD013".to_string(),
+            serde_json::json!({
+                "line-length": "not-a-number"  // Should be a number
+            }),
+        );
+
+        let config = LinterConfig {
+            rules: Some(rules),
+            ..Default::default()
+        };
+
+        let (internal, warnings) = config.to_config_with_warnings();
+
+        // Config should still be applied for valid values
+        assert!(internal.rules.contains_key("MD013"));
+
+        // Should have a warning about invalid value type
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("[MD013]"), "Warning should include rule name");
+        assert!(warnings[0].contains("line-length"), "Warning should mention field name");
+    }
+
+    #[test]
+    fn test_config_warnings_multiple_rules() {
+        // Multiple rules with issues should produce multiple warnings
+        let mut rules = std::collections::HashMap::new();
+        rules.insert(
+            "MD060".to_string(),
+            serde_json::json!({
+                "severity": "fatal"  // Invalid
+            }),
+        );
+        rules.insert(
+            "MD013".to_string(),
+            serde_json::json!({
+                "severity": "bad"  // Also invalid
+            }),
+        );
+
+        let config = LinterConfig {
+            rules: Some(rules),
+            ..Default::default()
+        };
+
+        let (_, warnings) = config.to_config_with_warnings();
+
+        // Should have 2 warnings, one for each rule
+        assert_eq!(warnings.len(), 2, "Should have warnings for both rules");
+        let has_md060_warning = warnings.iter().any(|w| w.contains("[MD060]"));
+        let has_md013_warning = warnings.iter().any(|w| w.contains("[MD013]"));
+        assert!(has_md060_warning, "Should have MD060 warning");
+        assert!(has_md013_warning, "Should have MD013 warning");
+    }
+
+    #[test]
+    fn test_linter_get_config_warnings() {
+        // Test the get_config_warnings() method returns JSON array
+        let config = LinterConfig {
+            rules: Some(std::collections::HashMap::new()),
+            ..Default::default()
+        };
+        let (internal_config, _) = config.to_config_with_warnings();
+
+        let linter = Linter {
+            config: internal_config,
+            flavor: config.markdown_flavor(),
+            config_warnings: vec!["[MD060] Invalid severity: test".to_string()],
+        };
+
+        let result = linter.get_config_warnings();
+        let warnings: Vec<String> = serde_json::from_str(&result).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0], "[MD060] Invalid severity: test");
+    }
+
+    #[test]
+    fn test_linter_get_config_warnings_empty() {
+        // Empty warnings should return empty JSON array
+        let config = LinterConfig::default();
+        let linter = Linter {
+            config: config.to_config(),
+            flavor: config.markdown_flavor(),
+            config_warnings: Vec::new(),
+        };
+
+        let result = linter.get_config_warnings();
+        let warnings: Vec<String> = serde_json::from_str(&result).unwrap();
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_promote_opt_in_enabled_adds_to_extend_enable() {
+        let mut rules = std::collections::HashMap::new();
+        rules.insert(
+            "MD060".to_string(),
+            serde_json::json!({ "enabled": true, "style": "aligned" }),
+        );
+
+        let config = LinterConfig {
+            rules: Some(rules),
+            ..Default::default()
+        };
+
+        let internal = config.to_config();
+
+        // MD060 should be in extend_enable so filter_rules() includes it
+        assert!(
+            internal.global.extend_enable.contains(&"MD060".to_string()),
+            "MD060 should be promoted to extend_enable when enabled=true"
+        );
+    }
+
+    #[test]
+    fn test_promote_opt_in_enabled_not_added_when_disabled() {
+        let mut rules = std::collections::HashMap::new();
+        rules.insert(
+            "MD060".to_string(),
+            serde_json::json!({ "enabled": false, "style": "aligned" }),
+        );
+
+        let config = LinterConfig {
+            rules: Some(rules),
+            ..Default::default()
+        };
+
+        let internal = config.to_config();
+
+        assert!(
+            !internal.global.extend_enable.contains(&"MD060".to_string()),
+            "MD060 should NOT be promoted when enabled=false"
+        );
+    }
+
+    #[test]
+    fn test_md060_fix_applies_table_alignment() {
+        // Reproduces the exact scenario from obsidian-rumdl issue #15:
+        // MD060 fix should align table columns when enabled via per-rule config
+        let mut rules = std::collections::HashMap::new();
+        rules.insert(
+            "MD060".to_string(),
+            serde_json::json!({ "enabled": true, "style": "aligned" }),
+        );
+
+        let config = LinterConfig {
+            disable: Some(vec!["MD041".to_string()]),
+            rules: Some(rules),
+            flavor: Some("obsidian".to_string()),
+            ..Default::default()
+        };
+
+        let linter = Linter {
+            config: config.to_config(),
+            flavor: config.markdown_flavor(),
+            config_warnings: Vec::new(),
+        };
+
+        let content = "|Column 1 |Column 2|\n|:--|--:|\n|Test|Val |\n|New|Val|\n";
+        let fixed = linter.fix(content, None);
+
+        // The fix should produce aligned table output
+        assert_ne!(fixed, content, "MD060 fix should modify the unaligned table");
+        assert!(
+            fixed.contains("| Column 1 |"),
+            "Fixed table should have padded cells, got: {fixed}"
+        );
+    }
+
+    // ========== Exclude pattern tests ==========
+
+    fn exclude_linter(patterns: Vec<&str>) -> Linter {
+        let config = LinterConfig {
+            exclude: Some(patterns.into_iter().map(String::from).collect()),
+            ..Default::default()
+        };
+        Linter {
+            config: config.to_config(),
+            flavor: config.markdown_flavor(),
+            config_warnings: Vec::new(),
+        }
+    }
+
+    /// Content that triggers MD001 (heading increment) so we can detect whether linting ran.
+    const LINT_TRIGGERING: &str = "## Level 2\n\n#### Level 4";
+
+    #[test]
+    fn test_linter_check_no_path_lints_even_with_exclude() {
+        // Without a path, the linter has no way to check excludes — lints normally.
+        let linter = exclude_linter(vec!["q2/**/*.md"]);
+        let result = linter.check(LINT_TRIGGERING, None);
+        let warnings: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert!(!warnings.is_empty(), "No path → should still lint");
+    }
+
+    #[test]
+    fn test_linter_check_glob_excludes_nested_file() {
+        let linter = exclude_linter(vec!["q2/**/*.md"]);
+        let result = linter.check(LINT_TRIGGERING, Some("q2/sub/page.md".to_string()));
+        let warnings: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert!(warnings.is_empty(), "Glob match should exclude file");
+    }
+
+    #[test]
+    fn test_linter_check_bare_directory_excludes_contents() {
+        // `.git` (bare name) should exclude everything inside `.git/`
+        let linter = exclude_linter(vec![".git", "node_modules"]);
+        for path in [".git/config.md", "node_modules/pkg/README.md"] {
+            let result = linter.check(LINT_TRIGGERING, Some(path.to_string()));
+            let warnings: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+            assert!(warnings.is_empty(), "{path} under excluded dir should be skipped");
+        }
+    }
+
+    #[test]
+    fn test_linter_check_bare_filename_matches_root() {
+        let linter = exclude_linter(vec!["CHANGELOG.md"]);
+        let result = linter.check(LINT_TRIGGERING, Some("CHANGELOG.md".to_string()));
+        let warnings: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert!(warnings.is_empty(), "Bare filename match should exclude");
+    }
+
+    #[test]
+    fn test_linter_check_non_matching_path_still_lints() {
+        let linter = exclude_linter(vec!["q2/**/*.md", ".git"]);
+        let result = linter.check(LINT_TRIGGERING, Some("notes/foo.md".to_string()));
+        let warnings: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert!(!warnings.is_empty(), "Non-matching path should still lint");
+    }
+
+    #[test]
+    fn test_linter_check_path_with_leading_dot_slash() {
+        // Obsidian's vault paths don't have `./`, but CLI callers sometimes do.
+        let linter = exclude_linter(vec!["q2/**/*.md"]);
+        let result = linter.check(LINT_TRIGGERING, Some("./q2/sub/page.md".to_string()));
+        let warnings: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert!(warnings.is_empty(), "`./` prefix should be normalized");
+    }
+
+    #[test]
+    fn test_linter_fix_excluded_returns_unchanged() {
+        // Content with trailing whitespace that MD009 would normally fix
+        let content = "Hello   \nWorld";
+        let linter = exclude_linter(vec!["q2/**/*.md"]);
+
+        let fixed = linter.fix(content, Some("q2/sub/page.md".to_string()));
+        assert_eq!(fixed, content, "Excluded file → fix returns content unchanged");
+    }
+
+    #[test]
+    fn test_linter_fix_non_excluded_still_fixes() {
+        let content = "Hello   \nWorld";
+        let linter = exclude_linter(vec!["q2/**/*.md"]);
+
+        let fixed = linter.fix(content, Some("notes/foo.md".to_string()));
+        assert!(!fixed.contains("   \n"), "Non-excluded path should still get fixed");
+    }
+
+    #[test]
+    fn test_linter_config_deserializes_exclude() {
+        let json = serde_json::json!({
+            "exclude": ["q2/**/*.md", ".git", "CHANGELOG.md"],
+        });
+        let config: LinterConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            config.exclude.as_deref(),
+            Some(&["q2/**/*.md".to_string(), ".git".to_string(), "CHANGELOG.md".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn test_linter_exclude_wired_to_global_config() {
+        // Verify `exclude` on LinterConfig lands in config.global.exclude
+        let config = LinterConfig {
+            exclude: Some(vec!["docs/**".to_string()]),
+            ..Default::default()
+        };
+        let internal = config.to_config();
+        assert_eq!(internal.global.exclude, vec!["docs/**".to_string()]);
+    }
+
+    #[test]
+    fn test_linter_check_empty_exclude_array_lints_normally() {
+        let linter = exclude_linter(vec![]);
+        let result = linter.check(LINT_TRIGGERING, Some("q2/page.md".to_string()));
+        let warnings: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert!(!warnings.is_empty(), "Empty exclude array should not skip linting");
+    }
+
+    #[test]
+    fn test_linter_check_none_exclude_lints_normally() {
+        // `exclude: None` is the default — same behavior as empty array.
+        let config = LinterConfig {
+            exclude: None,
+            ..Default::default()
+        };
+        let linter = Linter {
+            config: config.to_config(),
+            flavor: config.markdown_flavor(),
+            config_warnings: Vec::new(),
+        };
+        let result = linter.check(LINT_TRIGGERING, Some("q2/page.md".to_string()));
+        let warnings: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert!(!warnings.is_empty(), "None exclude should not skip linting");
+    }
+
+    #[test]
+    fn test_linter_check_exclude_is_case_sensitive() {
+        // globset is case-sensitive by default; LSP parity requires same behavior.
+        let linter = exclude_linter(vec!["README.md"]);
+        let result = linter.check(LINT_TRIGGERING, Some("readme.md".to_string()));
+        let warnings: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert!(!warnings.is_empty(), "Case mismatch should not exclude");
+    }
+
+    #[test]
+    fn test_linter_check_single_char_wildcard() {
+        let linter = exclude_linter(vec!["draft?.md"]);
+        let cases = [("draft1.md", true), ("draft.md", false), ("draft10.md", false)];
+        for (path, should_exclude) in cases {
+            let result = linter.check(LINT_TRIGGERING, Some(path.to_string()));
+            let warnings: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+            assert_eq!(warnings.is_empty(), should_exclude, "`?` wildcard mismatch for {path}");
+        }
+    }
+
+    #[test]
+    fn test_linter_check_character_class_glob() {
+        let linter = exclude_linter(vec!["draft[12].md"]);
+        let cases = [("draft1.md", true), ("draft2.md", true), ("draft3.md", false)];
+        for (path, should_exclude) in cases {
+            let result = linter.check(LINT_TRIGGERING, Some(path.to_string()));
+            let warnings: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+            assert_eq!(
+                warnings.is_empty(),
+                should_exclude,
+                "Character class mismatch for {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_linter_check_invalid_glob_pattern_falls_back_to_lint() {
+        // An invalid glob (unbalanced bracket) shouldn't crash — file lints normally.
+        let linter = exclude_linter(vec!["[invalid"]);
+        let result = linter.check(LINT_TRIGGERING, Some("any.md".to_string()));
+        let warnings: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert!(
+            !warnings.is_empty(),
+            "Invalid pattern should be ignored, file still lints"
+        );
+    }
+
+    #[test]
+    fn test_linter_fix_empty_exclude_fixes_everything() {
+        let content = "Hello   \nWorld";
+        let linter = exclude_linter(vec![]);
+        let fixed = linter.fix(content, Some("q2/page.md".to_string()));
+        assert!(!fixed.contains("   \n"), "Empty exclude → fix should run");
+    }
+}

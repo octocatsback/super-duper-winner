@@ -1,0 +1,1637 @@
+/// Rule MD028: No blank lines inside blockquotes
+///
+/// This rule flags blank lines that appear to be inside a blockquote but lack the > marker.
+/// It uses heuristics to distinguish between paragraph breaks within a blockquote
+/// and intentional separators between distinct blockquotes.
+///
+/// GFM Alerts (GitHub Flavored Markdown) are automatically detected and excluded:
+/// - `> [!NOTE]`, `> [!TIP]`, `> [!IMPORTANT]`, `> [!WARNING]`, `> [!CAUTION]`
+///   These alerts MUST be separated by blank lines to render correctly on GitHub.
+///
+/// Obsidian Callouts are also supported when using the Obsidian flavor:
+/// - Any `> [!TYPE]` pattern is recognized as a callout
+/// - Foldable syntax is supported: `> [!NOTE]+` (expanded) or `> [!NOTE]-` (collapsed)
+///
+/// See [docs/md028.md](../../docs/md028.md) for full documentation, configuration, and examples.
+use crate::config::MarkdownFlavor;
+use crate::lint_context::LineInfo;
+use crate::rule::{Fix, LintError, LintResult, LintWarning, Rule, RuleCategory, Severity};
+use crate::rule_config_serde::{RuleConfig, load_rule_config};
+use crate::utils::range_utils::calculate_line_range;
+use serde::{Deserialize, Serialize};
+
+/// GFM Alert types supported by GitHub
+/// Reference: https://docs.github.com/en/get-started/writing-on-github/getting-started-with-writing-and-formatting-on-github/basic-writing-and-formatting-syntax#alerts
+const GFM_ALERT_TYPES: &[&str] = &["NOTE", "TIP", "IMPORTANT", "WARNING", "CAUTION"];
+
+/// Configuration for MD028 (Blank line inside blockquote)
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub struct MD028Config {
+    /// Enable auto-fix to merge blockquotes separated by a blank line.
+    /// Defaults to false: filling the blank line with `>` merges two
+    /// blockquotes into one, and the detection cannot verify whether the author
+    /// meant a single quote with an accidental gap or two distinct quotes.
+    /// `check()` still warns either way; users opt into the merge with
+    /// `fix = true`.
+    #[serde(default)]
+    pub fix: bool,
+}
+
+impl RuleConfig for MD028Config {
+    const RULE_NAME: &'static str = "MD028";
+}
+
+#[derive(Clone, Default)]
+pub struct MD028NoBlanksBlockquote {
+    config: MD028Config,
+}
+
+impl MD028NoBlanksBlockquote {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_config(config: MD028Config) -> Self {
+        Self { config }
+    }
+
+    /// Construct with auto-fix explicitly enabled or disabled.
+    pub fn with_fix(fix: bool) -> Self {
+        Self {
+            config: MD028Config { fix },
+        }
+    }
+
+    /// Check if a line is a blockquote line (has > markers)
+    #[inline]
+    fn is_blockquote_line(line: &str) -> bool {
+        // Fast path: check for '>' character before doing any string operations
+        if !line.as_bytes().contains(&b'>') {
+            return false;
+        }
+        line.trim_start().starts_with('>')
+    }
+
+    /// Get the blockquote level (number of > markers) and leading whitespace
+    /// Returns (level, whitespace_end_idx)
+    fn get_blockquote_info(line: &str) -> (usize, usize) {
+        let bytes = line.as_bytes();
+        let mut i = 0;
+
+        // Skip leading whitespace
+        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+            i += 1;
+        }
+
+        let whitespace_end = i;
+        let mut level = 0;
+
+        // Count '>' markers
+        while i < bytes.len() {
+            if bytes[i] == b'>' {
+                level += 1;
+                i += 1;
+            } else if bytes[i] == b' ' || bytes[i] == b'\t' {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+
+        (level, whitespace_end)
+    }
+
+    /// Check if a line is in a skip context (HTML comment, code block, HTML block, or frontmatter)
+    #[inline]
+    fn is_in_skip_context(line_infos: &[LineInfo], idx: usize) -> bool {
+        if let Some(li) = line_infos.get(idx) {
+            li.in_html_comment || li.in_mdx_comment || li.in_code_block || li.in_html_block || li.in_front_matter
+        } else {
+            false
+        }
+    }
+
+    /// Check if there's substantive content between two blockquote sections
+    /// This helps distinguish between paragraph breaks and separate blockquotes.
+    /// Lines in skip contexts (HTML comments, code blocks, frontmatter) count as
+    /// separating content because they represent non-blockquote material between quotes.
+    fn has_content_between(lines: &[&str], line_infos: &[LineInfo], start: usize, end: usize) -> bool {
+        for (offset, line) in lines[start..end].iter().enumerate() {
+            let idx = start + offset;
+            // Non-blank lines in skip contexts (HTML comments, code blocks, frontmatter)
+            // are separating content between blockquotes
+            if Self::is_in_skip_context(line_infos, idx) {
+                if !line.trim().is_empty() {
+                    return true;
+                }
+                continue;
+            }
+            let trimmed = line.trim();
+            // If there's any non-blank, non-blockquote content, these are separate quotes
+            if !trimmed.is_empty() && !trimmed.starts_with('>') {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if a blockquote line is a GFM alert start
+    /// GFM alerts have the format: `> [!TYPE]` where TYPE is NOTE, TIP, IMPORTANT, WARNING, or CAUTION
+    /// Reference: https://docs.github.com/en/get-started/writing-on-github/getting-started-with-writing-and-formatting-on-github/basic-writing-and-formatting-syntax#alerts
+    #[inline]
+    fn is_gfm_alert_line(line: &str) -> bool {
+        // Fast path: must contain '[!' pattern
+        if !line.contains("[!") {
+            return false;
+        }
+
+        // Extract content after the > marker(s)
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with('>') {
+            return false;
+        }
+
+        // Skip all > markers and whitespace to get to content
+        let content = trimmed
+            .trim_start_matches('>')
+            .trim_start_matches([' ', '\t'])
+            .trim_start_matches('>')
+            .trim_start();
+
+        // Check for GFM alert pattern: [!TYPE]
+        if !content.starts_with("[!") {
+            return false;
+        }
+
+        // Extract the alert type
+        if let Some(end_bracket) = content.find(']') {
+            let alert_type = &content[2..end_bracket];
+            return GFM_ALERT_TYPES.iter().any(|&t| t.eq_ignore_ascii_case(alert_type));
+        }
+
+        false
+    }
+
+    /// Check if a blockquote line is an Obsidian callout
+    /// Obsidian callouts have the format: `> [!TYPE]` where TYPE can be any string
+    /// Obsidian also supports foldable callouts: `> [!TYPE]+` (expanded) or `> [!TYPE]-` (collapsed)
+    /// Reference: https://help.obsidian.md/callouts
+    #[inline]
+    fn is_obsidian_callout_line(line: &str) -> bool {
+        // Fast path: must contain '[!' pattern
+        if !line.contains("[!") {
+            return false;
+        }
+
+        // Extract content after the > marker(s)
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with('>') {
+            return false;
+        }
+
+        // Skip all > markers and whitespace to get to content
+        let content = trimmed
+            .trim_start_matches('>')
+            .trim_start_matches([' ', '\t'])
+            .trim_start_matches('>')
+            .trim_start();
+
+        // Check for Obsidian callout pattern: [!TYPE] or [!TYPE]+ or [!TYPE]-
+        if !content.starts_with("[!") {
+            return false;
+        }
+
+        // Find the closing bracket - must have at least one char for TYPE
+        if let Some(end_bracket) = content.find(']') {
+            // TYPE must be at least one character
+            if end_bracket > 2 {
+                // Verify the type contains only valid characters (alphanumeric, hyphen, underscore)
+                let alert_type = &content[2..end_bracket];
+                return !alert_type.is_empty()
+                    && alert_type.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_');
+            }
+        }
+
+        false
+    }
+
+    /// Check if a line is a callout/alert based on the flavor
+    /// For Obsidian flavor: accepts any [!TYPE] pattern
+    /// For other flavors: only accepts GFM alert types
+    #[inline]
+    fn is_callout_line(line: &str, flavor: MarkdownFlavor) -> bool {
+        match flavor {
+            MarkdownFlavor::Obsidian => Self::is_obsidian_callout_line(line),
+            _ => Self::is_gfm_alert_line(line),
+        }
+    }
+
+    /// Find the first line of a blockquote block starting from a given line
+    /// Scans backwards to find where this blockquote block begins
+    fn find_blockquote_start(lines: &[&str], line_infos: &[LineInfo], from_idx: usize) -> Option<usize> {
+        if from_idx >= lines.len() {
+            return None;
+        }
+
+        // Start from the given line and scan backwards
+        let mut start_idx = from_idx;
+
+        for i in (0..=from_idx).rev() {
+            // Skip lines in skip contexts
+            if Self::is_in_skip_context(line_infos, i) {
+                continue;
+            }
+
+            let line = lines[i];
+
+            // If it's a blockquote line, update start
+            if Self::is_blockquote_line(line) {
+                start_idx = i;
+            } else if line.trim().is_empty() {
+                // Blank line - check if previous content was blockquote
+                // If we haven't found any blockquote yet, continue
+                if start_idx == from_idx && !Self::is_blockquote_line(lines[from_idx]) {
+                    continue;
+                }
+                // Otherwise, blank line ends this blockquote block
+                break;
+            } else {
+                // Non-blockquote, non-blank line - this ends the blockquote block
+                break;
+            }
+        }
+
+        // Return start only if it's actually a blockquote line and not in a skip context
+        if Self::is_blockquote_line(lines[start_idx]) && !Self::is_in_skip_context(line_infos, start_idx) {
+            Some(start_idx)
+        } else {
+            None
+        }
+    }
+
+    /// Check if a blockquote block (starting at given index) is a callout/alert
+    /// For Obsidian flavor: accepts any [!TYPE] pattern
+    /// For other flavors: only accepts GFM alert types
+    fn is_callout_block(
+        lines: &[&str],
+        line_infos: &[LineInfo],
+        blockquote_line_idx: usize,
+        flavor: MarkdownFlavor,
+    ) -> bool {
+        // Find the start of this blockquote block
+        if let Some(start_idx) = Self::find_blockquote_start(lines, line_infos, blockquote_line_idx) {
+            // Check if the first line of the block is a callout/alert
+            return Self::is_callout_line(lines[start_idx], flavor);
+        }
+        false
+    }
+
+    /// Analyze context to determine if quotes are likely the same or different
+    fn are_likely_same_blockquote(
+        lines: &[&str],
+        line_infos: &[LineInfo],
+        blank_idx: usize,
+        flavor: MarkdownFlavor,
+    ) -> bool {
+        // Look for patterns that suggest these are the same blockquote:
+        // 1. Only one blank line between them (multiple blanks suggest separation)
+        // 2. Same indentation level
+        // 3. No content between them
+        // 4. Similar blockquote levels
+
+        // Note: We flag ALL blank lines between blockquotes, matching markdownlint behavior.
+        // Even multiple consecutive blank lines are flagged as they can be ambiguous
+        // (some parsers treat them as one blockquote, others as separate blockquotes).
+
+        // Find previous and next blockquote lines using fast byte scanning
+        let mut prev_quote_idx = None;
+        let mut next_quote_idx = None;
+
+        // Scan backwards for previous blockquote, skipping lines in skip contexts
+        for i in (0..blank_idx).rev() {
+            if Self::is_in_skip_context(line_infos, i) {
+                continue;
+            }
+            let line = lines[i];
+            // Fast check: if no '>' character, skip
+            if line.as_bytes().contains(&b'>') && Self::is_blockquote_line(line) {
+                prev_quote_idx = Some(i);
+                break;
+            }
+        }
+
+        // Scan forwards for next blockquote, skipping lines in skip contexts
+        for (i, line) in lines.iter().enumerate().skip(blank_idx + 1) {
+            if Self::is_in_skip_context(line_infos, i) {
+                continue;
+            }
+            // Fast check: if no '>' character, skip
+            if line.as_bytes().contains(&b'>') && Self::is_blockquote_line(line) {
+                next_quote_idx = Some(i);
+                break;
+            }
+        }
+
+        let (Some(prev_idx), Some(next_idx)) = (prev_quote_idx, next_quote_idx) else {
+            return false;
+        };
+
+        // Callout/Alert check: If either blockquote is a callout/alert, treat them as
+        // intentionally separate blockquotes. Callouts MUST be separated by blank lines
+        // to render correctly.
+        // For Obsidian flavor: any [!TYPE] is a callout
+        // For other flavors: only GFM alert types (NOTE, TIP, IMPORTANT, WARNING, CAUTION)
+        let prev_is_callout = Self::is_callout_block(lines, line_infos, prev_idx, flavor);
+        let next_is_callout = Self::is_callout_block(lines, line_infos, next_idx, flavor);
+        if prev_is_callout || next_is_callout {
+            return false;
+        }
+
+        // Check for content between blockquotes
+        if Self::has_content_between(lines, line_infos, prev_idx + 1, next_idx) {
+            return false;
+        }
+
+        // Get blockquote info once per line to avoid repeated parsing
+        let (prev_level, prev_whitespace_end) = Self::get_blockquote_info(lines[prev_idx]);
+        let (next_level, next_whitespace_end) = Self::get_blockquote_info(lines[next_idx]);
+
+        // Different levels suggest different contexts
+        // But next_level > prev_level could be nested continuation
+        if next_level < prev_level {
+            return false;
+        }
+
+        // Check indentation consistency using byte indices
+        let prev_line = lines[prev_idx];
+        let next_line = lines[next_idx];
+        let prev_indent = &prev_line[..prev_whitespace_end];
+        let next_indent = &next_line[..next_whitespace_end];
+
+        // Different indentation indicates separate blockquote contexts
+        // Same indentation with no content between = same blockquote (blank line inside)
+        prev_indent == next_indent
+    }
+
+    /// Check if a blank line is problematic (inside a blockquote)
+    fn is_problematic_blank_line(
+        lines: &[&str],
+        line_infos: &[LineInfo],
+        index: usize,
+        flavor: MarkdownFlavor,
+    ) -> Option<(usize, String)> {
+        let current_line = lines[index];
+
+        // Must be a blank line (no content, no > markers)
+        if !current_line.trim().is_empty() || Self::is_blockquote_line(current_line) {
+            return None;
+        }
+
+        // Use heuristics to determine if this blank line is inside a blockquote
+        // or if it's an intentional separator between blockquotes
+        if !Self::are_likely_same_blockquote(lines, line_infos, index, flavor) {
+            return None;
+        }
+
+        // This blank line appears to be inside a blockquote
+        // Find the appropriate fix using optimized parsing, skipping lines in skip contexts
+        for i in (0..index).rev() {
+            if Self::is_in_skip_context(line_infos, i) {
+                continue;
+            }
+            let line = lines[i];
+            // Fast check: if no '>' character, skip
+            if line.as_bytes().contains(&b'>') && Self::is_blockquote_line(line) {
+                let (level, whitespace_end) = Self::get_blockquote_info(line);
+                let indent = &line[..whitespace_end];
+                let mut fix = String::with_capacity(indent.len() + level);
+                fix.push_str(indent);
+                for _ in 0..level {
+                    fix.push('>');
+                }
+                return Some((level, fix));
+            }
+        }
+
+        None
+    }
+}
+
+impl Rule for MD028NoBlanksBlockquote {
+    fn name(&self) -> &'static str {
+        "MD028"
+    }
+
+    fn description(&self) -> &'static str {
+        "Blank line inside blockquote"
+    }
+
+    fn check(&self, ctx: &crate::lint_context::LintContext) -> LintResult {
+        // Early return for content without blockquotes
+        if !ctx.content.contains('>') {
+            return Ok(Vec::new());
+        }
+
+        let mut warnings = Vec::new();
+
+        // Get all lines
+        let lines = ctx.raw_lines();
+
+        // Pre-scan to find blank lines and blockquote lines for faster processing
+        let mut blank_line_indices = Vec::new();
+        let mut has_blockquotes = false;
+
+        for (line_idx, line) in lines.iter().enumerate() {
+            // Skip lines in non-markdown content contexts
+            if line_idx < ctx.lines.len() {
+                let li = &ctx.lines[line_idx];
+                if li.in_code_block || li.in_html_comment || li.in_mdx_comment || li.in_html_block || li.in_front_matter
+                {
+                    continue;
+                }
+            }
+
+            if line.trim().is_empty() {
+                blank_line_indices.push(line_idx);
+            } else if Self::is_blockquote_line(line) {
+                has_blockquotes = true;
+            }
+        }
+
+        // If no blockquotes found, no need to check blank lines
+        if !has_blockquotes {
+            return Ok(Vec::new());
+        }
+
+        // Only check blank lines that could be problematic
+        for &line_idx in &blank_line_indices {
+            let line_num = line_idx + 1;
+
+            // Check if this is a problematic blank line inside a blockquote
+            if let Some((level, fix_content)) = Self::is_problematic_blank_line(lines, &ctx.lines, line_idx, ctx.flavor)
+            {
+                let line = lines[line_idx];
+                let (start_line, start_col, end_line, end_col) = calculate_line_range(line_num, line);
+
+                warnings.push(LintWarning {
+                    rule_name: Some(self.name().to_string()),
+                    message: format!("Blank line inside blockquote (level {level})"),
+                    line: start_line,
+                    column: start_col,
+                    end_line,
+                    end_column: end_col,
+                    severity: Severity::Warning,
+                    // Auto-fix is opt-in: merging blockquotes changes meaning, so
+                    // attach the fix only when the user enabled it.
+                    fix: if self.config.fix {
+                        Some(Fix::new(
+                            ctx.line_column_byte_range_with_length(line_num, 1, line.len()),
+                            fix_content,
+                        ))
+                    } else {
+                        None
+                    },
+                });
+            }
+        }
+
+        Ok(warnings)
+    }
+
+    fn fix(&self, ctx: &crate::lint_context::LintContext) -> Result<String, LintError> {
+        // Auto-fix is opt-in: when disabled (default), merging blockquotes is a
+        // no-op. check() still reports the warning without a fix.
+        if !self.config.fix || self.should_skip(ctx) {
+            return Ok(ctx.content.to_string());
+        }
+        let warnings = self.check(ctx)?;
+        if warnings.is_empty() {
+            return Ok(ctx.content.to_string());
+        }
+        let warnings =
+            crate::utils::fix_utils::filter_warnings_by_inline_config(warnings, ctx.inline_config(), self.name());
+        crate::utils::fix_utils::apply_warning_fixes(ctx.content, &warnings)
+            .map_err(crate::rule::LintError::InvalidInput)
+    }
+
+    /// Get the category of this rule for selective processing
+    fn category(&self) -> RuleCategory {
+        RuleCategory::Blockquote
+    }
+
+    /// Check if this rule should be skipped
+    fn should_skip(&self, ctx: &crate::lint_context::LintContext) -> bool {
+        !ctx.likely_has_blockquotes()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn from_config(config: &crate::config::Config) -> Box<dyn Rule>
+    where
+        Self: Sized,
+    {
+        let rule_config: MD028Config = load_rule_config(config);
+        Box::new(MD028NoBlanksBlockquote::with_config(rule_config))
+    }
+
+    crate::impl_rule_config_sections!(MD028Config);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lint_context::LintContext;
+
+    #[test]
+    fn test_default_warns_but_does_not_merge_blockquotes() {
+        // Through the production config path, MD028's autofix is opt-in. Two
+        // same-level adjacent blockquotes separated by a blank line are two
+        // distinct blockquotes per CommonMark; merging them changes meaning, and
+        // the heuristic cannot verify the author's intent. So check() still
+        // warns, but the warning carries no inline fix and fmt is a no-op.
+        let rule = MD028NoBlanksBlockquote::from_config(&crate::config::Config::default());
+        let content = "> Quote by Alice.\n\n> Quote by Bob.\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(warnings.len(), 1, "detection should still fire by default");
+        assert!(warnings[0].fix.is_none(), "default warnings must not carry a fix");
+
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, content, "default fmt must not merge distinct blockquotes");
+    }
+
+    #[test]
+    fn test_fix_enabled_merges_blockquotes() {
+        // With fix = true, the autofix merges the blockquotes (the helpful case:
+        // rejoining a quote with a continuation that had an accidental gap).
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> A quote\n\n> its continuation\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, "> A quote\n>\n> its continuation\n");
+    }
+
+    #[test]
+    fn test_no_blockquotes() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "This is regular text\n\nWith blank lines\n\nBut no blockquotes";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty(), "Should not flag content without blockquotes");
+    }
+
+    #[test]
+    fn test_valid_blockquote_no_blanks() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> This is a blockquote\n> With multiple lines\n> But no blank lines";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty(), "Should not flag blockquotes without blank lines");
+    }
+
+    #[test]
+    fn test_blockquote_with_empty_line_marker() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        // Lines with just > are valid and should NOT be flagged
+        let content = "> First line\n>\n> Third line";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty(), "Should not flag lines with just > marker");
+    }
+
+    #[test]
+    fn test_blockquote_with_empty_line_marker_and_space() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        // Lines with > and space are also valid
+        let content = "> First line\n> \n> Third line";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty(), "Should not flag lines with > and space");
+    }
+
+    #[test]
+    fn test_blank_line_in_blockquote() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        // Truly blank line (no >) inside blockquote should be flagged
+        let content = "> First line\n\n> Third line";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1, "Should flag truly blank line inside blockquote");
+        assert_eq!(result[0].line, 2);
+        assert!(result[0].message.contains("Blank line inside blockquote"));
+    }
+
+    #[test]
+    fn test_multiple_blank_lines() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> First\n\n\n> Fourth";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        // With proper indentation checking, both blank lines are flagged as they're within the same blockquote
+        assert_eq!(result.len(), 2, "Should flag each blank line within the blockquote");
+        assert_eq!(result[0].line, 2);
+        assert_eq!(result[1].line, 3);
+    }
+
+    #[test]
+    fn test_nested_blockquote_blank() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = ">> Nested quote\n\n>> More nested";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].line, 2);
+    }
+
+    #[test]
+    fn test_nested_blockquote_with_marker() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        // Lines with >> are valid
+        let content = ">> Nested quote\n>>\n>> More nested";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty(), "Should not flag lines with >> marker");
+    }
+
+    #[test]
+    fn test_fix_single_blank() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> First\n\n> Third";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, "> First\n>\n> Third");
+    }
+
+    #[test]
+    fn test_fix_nested_blank() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = ">> Nested\n\n>> More";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, ">> Nested\n>>\n>> More");
+    }
+
+    #[test]
+    fn test_fix_with_indentation() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "  > Indented quote\n\n  > More";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, "  > Indented quote\n  >\n  > More");
+    }
+
+    #[test]
+    fn test_mixed_levels() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        // Blank lines between different levels
+        let content = "> Level 1\n\n>> Level 2\n\n> Level 1 again";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        // Line 2 is a blank between > and >>, level 1 to level 2, considered inside level 1
+        // Line 4 is a blank between >> and >, level 2 to level 1, NOT inside blockquote
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].line, 2);
+    }
+
+    #[test]
+    fn test_blockquote_with_code_block() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> Quote with code:\n> ```\n> code\n> ```\n>\n> More quote";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        // Line 5 has > marker, so it's not a blank line
+        assert!(result.is_empty(), "Should not flag line with > marker");
+    }
+
+    #[test]
+    fn test_category() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        assert_eq!(rule.category(), RuleCategory::Blockquote);
+    }
+
+    #[test]
+    fn test_should_skip() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let ctx1 = LintContext::new("No blockquotes here", crate::config::MarkdownFlavor::Standard, None);
+        assert!(rule.should_skip(&ctx1));
+
+        let ctx2 = LintContext::new("> Has blockquote", crate::config::MarkdownFlavor::Standard, None);
+        assert!(!rule.should_skip(&ctx2));
+    }
+
+    #[test]
+    fn test_empty_content() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_blank_after_blockquote() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> Quote\n\nNot a quote";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty(), "Blank line after blockquote ends is valid");
+    }
+
+    #[test]
+    fn test_blank_before_blockquote() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "Not a quote\n\n> Quote";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty(), "Blank line before blockquote starts is valid");
+    }
+
+    #[test]
+    fn test_preserve_trailing_newline() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> Quote\n\n> More\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        assert!(fixed.ends_with('\n'));
+
+        let content_no_newline = "> Quote\n\n> More";
+        let ctx2 = LintContext::new(content_no_newline, crate::config::MarkdownFlavor::Standard, None);
+        let fixed2 = rule.fix(&ctx2).unwrap();
+        assert!(!fixed2.ends_with('\n'));
+    }
+
+    #[test]
+    fn test_document_structure_extension() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let ctx = LintContext::new("> test", crate::config::MarkdownFlavor::Standard, None);
+        // Test that the rule works correctly with blockquotes
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty(), "Should not flag valid blockquote");
+
+        // Test that rule skips content without blockquotes
+        let ctx2 = LintContext::new("no blockquote", crate::config::MarkdownFlavor::Standard, None);
+        assert!(rule.should_skip(&ctx2), "Should skip content without blockquotes");
+    }
+
+    #[test]
+    fn test_deeply_nested_blank() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = ">>> Deep nest\n\n>>> More deep";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, ">>> Deep nest\n>>>\n>>> More deep");
+    }
+
+    #[test]
+    fn test_deeply_nested_with_marker() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        // Lines with >>> are valid
+        let content = ">>> Deep nest\n>>>\n>>> More deep";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty(), "Should not flag lines with >>> marker");
+    }
+
+    #[test]
+    fn test_complex_blockquote_structure() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        // Line with > is valid, not a blank line
+        let content = "> Level 1\n> > Nested properly\n>\n> Back to level 1";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty(), "Should not flag line with > marker");
+    }
+
+    #[test]
+    fn test_complex_with_blank() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        // Blank line between different nesting levels is not flagged
+        // (going from >> back to > is a context change)
+        let content = "> Level 1\n> > Nested\n\n> Back to level 1";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(
+            result.len(),
+            0,
+            "Blank between different nesting levels is not inside blockquote"
+        );
+    }
+
+    // ==================== GFM Alert Tests ====================
+    // GitHub Flavored Markdown alerts use the syntax > [!TYPE] where TYPE is
+    // NOTE, TIP, IMPORTANT, WARNING, or CAUTION. These alerts MUST be separated
+    // by blank lines to render correctly on GitHub.
+    // Reference: https://docs.github.com/en/get-started/writing-on-github/getting-started-with-writing-and-formatting-on-github/basic-writing-and-formatting-syntax#alerts
+
+    #[test]
+    fn test_gfm_alert_detection_note() {
+        assert!(MD028NoBlanksBlockquote::is_gfm_alert_line("> [!NOTE]"));
+        assert!(MD028NoBlanksBlockquote::is_gfm_alert_line("> [!NOTE] Additional text"));
+        assert!(MD028NoBlanksBlockquote::is_gfm_alert_line(">  [!NOTE]"));
+        assert!(MD028NoBlanksBlockquote::is_gfm_alert_line("> [!note]")); // case insensitive
+        assert!(MD028NoBlanksBlockquote::is_gfm_alert_line("> [!Note]")); // mixed case
+    }
+
+    #[test]
+    fn test_gfm_alert_detection_all_types() {
+        // All five GFM alert types
+        assert!(MD028NoBlanksBlockquote::is_gfm_alert_line("> [!NOTE]"));
+        assert!(MD028NoBlanksBlockquote::is_gfm_alert_line("> [!TIP]"));
+        assert!(MD028NoBlanksBlockquote::is_gfm_alert_line("> [!IMPORTANT]"));
+        assert!(MD028NoBlanksBlockquote::is_gfm_alert_line("> [!WARNING]"));
+        assert!(MD028NoBlanksBlockquote::is_gfm_alert_line("> [!CAUTION]"));
+    }
+
+    #[test]
+    fn test_gfm_alert_detection_not_alert() {
+        // These should NOT be detected as GFM alerts
+        assert!(!MD028NoBlanksBlockquote::is_gfm_alert_line("> Regular blockquote"));
+        assert!(!MD028NoBlanksBlockquote::is_gfm_alert_line("> [!INVALID]"));
+        assert!(!MD028NoBlanksBlockquote::is_gfm_alert_line("> [NOTE]")); // missing !
+        assert!(!MD028NoBlanksBlockquote::is_gfm_alert_line("> [!]")); // empty type
+        assert!(!MD028NoBlanksBlockquote::is_gfm_alert_line("Regular text [!NOTE]")); // not blockquote
+        assert!(!MD028NoBlanksBlockquote::is_gfm_alert_line("")); // empty
+        assert!(!MD028NoBlanksBlockquote::is_gfm_alert_line("> ")); // empty blockquote
+    }
+
+    #[test]
+    fn test_gfm_alerts_separated_by_blank_line() {
+        // Issue #126 use case: Two GFM alerts separated by blank line should NOT be flagged
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> [!TIP]\n> Here's a github tip\n\n> [!NOTE]\n> Here's a github note";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty(), "Should not flag blank line between GFM alerts");
+    }
+
+    #[test]
+    fn test_gfm_alerts_all_five_types_separated() {
+        // All five alert types in sequence, each separated by blank lines
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = r#"> [!NOTE]
+> Note content
+
+> [!TIP]
+> Tip content
+
+> [!IMPORTANT]
+> Important content
+
+> [!WARNING]
+> Warning content
+
+> [!CAUTION]
+> Caution content"#;
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not flag blank lines between any GFM alert types"
+        );
+    }
+
+    #[test]
+    fn test_gfm_alert_with_multiple_lines() {
+        // GFM alert with multiple content lines, then another alert
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = r#"> [!WARNING]
+> This is a warning
+> with multiple lines
+> of content
+
+> [!NOTE]
+> This is a note"#;
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not flag blank line between multi-line GFM alerts"
+        );
+    }
+
+    #[test]
+    fn test_gfm_alert_followed_by_regular_blockquote() {
+        // GFM alert followed by regular blockquote - should NOT flag
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> [!TIP]\n> A helpful tip\n\n> Regular blockquote";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty(), "Should not flag blank line after GFM alert");
+    }
+
+    #[test]
+    fn test_regular_blockquote_followed_by_gfm_alert() {
+        // Regular blockquote followed by GFM alert - should NOT flag
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> Regular blockquote\n\n> [!NOTE]\n> Important note";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty(), "Should not flag blank line before GFM alert");
+    }
+
+    #[test]
+    fn test_regular_blockquotes_still_flagged() {
+        // Regular blockquotes (not GFM alerts) should still be flagged
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> First blockquote\n\n> Second blockquote";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(
+            result.len(),
+            1,
+            "Should still flag blank line between regular blockquotes"
+        );
+    }
+
+    #[test]
+    fn test_gfm_alert_blank_line_within_same_alert() {
+        // Blank line WITHIN a single GFM alert should still be flagged
+        // (this is a missing > marker inside the alert)
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> [!NOTE]\n> First paragraph\n\n> Second paragraph of same note";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        // The second > line is NOT a new alert, so this is a blank within the same blockquote
+        // However, since the first blockquote is a GFM alert, and the second is just continuation,
+        // this could be ambiguous. Current implementation: if first is alert, don't flag.
+        // This is acceptable - user can use > marker on blank line if they want continuation.
+        assert!(
+            result.is_empty(),
+            "GFM alert status propagates to subsequent blockquote lines"
+        );
+    }
+
+    #[test]
+    fn test_gfm_alert_case_insensitive() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> [!note]\n> lowercase\n\n> [!TIP]\n> uppercase\n\n> [!Warning]\n> mixed";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty(), "GFM alert detection should be case insensitive");
+    }
+
+    #[test]
+    fn test_gfm_alert_with_nested_blockquote() {
+        // GFM alert doesn't support nesting, but test behavior
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> [!NOTE]\n> > Nested quote inside alert\n\n> [!TIP]\n> Tip";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not flag blank between alerts even with nested content"
+        );
+    }
+
+    #[test]
+    fn test_gfm_alert_indented() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        // Indented GFM alerts (e.g., in a list context)
+        let content = "  > [!NOTE]\n  > Indented note\n\n  > [!TIP]\n  > Indented tip";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty(), "Should not flag blank between indented GFM alerts");
+    }
+
+    #[test]
+    fn test_gfm_alert_mixed_with_regular_content() {
+        // Mixed document with GFM alerts and regular content
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = r#"# Heading
+
+Some paragraph.
+
+> [!NOTE]
+> Important note
+
+More paragraph text.
+
+> [!WARNING]
+> Be careful!
+
+Final text."#;
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "GFM alerts in mixed document should not trigger warnings"
+        );
+    }
+
+    #[test]
+    fn test_gfm_alert_fix_not_applied() {
+        // When we have GFM alerts, fix should not modify the blank lines
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> [!TIP]\n> Tip\n\n> [!NOTE]\n> Note";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, content, "Fix should not modify blank lines between GFM alerts");
+    }
+
+    #[test]
+    fn test_gfm_alert_multiple_blank_lines_between() {
+        // Multiple blank lines between GFM alerts should not be flagged
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> [!NOTE]\n> Note\n\n\n> [!TIP]\n> Tip";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not flag multiple blank lines between GFM alerts"
+        );
+    }
+
+    // ==================== Obsidian Callout Tests ====================
+    // Obsidian callouts use the same > [!TYPE] syntax as GFM alerts, but support
+    // any custom type (not just NOTE, TIP, IMPORTANT, WARNING, CAUTION).
+    // They also support foldable callouts with + or - suffix.
+    // Reference: https://help.obsidian.md/callouts
+
+    #[test]
+    fn test_obsidian_callout_detection() {
+        // Obsidian callouts should be detected
+        assert!(MD028NoBlanksBlockquote::is_obsidian_callout_line("> [!NOTE]"));
+        assert!(MD028NoBlanksBlockquote::is_obsidian_callout_line("> [!info]"));
+        assert!(MD028NoBlanksBlockquote::is_obsidian_callout_line("> [!todo]"));
+        assert!(MD028NoBlanksBlockquote::is_obsidian_callout_line("> [!success]"));
+        assert!(MD028NoBlanksBlockquote::is_obsidian_callout_line("> [!question]"));
+        assert!(MD028NoBlanksBlockquote::is_obsidian_callout_line("> [!failure]"));
+        assert!(MD028NoBlanksBlockquote::is_obsidian_callout_line("> [!danger]"));
+        assert!(MD028NoBlanksBlockquote::is_obsidian_callout_line("> [!bug]"));
+        assert!(MD028NoBlanksBlockquote::is_obsidian_callout_line("> [!example]"));
+        assert!(MD028NoBlanksBlockquote::is_obsidian_callout_line("> [!quote]"));
+        assert!(MD028NoBlanksBlockquote::is_obsidian_callout_line("> [!cite]"));
+    }
+
+    #[test]
+    fn test_obsidian_callout_custom_types() {
+        // Obsidian supports custom callout types
+        assert!(MD028NoBlanksBlockquote::is_obsidian_callout_line("> [!custom]"));
+        assert!(MD028NoBlanksBlockquote::is_obsidian_callout_line("> [!my-callout]"));
+        assert!(MD028NoBlanksBlockquote::is_obsidian_callout_line("> [!my_callout]"));
+        assert!(MD028NoBlanksBlockquote::is_obsidian_callout_line("> [!MyCallout]"));
+        assert!(MD028NoBlanksBlockquote::is_obsidian_callout_line("> [!callout123]"));
+    }
+
+    #[test]
+    fn test_obsidian_callout_foldable() {
+        // Obsidian supports foldable callouts with + or -
+        assert!(MD028NoBlanksBlockquote::is_obsidian_callout_line("> [!NOTE]+ Expanded"));
+        assert!(MD028NoBlanksBlockquote::is_obsidian_callout_line(
+            "> [!NOTE]- Collapsed"
+        ));
+        assert!(MD028NoBlanksBlockquote::is_obsidian_callout_line("> [!WARNING]+"));
+        assert!(MD028NoBlanksBlockquote::is_obsidian_callout_line("> [!TIP]-"));
+    }
+
+    #[test]
+    fn test_obsidian_callout_with_title() {
+        // Obsidian callouts can have custom titles
+        assert!(MD028NoBlanksBlockquote::is_obsidian_callout_line(
+            "> [!NOTE] Custom Title"
+        ));
+        assert!(MD028NoBlanksBlockquote::is_obsidian_callout_line(
+            "> [!WARNING]+ Be Careful!"
+        ));
+    }
+
+    #[test]
+    fn test_obsidian_callout_invalid() {
+        // Invalid callout patterns
+        assert!(!MD028NoBlanksBlockquote::is_obsidian_callout_line(
+            "> Regular blockquote"
+        ));
+        assert!(!MD028NoBlanksBlockquote::is_obsidian_callout_line("> [NOTE]")); // missing !
+        assert!(!MD028NoBlanksBlockquote::is_obsidian_callout_line("> [!]")); // empty type
+        assert!(!MD028NoBlanksBlockquote::is_obsidian_callout_line(
+            "Regular text [!NOTE]"
+        )); // not blockquote
+        assert!(!MD028NoBlanksBlockquote::is_obsidian_callout_line("")); // empty
+    }
+
+    #[test]
+    fn test_obsidian_callouts_separated_by_blank_line() {
+        // Obsidian callouts separated by blank line should NOT be flagged
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> [!info]\n> Some info\n\n> [!todo]\n> A todo item";
+        let ctx = LintContext::new(content, MarkdownFlavor::Obsidian, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not flag blank line between Obsidian callouts"
+        );
+    }
+
+    #[test]
+    fn test_obsidian_custom_callouts_separated() {
+        // Custom Obsidian callouts should also be recognized
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> [!my-custom]\n> Custom content\n\n> [!another_custom]\n> More content";
+        let ctx = LintContext::new(content, MarkdownFlavor::Obsidian, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not flag blank line between custom Obsidian callouts"
+        );
+    }
+
+    #[test]
+    fn test_obsidian_foldable_callouts_separated() {
+        // Foldable Obsidian callouts should also be recognized
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> [!NOTE]+ Expanded\n> Content\n\n> [!WARNING]- Collapsed\n> Warning content";
+        let ctx = LintContext::new(content, MarkdownFlavor::Obsidian, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not flag blank line between foldable Obsidian callouts"
+        );
+    }
+
+    #[test]
+    fn test_obsidian_custom_not_recognized_in_standard_flavor() {
+        // Custom callout types should NOT be recognized in Standard flavor
+        // (only GFM alert types are recognized)
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> [!info]\n> Info content\n\n> [!todo]\n> Todo content";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        // In Standard flavor, [!info] and [!todo] are NOT GFM alerts, so this is flagged
+        assert_eq!(
+            result.len(),
+            1,
+            "Custom callout types should be flagged in Standard flavor"
+        );
+    }
+
+    #[test]
+    fn test_obsidian_gfm_alerts_work_in_both_flavors() {
+        // GFM alert types should work in both Standard and Obsidian flavors
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> [!NOTE]\n> Note\n\n> [!WARNING]\n> Warning";
+
+        // Standard flavor
+        let ctx_standard = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result_standard = rule.check(&ctx_standard).unwrap();
+        assert!(result_standard.is_empty(), "GFM alerts should work in Standard flavor");
+
+        // Obsidian flavor
+        let ctx_obsidian = LintContext::new(content, MarkdownFlavor::Obsidian, None);
+        let result_obsidian = rule.check(&ctx_obsidian).unwrap();
+        assert!(
+            result_obsidian.is_empty(),
+            "GFM alerts should also work in Obsidian flavor"
+        );
+    }
+
+    #[test]
+    fn test_obsidian_callout_all_builtin_types() {
+        // Test all built-in Obsidian callout types
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = r#"> [!note]
+> Note
+
+> [!abstract]
+> Abstract
+
+> [!summary]
+> Summary
+
+> [!info]
+> Info
+
+> [!todo]
+> Todo
+
+> [!tip]
+> Tip
+
+> [!success]
+> Success
+
+> [!question]
+> Question
+
+> [!warning]
+> Warning
+
+> [!failure]
+> Failure
+
+> [!danger]
+> Danger
+
+> [!bug]
+> Bug
+
+> [!example]
+> Example
+
+> [!quote]
+> Quote"#;
+        let ctx = LintContext::new(content, MarkdownFlavor::Obsidian, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty(), "All Obsidian callout types should be recognized");
+    }
+
+    #[test]
+    fn test_obsidian_fix_not_applied_to_callouts() {
+        // Fix should not modify blank lines between Obsidian callouts
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> [!info]\n> Info\n\n> [!todo]\n> Todo";
+        let ctx = LintContext::new(content, MarkdownFlavor::Obsidian, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(
+            fixed, content,
+            "Fix should not modify blank lines between Obsidian callouts"
+        );
+    }
+
+    #[test]
+    fn test_obsidian_regular_blockquotes_still_flagged() {
+        // Regular blockquotes (not callouts) should still be flagged in Obsidian flavor
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> First blockquote\n\n> Second blockquote";
+        let ctx = LintContext::new(content, MarkdownFlavor::Obsidian, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(
+            result.len(),
+            1,
+            "Regular blockquotes should still be flagged in Obsidian flavor"
+        );
+    }
+
+    #[test]
+    fn test_obsidian_callout_mixed_with_regular_blockquote() {
+        // Callout followed by regular blockquote - should NOT flag (callout takes precedence)
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> [!note]\n> Note content\n\n> Regular blockquote";
+        let ctx = LintContext::new(content, MarkdownFlavor::Obsidian, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not flag blank after callout even if followed by regular blockquote"
+        );
+    }
+
+    // ==================== HTML Comment Skip Tests ====================
+    // Blockquote-like content inside HTML comments should not be linted.
+
+    #[test]
+    fn test_html_comment_blockquotes_not_flagged() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "## Responses\n\n<!--\n> First response text here.\n> <br>— Person One\n\n> Second response text here.\n> <br>— Person Two\n-->\n\nThe above responses are currently disabled.\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not flag blank lines inside HTML comments, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_fix_preserves_html_comment_content() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "<!--\n> First quote\n\n> Second quote\n-->\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, content, "Fix should not modify content inside HTML comments");
+    }
+
+    #[test]
+    fn test_multiline_html_comment_with_blockquotes() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "# Title\n\n<!--\n> Quote A\n> Line 2\n\n> Quote B\n> Line 2\n\n> Quote C\n-->\n\nSome text\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not flag any blank lines inside HTML comments, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_blockquotes_outside_html_comment_still_flagged() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> First quote\n\n> Second quote\n\n<!--\n> Commented quote A\n\n> Commented quote B\n-->\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        // The blank line between the first two blockquotes (outside comment) should be flagged
+        // but none inside the HTML comment (lines 7 is the blank between commented quotes)
+        for w in &result {
+            assert!(
+                w.line < 5,
+                "Warning at line {} should not be inside HTML comment",
+                w.line
+            );
+        }
+        assert!(
+            !result.is_empty(),
+            "Should still flag blank line between blockquotes outside HTML comment"
+        );
+    }
+
+    #[test]
+    fn test_frontmatter_blockquote_like_content_not_flagged() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "---\n> not a real blockquote\n\n> also not real\n---\n\n# Title\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not flag content inside frontmatter, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_comment_boundary_does_not_leak_into_adjacent_blockquotes() {
+        // A real blockquote before a comment should not be matched with
+        // a blockquote inside the comment across the <!-- boundary
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> real quote\n\n<!--\n> commented quote\n-->\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not match blockquotes across HTML comment boundaries, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_blockquote_after_comment_boundary_not_matched() {
+        // A blockquote inside a comment should not be matched with
+        // a blockquote after the comment across the --> boundary
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "<!--\n> commented quote\n-->\n\n> real quote\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not match blockquotes across HTML comment boundaries, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_fix_preserves_comment_boundary_content() {
+        // Verify fix doesn't modify content when blockquotes straddle a comment boundary
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> real quote\n\n<!--\n> commented quote A\n\n> commented quote B\n-->\n\n> another real quote\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(
+            fixed, content,
+            "Fix should not modify content when blockquotes are separated by comment boundaries"
+        );
+    }
+
+    #[test]
+    fn test_inline_html_comment_does_not_suppress_warning() {
+        // Inline HTML comments on a blockquote line should NOT suppress warnings -
+        // only multi-line HTML comment blocks should
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> quote with <!-- inline comment -->\n\n> continuation\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        // This should still be flagged since the blockquotes are not inside an HTML comment block
+        assert!(
+            !result.is_empty(),
+            "Should still flag blank lines between blockquotes with inline HTML comments"
+        );
+    }
+
+    // ==================== Skip Context Scanning Tests ====================
+    // Verify that backward/forward scanning in are_likely_same_blockquote()
+    // and is_problematic_blank_line() properly skips lines in HTML comments,
+    // code blocks, and frontmatter.
+
+    #[test]
+    fn test_comment_with_blockquote_markers_on_delimiters() {
+        // The backward scan should not find blockquote lines on HTML comment
+        // delimiter lines, preventing false positives
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "<!-- > not a real blockquote\n\n> also not real -->\n\n> real quote A\n\n> real quote B";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        // Only the blank between "real quote A" and "real quote B" (line 6) should be flagged
+        assert_eq!(
+            result.len(),
+            1,
+            "Should only warn about blank between real quotes, got: {result:?}"
+        );
+        assert_eq!(result[0].line, 6, "Warning should be on line 6 (between real quotes)");
+    }
+
+    #[test]
+    fn test_commented_blockquote_between_real_blockquotes() {
+        // A commented-out blockquote between two real blockquotes should act
+        // as non-blockquote content, preventing them from being considered
+        // the same blockquote
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> real A\n\n<!-- > commented -->\n\n> real B";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should NOT warn when non-blockquote content (HTML comment) separates blockquotes, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_code_block_with_blockquote_markers_between_real_blockquotes() {
+        // Blockquote markers inside code blocks should be ignored by scanning
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> real A\n\n```\n> not a blockquote\n```\n\n> real B";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should NOT warn when code block with > markers separates blockquotes, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_frontmatter_with_blockquote_markers_does_not_cause_false_positive() {
+        // Blockquote-like lines in frontmatter should be ignored by scanning
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "---\n> frontmatter value\n---\n\n> real quote A\n\n> real quote B";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        // Only the blank between the two real blockquotes should be flagged
+        assert_eq!(
+            result.len(),
+            1,
+            "Should only flag the blank between real quotes, got: {result:?}"
+        );
+        assert_eq!(result[0].line, 6, "Warning should be on line 6 (between real quotes)");
+    }
+
+    #[test]
+    fn test_fix_does_not_modify_comment_separated_blockquotes() {
+        // Fix should not add > markers when blockquotes are separated by HTML comments
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> real A\n\n<!-- > commented -->\n\n> real B";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(
+            fixed, content,
+            "Fix should not modify content when blockquotes are separated by HTML comment"
+        );
+    }
+
+    #[test]
+    fn test_fix_works_correctly_with_comment_before_real_blockquotes() {
+        // Fix should correctly handle the case where a comment with > markers
+        // precedes two real blockquotes that have a blank between them
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "<!-- > not a real blockquote\n\n> also not real -->\n\n> real quote A\n\n> real quote B";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        // The blank between the two real quotes should be fixed
+        assert!(
+            fixed.contains("> real quote A\n>\n> real quote B"),
+            "Fix should add > marker between real quotes, got: {fixed}"
+        );
+        // The content inside the comment should be untouched
+        assert!(
+            fixed.contains("<!-- > not a real blockquote"),
+            "Fix should not modify comment content"
+        );
+    }
+
+    #[test]
+    fn test_html_block_with_angle_brackets_not_flagged() {
+        // HTML blocks can contain `>` characters (e.g., in nested tags or template syntax)
+        // that look like blockquote markers. These should be skipped.
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "<div>\n> not a real blockquote\n\n> also not real\n</div>";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+
+        assert!(
+            result.is_empty(),
+            "Lines inside HTML blocks should not trigger MD028. Got: {result:?}"
+        );
+    }
+
+    // ==================== Roundtrip Safety Tests ====================
+    // Verify that fix() output, when re-checked, produces zero warnings.
+
+    #[test]
+    fn test_roundtrip_single_blank() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> First\n\n> Third";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        let ctx2 = LintContext::new(&fixed, crate::config::MarkdownFlavor::Standard, None);
+        let warnings = rule.check(&ctx2).unwrap();
+        assert!(
+            warnings.is_empty(),
+            "Roundtrip should produce zero warnings, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_multiple_blanks() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> First\n\n\n> Fourth";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        let ctx2 = LintContext::new(&fixed, crate::config::MarkdownFlavor::Standard, None);
+        let warnings = rule.check(&ctx2).unwrap();
+        assert!(
+            warnings.is_empty(),
+            "Roundtrip should produce zero warnings, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_nested() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = ">> Nested\n\n>> More";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        let ctx2 = LintContext::new(&fixed, crate::config::MarkdownFlavor::Standard, None);
+        let warnings = rule.check(&ctx2).unwrap();
+        assert!(
+            warnings.is_empty(),
+            "Roundtrip should produce zero warnings, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_indented() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "  > Indented\n\n  > More";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        let ctx2 = LintContext::new(&fixed, crate::config::MarkdownFlavor::Standard, None);
+        let warnings = rule.check(&ctx2).unwrap();
+        assert!(
+            warnings.is_empty(),
+            "Roundtrip should produce zero warnings, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_deeply_nested() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = ">>> Deep\n\n>>> More";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        let ctx2 = LintContext::new(&fixed, crate::config::MarkdownFlavor::Standard, None);
+        let warnings = rule.check(&ctx2).unwrap();
+        assert!(
+            warnings.is_empty(),
+            "Roundtrip should produce zero warnings, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_multi_blockquotes() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> First\n> Line\n\n> Second\n> Line\n\n> Third\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        let ctx2 = LintContext::new(&fixed, crate::config::MarkdownFlavor::Standard, None);
+        let warnings = rule.check(&ctx2).unwrap();
+        assert!(
+            warnings.is_empty(),
+            "Roundtrip should produce zero warnings, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_idempotent() {
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content = "> First\n\n> Second\n\n> Third\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed1 = rule.fix(&ctx).unwrap();
+        let ctx2 = LintContext::new(&fixed1, crate::config::MarkdownFlavor::Standard, None);
+        let fixed2 = rule.fix(&ctx2).unwrap();
+        assert_eq!(fixed1, fixed2, "Fix should be idempotent");
+    }
+
+    #[test]
+    fn test_html_block_does_not_leak_into_adjacent_blockquotes() {
+        // Blockquotes after an HTML block should still be checked
+        let rule = MD028NoBlanksBlockquote::with_fix(true);
+        let content =
+            "<details>\n<summary>Click</summary>\n> inside html block\n</details>\n\n> real quote A\n\n> real quote B";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+
+        // Only the blank between "real quote A" and "real quote B" should be flagged
+        assert_eq!(
+            result.len(),
+            1,
+            "Expected 1 warning for blank between real blockquotes after HTML block. Got: {result:?}"
+        );
+    }
+}

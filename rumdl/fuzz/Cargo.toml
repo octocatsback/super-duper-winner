@@ -1,0 +1,77 @@
+[package]
+name = "rumdl-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[package.metadata.cargo-machete]
+ignored = ["rumdl"] # Imported as rumdl_lib (lib rename in parent Cargo.toml)
+
+[dependencies]
+libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
+arbitrary = { version = "1", features = ["derive"] }
+toml = "1.0"
+
+[dependencies.rumdl]
+path = ".."
+default-features = false
+features = ["parallel"]
+
+[[bin]]
+name = "fuzz_fix_idempotency"
+path = "fuzz_targets/fuzz_fix_idempotency.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_lint"
+path = "fuzz_targets/fuzz_lint.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_fix"
+path = "fuzz_targets/fuzz_fix.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_config"
+path = "fuzz_targets/fuzz_config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_context"
+path = "fuzz_targets/fuzz_context.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_differential"
+path = "fuzz_targets/fuzz_differential.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_properties"
+path = "fuzz_targets/fuzz_properties.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_structured"
+path = "fuzz_targets/fuzz_structured.rs"
+test = false
+doc = false
+bench = false

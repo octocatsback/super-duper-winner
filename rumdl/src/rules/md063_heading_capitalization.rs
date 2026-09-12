@@ -1,0 +1,3997 @@
+/// Rule MD063: Heading capitalization
+///
+/// See [docs/md063.md](../../docs/md063.md) for full documentation, configuration, and examples.
+///
+/// This rule enforces consistent capitalization styles for markdown headings.
+/// It supports title case, sentence case, and all caps styles.
+///
+/// **Note:** This rule is disabled by default. Enable it in your configuration:
+/// ```toml
+/// [MD063]
+/// enabled = true
+/// style = "title_case"
+/// ```
+use crate::rule::{Fix, LintError, LintResult, LintWarning, Rule, RuleCategory, Severity};
+use crate::utils::header_id_utils::{HTML_TAG_ATTRIBUTES_PATTERN, HTML_TAG_NAME_PATTERN, is_backslash_escaped};
+use crate::utils::html_elements::is_void_element;
+use crate::utils::mdg;
+use crate::utils::range_utils::byte_to_char_count;
+use regex::Regex;
+use std::collections::HashSet;
+use std::sync::LazyLock;
+
+mod md063_config;
+pub(super) use md063_config::{HeadingCapStyle, MD063Config};
+
+// Regex to match inline code spans (backticks)
+static INLINE_CODE_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`+[^`]+`+").unwrap());
+
+// Regex to match markdown links [text](url) or [text][ref].
+// The inline-URL part allows one level of nested parentheses so URLs like
+// `https://example.com/docs/v(2)beta` are matched in full; otherwise the URL
+// would be truncated at the first ')' and its tail title-cased as prose.
+static LINK_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[([^\]]*)\]\((?:[^()]|\([^()]*\))*\)|\[([^\]]*)\]\[[^\]]*\]").unwrap());
+
+// One inline HTML token: a comment, a closing tag (name in group 1), or an open
+// tag (name in group 2). `<!-->` and `<!--->` are complete comments, so a later
+// `-->` is text. Attributes follow the CommonMark grammar, so a quoted value may
+// contain `>`. Elements are paired by name in `html_regions`, since the regex
+// engine has no backreferences.
+static HTML_TOKEN_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    let pattern = format!(
+        r"<!-->|<!--->|<!--.*?-->|</({HTML_TAG_NAME_PATTERN})\s*>|<({HTML_TAG_NAME_PATTERN}){HTML_TAG_ATTRIBUTES_PATTERN}\s*/?>"
+    );
+    Regex::new(&pattern).unwrap()
+});
+
+// Elements that paint content of their own without holding text: the replaced
+// elements (images, media, frames, canvases, embedded SVG and MathML) and the
+// form controls. An empty one is still visible, so it counts as a word of the
+// heading, as a Markdown image does.
+const SELF_RENDERING_ELEMENTS: &[&str] = &[
+    "img", "video", "audio", "iframe", "embed", "object", "canvas", "svg", "math", "input", "select", "textarea",
+    "button", "meter", "progress",
+];
+
+// Regex to match custom header IDs {#id}
+static CUSTOM_ID_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s*\{#[^}]+\}\s*$").unwrap());
+
+/// Represents a segment of heading text
+#[derive(Debug, Clone)]
+enum HeadingSegment {
+    /// Regular text that should be capitalized
+    Text(String),
+    /// Inline code that should be preserved as-is
+    Code(String),
+    /// Link with text that may be capitalized and URL that's preserved
+    Link {
+        full: String,
+        text_start: usize,
+        text_end: usize,
+    },
+    /// Inline HTML tag that should be preserved as-is
+    Html(String),
+    /// Image `![alt](url)` preserved as-is, including alt text. Unlike link
+    /// text, image alt text is not recased.
+    Image(String),
+}
+
+impl HeadingSegment {
+    /// Whether the segment shows a reader nothing: an empty element such as an
+    /// anchor, or a comment. Such a segment does not move the heading's first or
+    /// last word. An element that paints content of its own, such as an image or
+    /// a form control, is visible even without text.
+    fn renders_nothing(&self) -> bool {
+        match self {
+            HeadingSegment::Html(html) => {
+                let paints_something = HTML_TOKEN_REGEX.captures_iter(html).any(|token| {
+                    token.get(2).is_some_and(|name| {
+                        let name = name.as_str().to_ascii_lowercase();
+                        SELF_RENDERING_ELEMENTS.contains(&name.as_str())
+                    })
+                });
+                !paints_something && HTML_TOKEN_REGEX.replace_all(html, "").trim().is_empty()
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Rule MD063: Heading capitalization
+#[derive(Clone)]
+pub struct MD063HeadingCapitalization {
+    config: MD063Config,
+    lowercase_set: HashSet<String>,
+    /// Multi-word proper names from MD044 that must survive sentence-case transformation.
+    /// Populated via `from_config` when both rules are active.
+    proper_names: Vec<String>,
+}
+
+impl Default for MD063HeadingCapitalization {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MD063HeadingCapitalization {
+    pub fn new() -> Self {
+        let config = MD063Config::default();
+        let lowercase_set = config.lowercase_words.iter().cloned().collect();
+        Self {
+            config,
+            lowercase_set,
+            proper_names: Vec::new(),
+        }
+    }
+
+    pub fn from_config_struct(config: MD063Config) -> Self {
+        let lowercase_set = config.lowercase_words.iter().cloned().collect();
+        Self {
+            config,
+            lowercase_set,
+            proper_names: Vec::new(),
+        }
+    }
+
+    /// Match `pattern_lower` at `start` in `text` using Unicode-aware lowercasing.
+    /// Returns the end byte offset in `text` when the match succeeds.
+    ///
+    /// This avoids converting the full `text` to lowercase and then reusing those
+    /// offsets on the original string, which can panic for case-fold expansions
+    /// (e.g. `İ` -> `i̇`).
+    fn match_case_insensitive_at(text: &str, start: usize, pattern_lower: &str) -> Option<usize> {
+        if start > text.len() || !text.is_char_boundary(start) || pattern_lower.is_empty() {
+            return None;
+        }
+
+        let mut matched_bytes = 0;
+
+        for (offset, ch) in text[start..].char_indices() {
+            if matched_bytes >= pattern_lower.len() {
+                break;
+            }
+
+            let lowered: String = ch.to_lowercase().collect();
+            if !pattern_lower[matched_bytes..].starts_with(&lowered) {
+                return None;
+            }
+
+            matched_bytes += lowered.len();
+
+            if matched_bytes == pattern_lower.len() {
+                return Some(start + offset + ch.len_utf8());
+            }
+        }
+
+        None
+    }
+
+    /// Find the next case-insensitive match of `pattern_lower` in `text`,
+    /// returning byte offsets in the ORIGINAL string.
+    fn find_case_insensitive_match(text: &str, pattern_lower: &str, search_start: usize) -> Option<(usize, usize)> {
+        if pattern_lower.is_empty() || search_start >= text.len() || !text.is_char_boundary(search_start) {
+            return None;
+        }
+
+        for (offset, _) in text[search_start..].char_indices() {
+            let start = search_start + offset;
+            if let Some(end) = Self::match_case_insensitive_at(text, start, pattern_lower) {
+                return Some((start, end));
+            }
+        }
+
+        None
+    }
+
+    /// Build a map from word byte-position → canonical form for all proper names
+    /// that appear in the heading text (case-insensitive phrase match).
+    ///
+    /// This is used in `apply_sentence_case_from` so that words belonging to a proper
+    /// name phrase are never lowercased to begin with.
+    fn proper_name_canonical_forms(&self, text: &str) -> std::collections::HashMap<usize, &str> {
+        let mut map = std::collections::HashMap::new();
+
+        for name in &self.proper_names {
+            if name.is_empty() {
+                continue;
+            }
+            let name_lower = name.to_lowercase();
+            let canonical_words: Vec<&str> = name.split_whitespace().collect();
+            if canonical_words.is_empty() {
+                continue;
+            }
+            let mut search_start = 0;
+
+            while search_start < text.len() {
+                let Some((abs_pos, end_pos)) = Self::find_case_insensitive_match(text, &name_lower, search_start)
+                else {
+                    break;
+                };
+
+                // Require word boundaries
+                let before_ok = abs_pos == 0 || !text[..abs_pos].chars().last().is_some_and(char::is_alphanumeric);
+                let after_ok =
+                    end_pos >= text.len() || !text[end_pos..].chars().next().is_some_and(char::is_alphanumeric);
+
+                if before_ok && after_ok {
+                    // Map each word in the matched region to its canonical form.
+                    // We zip the words found in the text slice with the words of the
+                    // canonical name so that every word gets the right casing.
+                    let text_slice = &text[abs_pos..end_pos];
+                    let mut word_idx = 0;
+                    let mut slice_offset = 0;
+
+                    for text_word in text_slice.split_whitespace() {
+                        if let Some(w_rel) = text_slice[slice_offset..].find(text_word) {
+                            let word_abs = abs_pos + slice_offset + w_rel;
+                            if let Some(&canonical_word) = canonical_words.get(word_idx) {
+                                map.insert(word_abs, canonical_word);
+                            }
+                            slice_offset += w_rel + text_word.len();
+                            word_idx += 1;
+                        }
+                    }
+                }
+
+                // Advance by one Unicode scalar value to allow overlapping matches
+                // while staying on a UTF-8 char boundary.
+                search_start = abs_pos + text[abs_pos..].chars().next().map_or(1, char::len_utf8);
+            }
+        }
+
+        map
+    }
+
+    /// Check if a word has internal capitals (like "iPhone", "macOS", "GitHub", "iOS")
+    fn has_internal_capitals(&self, word: &str) -> bool {
+        let chars: Vec<char> = word.chars().collect();
+        if chars.len() < 2 {
+            return false;
+        }
+
+        let first = chars[0];
+        let rest = &chars[1..];
+        let has_upper_in_rest = rest.iter().any(|c| c.is_uppercase());
+        let has_lower_in_rest = rest.iter().any(|c| c.is_lowercase());
+
+        // Case 1: Mixed case after first character (like "iPhone", "macOS", "GitHub", "JavaScript")
+        if has_upper_in_rest && has_lower_in_rest {
+            return true;
+        }
+
+        // Case 2: Lowercase first + uppercase in rest (like "iOS", "eBay")
+        if first.is_lowercase() && has_upper_in_rest {
+            return true;
+        }
+
+        false
+    }
+
+    /// Check if a word is an all-caps acronym (2+ consecutive uppercase letters)
+    /// Examples: "API", "GPU", "HTTP2", "IO" return true
+    /// Examples: "A", "iPhone", "npm" return false
+    fn is_all_caps_acronym(&self, word: &str) -> bool {
+        // Skip single-letter words (handled by title case rules)
+        if word.len() < 2 {
+            return false;
+        }
+
+        let mut consecutive_upper = 0;
+        let mut max_consecutive = 0;
+
+        for c in word.chars() {
+            if c.is_uppercase() {
+                consecutive_upper += 1;
+                max_consecutive = max_consecutive.max(consecutive_upper);
+            } else if c.is_lowercase() {
+                // Any lowercase letter means not all-caps
+                return false;
+            } else {
+                // Non-letter (number, punctuation) - reset counter but don't fail
+                consecutive_upper = 0;
+            }
+        }
+
+        // Must have at least 2 consecutive uppercase letters
+        max_consecutive >= 2
+    }
+
+    /// Check if a word should be preserved as-is
+    fn should_preserve_word(&self, word: &str) -> bool {
+        // Check ignore_words list (case-sensitive exact match)
+        if self.is_ignored_word(word) {
+            return true;
+        }
+
+        // Numeric ordinals ("1st", "5th", "21st", ...) must always flow
+        // through the normal title-case path so mis-cased forms like
+        // "5Th" get normalised back to "5th". Skip the preserve_cased_words
+        // heuristics, which would otherwise treat "5Th" as intentionally
+        // mixed-case and leave it untouched.
+        let is_ordinal = Self::is_numeric_ordinal(word);
+
+        if !is_ordinal {
+            // Check if word has internal capitals and preserve_cased_words is enabled
+            if self.config.preserve_cased_words && self.has_internal_capitals(word) {
+                return true;
+            }
+
+            // Check if word is an all-caps acronym (2+ consecutive uppercase)
+            if self.config.preserve_cased_words && self.is_all_caps_acronym(word) {
+                return true;
+            }
+        }
+
+        // Preserve caret notation for control characters (^A, ^Z, ^@, etc.)
+        if self.is_caret_notation(word) {
+            return true;
+        }
+
+        false
+    }
+
+    fn is_ignored_word(&self, word: &str) -> bool {
+        self.config.ignore_words.iter().any(|ignored| ignored == word)
+    }
+
+    /// Detect numeric ordinals like `1st`, `2nd`, `3rd`, `4th`, `21st`,
+    /// `100th`, ignoring the case of the suffix and any punctuation wrapping
+    /// the token (e.g. `5th.`, `1st,`, `(2nd)`, `"3rd"`).
+    ///
+    /// Such tokens have a fixed lower-case alphabetic suffix in title case
+    /// — `21st Century`, never `21St Century` — and must be detected
+    /// before applying the generic "capitalise first letter" rule.
+    fn is_numeric_ordinal(word: &str) -> bool {
+        // The word arrives as a whitespace-split token, punctuation included, so
+        // both wrappers come off before the digits are read. Only the wrapping:
+        // an interior separator (`2-nd`) leaves a token that is not an ordinal,
+        // and a token with no alphanumeric core is rejected by the digit scan.
+        let core = word.trim_matches(|c: char| !c.is_alphanumeric());
+        let bytes = core.as_bytes();
+
+        // Require at least one leading ASCII digit followed by a letter.
+        let alpha_start = match bytes.iter().position(|&b| !b.is_ascii_digit()) {
+            Some(pos) if pos > 0 => pos,
+            _ => return false,
+        };
+
+        // Find where the alphabetic suffix ends (a possessive `'s`, and so on).
+        let alpha_end = bytes[alpha_start..]
+            .iter()
+            .position(|b| !b.is_ascii_alphabetic())
+            .map_or(bytes.len(), |p| alpha_start + p);
+
+        let suffix = &core[alpha_start..alpha_end];
+        matches!(suffix.to_ascii_lowercase().as_str(), "st" | "nd" | "rd" | "th")
+    }
+
+    /// Check if a word is caret notation for control characters (e.g., ^A, ^C, ^Z)
+    fn is_caret_notation(&self, word: &str) -> bool {
+        let chars: Vec<char> = word.chars().collect();
+        // Pattern: ^ followed by uppercase letter or @[\]^_
+        if chars.len() >= 2 && chars[0] == '^' {
+            let second = chars[1];
+            // Control characters: ^@ (NUL) through ^_ (US), which includes ^A-^Z
+            if second.is_ascii_uppercase() || "@[\\]^_".contains(second) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if a word is a "lowercase word" (articles, prepositions, etc.)
+    fn is_lowercase_word(&self, word: &str) -> bool {
+        self.lowercase_set.contains(&word.to_lowercase())
+    }
+
+    /// Apply title case to a single word
+    fn title_case_word(&self, word: &str, is_first: bool, is_last: bool) -> String {
+        if word.is_empty() {
+            return word.to_string();
+        }
+
+        // Preserve words in ignore list or with internal capitals
+        if self.should_preserve_word(word) {
+            return word.to_string();
+        }
+
+        // First and last words are always capitalized
+        if is_first || is_last {
+            return self.capitalize_first(word);
+        }
+
+        // Check if it's a lowercase word (articles, prepositions, etc.)
+        if self.is_lowercase_word(word) {
+            return Self::lowercase_preserving_composition(word);
+        }
+
+        // Regular word - capitalize first letter
+        self.capitalize_first(word)
+    }
+
+    /// Apply canonical proper-name casing while preserving any trailing punctuation
+    /// attached to the original whitespace token (e.g. `javascript,` -> `JavaScript,`).
+    fn apply_canonical_form_to_word(word: &str, canonical: &str) -> String {
+        let canonical_lower = canonical.to_lowercase();
+        if canonical_lower.is_empty() {
+            return canonical.to_string();
+        }
+
+        if let Some(end_pos) = Self::match_case_insensitive_at(word, 0, &canonical_lower) {
+            let mut out = String::with_capacity(canonical.len() + word.len().saturating_sub(end_pos));
+            out.push_str(canonical);
+            out.push_str(&word[end_pos..]);
+            out
+        } else {
+            canonical.to_string()
+        }
+    }
+
+    /// Capitalize the first letter of a word, handling Unicode properly
+    fn capitalize_first(&self, word: &str) -> String {
+        if word.is_empty() {
+            return String::new();
+        }
+
+        // Find the first alphabetic character to capitalize
+        let first_alpha_pos = word.find(|c: char| c.is_alphabetic());
+        let Some(pos) = first_alpha_pos else {
+            return word.to_string();
+        };
+
+        let prefix = &word[..pos];
+        let suffix = &word[pos..];
+
+        // Numeric ordinals ("1st", "21st", "5th", ...) keep their
+        // alphabetic suffix lower-cased even at title-case positions.
+        if Self::is_numeric_ordinal(word) {
+            let suffix_lower = Self::lowercase_preserving_composition(suffix);
+            return format!("{prefix}{suffix_lower}");
+        }
+
+        let mut chars = suffix.chars();
+        let first = chars.next().unwrap();
+        // Use composition-preserving uppercase to avoid decomposing
+        // precomposed characters (e.g., ῷ → Ω + combining marks + Ι)
+        let first_upper = Self::uppercase_preserving_composition(&first.to_string());
+        let rest: String = chars.collect();
+        let rest_lower = Self::lowercase_preserving_composition(&rest);
+        format!("{prefix}{first_upper}{rest_lower}")
+    }
+
+    /// Lowercase a string character-by-character, preserving precomposed
+    /// characters that would decompose during case conversion.
+    fn lowercase_preserving_composition(s: &str) -> String {
+        let mut result = String::with_capacity(s.len());
+        for c in s.chars() {
+            let lower: String = c.to_lowercase().collect();
+            if lower.chars().count() == 1 {
+                result.push_str(&lower);
+            } else {
+                // Lowercasing would decompose this character; keep original
+                result.push(c);
+            }
+        }
+        result
+    }
+
+    /// Return the sentence-case spelling of English first-person pronouns found
+    /// in `word`, when at least one uses its required uppercase `I`.
+    ///
+    /// Sentence case normally lowercases every mid-sentence token, but `I` is
+    /// uppercase wherever it appears. Recognize its standard contractions as
+    /// well, including a typographic apostrophe and adjacent punctuation or
+    /// Markdown emphasis. Only already-uppercase instances are recognized: a
+    /// lowercase `i` may intentionally be a variable and is outside MD063's
+    /// responsibility to reinterpret.
+    fn sentence_case_first_person_pronouns(word: &str) -> Option<String> {
+        fn is_emphasis_marker(c: char) -> bool {
+            matches!(c, '*' | '_' | '~')
+        }
+
+        // These characters commonly join identifiers or abbreviations. Treating
+        // them as word boundaries would misread technical forms such as `I/O`,
+        // `A.I.` or `I-am` as the pronoun.
+        fn is_word_connector(c: char) -> bool {
+            matches!(c, '/' | '\\' | '-' | '.' | '+' | '&')
+        }
+
+        fn is_word_boundary(c: char) -> bool {
+            !c.is_alphanumeric() && !is_word_connector(c)
+        }
+
+        fn is_pronoun_at(word: &str, pos: usize) -> bool {
+            let left = word[..pos].trim_end_matches(is_emphasis_marker);
+            if !left.chars().next_back().is_none_or(is_word_boundary) {
+                return false;
+            }
+
+            let after_i = word[pos + 1..].trim_start_matches(is_emphasis_marker);
+            let Some(apostrophe) = after_i.chars().next() else {
+                return true;
+            };
+            if !matches!(apostrophe, '\'' | '’') {
+                return is_word_boundary(apostrophe);
+            }
+
+            let after_apostrophe = after_i[apostrophe.len_utf8()..].trim_start_matches(is_emphasis_marker);
+            let suffix_end = after_apostrophe
+                .find(|c: char| !c.is_ascii_alphabetic())
+                .unwrap_or(after_apostrophe.len());
+            let suffix = &after_apostrophe[..suffix_end];
+            if suffix.is_empty() {
+                // A trailing apostrophe can be a closing quotation mark around `I`.
+                return after_apostrophe.chars().next().is_none_or(is_word_boundary);
+            }
+            if !matches!(suffix.to_ascii_lowercase().as_str(), "d" | "ll" | "m" | "ve") {
+                return false;
+            }
+
+            let after_suffix = after_apostrophe[suffix_end..].trim_start_matches(is_emphasis_marker);
+            after_suffix.chars().next().is_none_or(is_word_boundary)
+        }
+
+        let pronoun_positions: Vec<usize> = word
+            .char_indices()
+            .filter_map(|(pos, c)| (c == 'I' && is_pronoun_at(word, pos)).then_some(pos))
+            .collect();
+        if pronoun_positions.is_empty() {
+            return None;
+        }
+
+        let mut result = String::with_capacity(word.len());
+        let mut copied_through = 0;
+        for pos in pronoun_positions {
+            result.push_str(&Self::lowercase_preserving_composition(&word[copied_through..pos]));
+            result.push('I');
+            copied_through = pos + 1;
+        }
+        result.push_str(&Self::lowercase_preserving_composition(&word[copied_through..]));
+        Some(result)
+    }
+
+    /// Uppercase a string character-by-character, preserving precomposed
+    /// characters that would decompose during case conversion.
+    /// For example, ῷ (U+1FF7) would decompose into Ω + combining marks + Ι
+    /// via to_uppercase(); this function keeps ῷ unchanged instead.
+    fn uppercase_preserving_composition(s: &str) -> String {
+        let mut result = String::with_capacity(s.len());
+        for c in s.chars() {
+            let upper: String = c.to_uppercase().collect();
+            if upper.chars().count() == 1 {
+                result.push_str(&upper);
+            } else {
+                // Uppercasing would decompose this character; keep original
+                result.push(c);
+            }
+        }
+        result
+    }
+
+    /// Apply title case to text, using our own title-case logic.
+    /// We avoid the external titlecase crate because it decomposes
+    /// precomposed Unicode characters during case conversion.
+    fn apply_title_case(&self, text: &str) -> String {
+        let canonical_forms = self.proper_name_canonical_forms(text);
+
+        let original_words: Vec<&str> = text.split_whitespace().collect();
+        let total_words = original_words.len();
+
+        // Pre-compute byte position of each word for canonical form lookup.
+        // Use usize::MAX as sentinel for unfound words so canonical_forms.get() returns None.
+        let mut word_positions: Vec<usize> = Vec::with_capacity(original_words.len());
+        let mut pos = 0;
+        for word in &original_words {
+            if let Some(rel) = text[pos..].find(word) {
+                word_positions.push(pos + rel);
+                pos = pos + rel + word.len();
+            } else {
+                word_positions.push(usize::MAX);
+            }
+        }
+
+        let result_words: Vec<String> = original_words
+            .iter()
+            .enumerate()
+            .map(|(i, word)| {
+                let after_period = i > 0 && original_words[i - 1].ends_with('.');
+                let is_first = i == 0 || after_period;
+                let is_last = i == total_words - 1;
+
+                // Words that are part of an MD044 proper name use the canonical form directly.
+                if let Some(&canonical) = word_positions.get(i).and_then(|&p| canonical_forms.get(&p)) {
+                    return Self::apply_canonical_form_to_word(word, canonical);
+                }
+
+                // Preserve words in ignore list or with internal capitals
+                if self.should_preserve_word(word) {
+                    return (*word).to_string();
+                }
+
+                // Handle hyphenated words
+                if word.contains('-') {
+                    return self.handle_hyphenated_word(word, is_first, is_last);
+                }
+
+                self.title_case_word(word, is_first, is_last)
+            })
+            .collect();
+
+        result_words.join(" ")
+    }
+
+    /// Handle hyphenated words like "self-documenting"
+    fn handle_hyphenated_word(&self, word: &str, is_first: bool, is_last: bool) -> String {
+        let parts: Vec<&str> = word.split('-').collect();
+        let total_parts = parts.len();
+
+        let result_parts: Vec<String> = parts
+            .iter()
+            .enumerate()
+            .map(|(i, part)| {
+                // First part of first word and last part of last word get special treatment
+                let part_is_first = is_first && i == 0;
+                let part_is_last = is_last && i == total_parts - 1;
+                self.title_case_word(part, part_is_first, part_is_last)
+            })
+            .collect();
+
+        result_parts.join("-")
+    }
+
+    /// True when a word ends a sentence, so the next word is capitalized.
+    ///
+    /// The comparison is against the end of the whole word rather than a scan through
+    /// it, so `Overview: details` restarts and `a:b` does not. That keeps the boundary
+    /// where a reader sees one and leaves `https://example.com` alone.
+    fn ends_sentence(&self, word: &str) -> bool {
+        self.config
+            .sentence_case_restart_after
+            .iter()
+            .any(|boundary| !boundary.is_empty() && word.ends_with(boundary.as_str()))
+    }
+
+    /// Apply sentence case to text, capitalizing the leading word only when it opens
+    /// the heading. A segment that follows a code span or link continues the sentence
+    /// the earlier segment started, so it begins mid-sentence.
+    fn apply_sentence_case_from(&self, text: &str, starts_sentence: bool) -> String {
+        if text.is_empty() {
+            return text.to_string();
+        }
+
+        let canonical_forms = self.proper_name_canonical_forms(text);
+        let mut result = String::new();
+        let mut current_pos = 0;
+        let mut at_sentence_start = starts_sentence;
+
+        // Use original text positions to preserve whitespace correctly
+        for word in text.split_whitespace() {
+            if let Some(pos) = text[current_pos..].find(word) {
+                let abs_pos = current_pos + pos;
+
+                // Preserve whitespace before this word
+                result.push_str(&text[current_pos..abs_pos]);
+
+                // Words that are part of an MD044 proper name use the canonical form
+                // directly, bypassing sentence-case lowercasing entirely.
+                if let Some(&canonical) = canonical_forms.get(&abs_pos) {
+                    result.push_str(&Self::apply_canonical_form_to_word(word, canonical));
+                } else if self.is_ignored_word(word) {
+                    // Explicit ignore-words promise exact byte-for-byte preservation.
+                    result.push_str(word);
+                } else if let Some(pronoun) = Self::sentence_case_first_person_pronouns(word) {
+                    // The English pronoun `I` remains uppercase in every sentence
+                    // position; normalize only the contraction suffix.
+                    result.push_str(&pronoun);
+                } else if at_sentence_start {
+                    // Check if word should be preserved BEFORE any capitalization
+                    if self.should_preserve_word(word) {
+                        // Preserve ignore-words exactly as-is, even at start
+                        result.push_str(word);
+                    } else {
+                        // Sentence-initial word: capitalize first letter, lowercase rest
+                        let mut chars = word.chars();
+                        if let Some(first) = chars.next() {
+                            result.push_str(&Self::uppercase_preserving_composition(&first.to_string()));
+                            let rest: String = chars.collect();
+                            result.push_str(&Self::lowercase_preserving_composition(&rest));
+                        }
+                    }
+                } else {
+                    // Mid-sentence words: preserve if needed, otherwise lowercase
+                    if self.should_preserve_word(word) {
+                        result.push_str(word);
+                    } else {
+                        result.push_str(&Self::lowercase_preserving_composition(word));
+                    }
+                }
+
+                at_sentence_start = self.ends_sentence(word);
+                current_pos = abs_pos + word.len();
+            }
+        }
+
+        // Preserve any trailing whitespace
+        if current_pos < text.len() {
+            result.push_str(&text[current_pos..]);
+        }
+
+        result
+    }
+
+    /// Apply all caps to text (preserve whitespace)
+    fn apply_all_caps(&self, text: &str) -> String {
+        if text.is_empty() {
+            return text.to_string();
+        }
+
+        let canonical_forms = self.proper_name_canonical_forms(text);
+        let mut result = String::new();
+        let mut current_pos = 0;
+
+        // Use original text positions to preserve whitespace correctly
+        for word in text.split_whitespace() {
+            if let Some(pos) = text[current_pos..].find(word) {
+                let abs_pos = current_pos + pos;
+
+                // Preserve whitespace before this word
+                result.push_str(&text[current_pos..abs_pos]);
+
+                // Words that are part of an MD044 proper name use the canonical form directly.
+                // This prevents oscillation with MD044 when all-caps style is active.
+                if let Some(&canonical) = canonical_forms.get(&abs_pos) {
+                    result.push_str(&Self::apply_canonical_form_to_word(word, canonical));
+                } else if self.should_preserve_word(word) {
+                    result.push_str(word);
+                } else {
+                    result.push_str(&Self::uppercase_preserving_composition(word));
+                }
+
+                current_pos = abs_pos + word.len();
+            }
+        }
+
+        // Preserve any trailing whitespace
+        if current_pos < text.len() {
+            result.push_str(&text[current_pos..]);
+        }
+
+        result
+    }
+
+    /// Parse heading text into segments
+    fn parse_segments(&self, text: &str) -> Vec<HeadingSegment> {
+        let mut segments = Vec::new();
+        let mut last_end = 0;
+
+        // Collect all special regions (code and links)
+        let mut special_regions: Vec<(usize, usize, HeadingSegment)> = Vec::new();
+
+        // Find inline code spans
+        for mat in INLINE_CODE_REGEX.find_iter(text) {
+            special_regions.push((mat.start(), mat.end(), HeadingSegment::Code(mat.as_str().to_string())));
+        }
+
+        // Find links
+        for caps in LINK_REGEX.captures_iter(text) {
+            let full_match = caps.get(0).unwrap();
+
+            // A '!' immediately before the match makes this an image. Preserve
+            // the whole image (including the leading '!' and its alt text)
+            // rather than recasing the alt text as if it were link text.
+            if full_match.start() >= 1 && text.as_bytes()[full_match.start() - 1] == b'!' {
+                let region_start = full_match.start() - 1;
+                special_regions.push((
+                    region_start,
+                    full_match.end(),
+                    HeadingSegment::Image(text[region_start..full_match.end()].to_string()),
+                ));
+                continue;
+            }
+
+            let text_match = caps.get(1).or_else(|| caps.get(2));
+
+            if let Some(text_m) = text_match {
+                special_regions.push((
+                    full_match.start(),
+                    full_match.end(),
+                    HeadingSegment::Link {
+                        full: full_match.as_str().to_string(),
+                        text_start: text_m.start() - full_match.start(),
+                        text_end: text_m.end() - full_match.start(),
+                    },
+                ));
+            }
+        }
+
+        // Find inline HTML: a tag token is never prose, and neither is the content
+        // of an element closed on the same line. A tag inside a code span is code.
+        let code_ranges: Vec<(usize, usize)> = special_regions
+            .iter()
+            .filter(|(_, _, segment)| matches!(segment, HeadingSegment::Code(_)))
+            .map(|(start, end, _)| (*start, *end))
+            .collect();
+        for (start, end) in Self::html_regions(text, &code_ranges) {
+            special_regions.push((start, end, HeadingSegment::Html(text[start..end].to_string())));
+        }
+
+        // Sort by start position
+        special_regions.sort_by_key(|(start, _, _)| *start);
+
+        // Drop regions that overlap one already kept. After sorting by start
+        // position, the earliest-starting region wins a conflict.
+        let mut filtered_regions: Vec<(usize, usize, HeadingSegment)> = Vec::new();
+        for region in special_regions {
+            let overlaps = filtered_regions.iter().any(|(s, e, _)| region.0 < *e && region.1 > *s);
+            if !overlaps {
+                filtered_regions.push(region);
+            }
+        }
+
+        // Build segments
+        for (start, end, segment) in filtered_regions {
+            // Add text before this special region
+            if start > last_end {
+                let text_segment = &text[last_end..start];
+                if !text_segment.is_empty() {
+                    segments.push(HeadingSegment::Text(text_segment.to_string()));
+                }
+            }
+            segments.push(segment);
+            last_end = end;
+        }
+
+        // Add remaining text
+        if last_end < text.len() {
+            let remaining = &text[last_end..];
+            if !remaining.is_empty() {
+                segments.push(HeadingSegment::Text(remaining.to_string()));
+            }
+        }
+
+        // If no segments were found, treat the whole thing as text
+        if segments.is_empty() && !text.is_empty() {
+            segments.push(HeadingSegment::Text(text.to_string()));
+        }
+
+        segments
+    }
+
+    /// Byte ranges of `text` that are HTML and therefore never recased.
+    ///
+    /// Every tag token and comment is one region. When a closing tag pairs with
+    /// the nearest earlier open tag of the same name, the whole element becomes
+    /// one region, so `<b>bold <i>inner</i> more</b>` is preserved verbatim
+    /// while the prose after an unpaired tag (`<br>`) stays prose. A self-closing
+    /// token (`<span/>`) and a void element (`<br>`) hold no content, so neither
+    /// opens an element and a later closing tag of the same name belongs to the
+    /// enclosing one. A token that starts inside a code span is code, and one
+    /// whose `<` is backslash-escaped is text, so neither is markup; the scan
+    /// resumes just past its `<`, since that text may hold a real tag of its
+    /// own. Tokens are read one after another as a browser tokenizes them, so a
+    /// tag written inside another tag's attribute value is part of that value.
+    fn html_regions(text: &str, code_ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+        let mut regions: Vec<(usize, usize)> = Vec::new();
+        let mut open_elements: Vec<(String, usize)> = Vec::new();
+
+        let mut pos = 0;
+        while let Some(token) = HTML_TOKEN_REGEX.captures_at(text, pos) {
+            let whole = token.get(0).unwrap();
+            if code_ranges
+                .iter()
+                .any(|&(start, end)| start <= whole.start() && whole.start() < end)
+                || is_backslash_escaped(text, whole.start())
+            {
+                // The token is text, and text may hold a tag of its own past its `<`.
+                pos = whole.start() + 1;
+                continue;
+            }
+            pos = whole.end();
+
+            if let Some(closing) = token.get(1) {
+                let name = closing.as_str().to_ascii_lowercase();
+                if let Some(depth) = open_elements.iter().rposition(|(open_name, _)| *open_name == name) {
+                    let element_start = open_elements[depth].1;
+                    open_elements.truncate(depth);
+                    regions.retain(|&(start, _)| start < element_start);
+                    regions.push((element_start, whole.end()));
+                    continue;
+                }
+            } else if let Some(opening) = token.get(2) {
+                let name = opening.as_str().to_ascii_lowercase();
+                if !whole.as_str().ends_with("/>") && !is_void_element(&name) {
+                    open_elements.push((name, whole.start()));
+                }
+            }
+
+            regions.push((whole.start(), whole.end()));
+        }
+
+        regions
+    }
+
+    /// Apply capitalization to heading text
+    fn apply_capitalization(&self, text: &str, flavor: crate::config::MarkdownFlavor) -> String {
+        // Strip custom ID if present and re-add later
+        let (main_text, custom_id) = if let Some(mat) = CUSTOM_ID_REGEX.find(text) {
+            (&text[..mat.start()], Some(mat.as_str()))
+        } else {
+            (text, None)
+        };
+
+        // Markdown with Gherkin spells every structure as a `Keyword: name` heading, and
+        // a keyword names a structure only when spelled exactly, so recasing starts after
+        // the colon and the keyword is copied through verbatim. The split precedes segment
+        // parsing so the keyword keeps its own spacing and never counts as the heading's
+        // first or last word, and so a code span the split declines stays visible to the
+        // parser below instead of having its contents recased.
+        let (keyword, main_text) = if flavor == crate::config::MarkdownFlavor::MDG {
+            mdg::keyword_split(main_text).unwrap_or(("", main_text))
+        } else {
+            ("", main_text)
+        };
+
+        // Parse into segments
+        let segments = self.parse_segments(main_text);
+
+        // Count text segments to determine first/last word context
+        let text_segments: Vec<usize> = segments
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| matches!(s, HeadingSegment::Text(_)).then_some(i))
+            .collect();
+
+        // Sentence case starts with visible prose. A link label is prose too, even
+        // though its Markdown destination is kept opaque. Invisible HTML, such as
+        // an empty anchor or a comment, is looked past.
+        let first_segment_starts_sentence = segments
+            .iter()
+            .find(|s| !s.renders_nothing())
+            .is_some_and(|s| matches!(s, HeadingSegment::Text(_) | HeadingSegment::Link { .. }));
+
+        // If the last visible segment is Code or Link, then the last text segment should
+        // NOT treat its last word as the heading's last word (for lowercase-words respect)
+        let last_segment_is_text = segments
+            .iter()
+            .rev()
+            .find(|s| !s.renders_nothing())
+            .is_some_and(|s| matches!(s, HeadingSegment::Text(_)));
+
+        // Apply capitalization to each segment
+        let mut result_parts: Vec<String> = Vec::new();
+
+        // Where the heading's sentence currently stands, carried across segments so a
+        // boundary in one segment governs the next.
+        let mut at_sentence_start = first_segment_starts_sentence;
+
+        for (i, segment) in segments.iter().enumerate() {
+            // Whether this segment closes a sentence, which decides how the next one
+            // starts. Only prose can, and the prose of a heading is what this rule
+            // capitalizes: plain text and link text. Code, HTML and images are opaque,
+            // so a boundary inside them is not one a reader is offered.
+            at_sentence_start = match segment {
+                HeadingSegment::Text(t) => {
+                    let is_first_text = text_segments.first() == Some(&i);
+                    // A text segment is "last" only if it's the last text segment AND
+                    // the last segment overall is also text. If there's Code/Link after,
+                    // the last word should respect lowercase-words.
+                    let is_last_text = text_segments.last() == Some(&i) && last_segment_is_text;
+
+                    let capitalized = match self.config.style {
+                        HeadingCapStyle::TitleCase => self.apply_title_case_segment(t, is_first_text, is_last_text),
+                        HeadingCapStyle::SentenceCase => self.apply_sentence_case_from(t, at_sentence_start),
+                        HeadingCapStyle::AllCaps => self.apply_all_caps(t),
+                    };
+                    let ends_sentence = self.ends_sentence(capitalized.trim_end());
+                    result_parts.push(capitalized);
+                    ends_sentence
+                }
+                HeadingSegment::Code(c) => {
+                    result_parts.push(c.clone());
+                    false
+                }
+                HeadingSegment::Link {
+                    full,
+                    text_start,
+                    text_end,
+                } => {
+                    // Apply capitalization to link text only
+                    let link_text = &full[*text_start..*text_end];
+                    let capitalized_text = match self.config.style {
+                        HeadingCapStyle::TitleCase => self.apply_title_case(link_text),
+                        // For sentence case, apply same preservation logic as text
+                        // This preserves acronyms (API), brand names (iPhone), etc.
+                        HeadingCapStyle::SentenceCase => self.apply_sentence_case_from(link_text, at_sentence_start),
+                        HeadingCapStyle::AllCaps => self.apply_all_caps(link_text),
+                    };
+                    // The link's own text ends the sentence, not its destination: a reader
+                    // sees `[see:](url)` as `see:`, so the boundary is where they read it.
+                    let ends_sentence = self.ends_sentence(capitalized_text.trim_end());
+
+                    let mut new_link = String::new();
+                    new_link.push_str(&full[..*text_start]);
+                    new_link.push_str(&capitalized_text);
+                    new_link.push_str(&full[*text_end..]);
+                    result_parts.push(new_link);
+                    ends_sentence
+                }
+                HeadingSegment::Html(h) => {
+                    // Preserve HTML tags as-is (like code). Markup that renders
+                    // nothing is invisible to the reader, so the sentence stands
+                    // where it stood before it.
+                    result_parts.push(h.clone());
+                    segment.renders_nothing() && at_sentence_start
+                }
+                HeadingSegment::Image(img) => {
+                    // Preserve images as-is, including alt text.
+                    result_parts.push(img.clone());
+                    false
+                }
+            };
+        }
+
+        let mut result = String::with_capacity(text.len());
+        result.push_str(keyword);
+        result.push_str(&result_parts.join(""));
+
+        // Re-add custom ID if present
+        if let Some(id) = custom_id {
+            result.push_str(id);
+        }
+
+        result
+    }
+
+    /// Apply title case to a text segment with first/last awareness
+    fn apply_title_case_segment(&self, text: &str, is_first_segment: bool, is_last_segment: bool) -> String {
+        let canonical_forms = self.proper_name_canonical_forms(text);
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let total_words = words.len();
+
+        if total_words == 0 {
+            return text.to_string();
+        }
+
+        // Pre-compute byte position of each word so we can look up canonical forms.
+        // Use usize::MAX as sentinel for unfound words so canonical_forms.get() returns None.
+        let mut word_positions: Vec<usize> = Vec::with_capacity(words.len());
+        let mut pos = 0;
+        for word in &words {
+            if let Some(rel) = text[pos..].find(word) {
+                word_positions.push(pos + rel);
+                pos = pos + rel + word.len();
+            } else {
+                word_positions.push(usize::MAX);
+            }
+        }
+
+        let result_words: Vec<String> = words
+            .iter()
+            .enumerate()
+            .map(|(i, word)| {
+                let after_period = i > 0 && words[i - 1].ends_with('.');
+                let is_first = (is_first_segment && i == 0) || after_period;
+                let is_last = is_last_segment && i == total_words - 1;
+
+                // Words that are part of an MD044 proper name use the canonical form directly.
+                if let Some(&canonical) = word_positions.get(i).and_then(|&p| canonical_forms.get(&p)) {
+                    return Self::apply_canonical_form_to_word(word, canonical);
+                }
+
+                // Handle hyphenated words
+                if word.contains('-') {
+                    return self.handle_hyphenated_word(word, is_first, is_last);
+                }
+
+                self.title_case_word(word, is_first, is_last)
+            })
+            .collect();
+
+        // Preserve original spacing
+        let mut result = String::new();
+        let mut word_iter = result_words.iter();
+        let mut in_word = false;
+
+        for c in text.chars() {
+            if c.is_whitespace() {
+                if in_word {
+                    in_word = false;
+                }
+                result.push(c);
+            } else if !in_word {
+                if let Some(word) = word_iter.next() {
+                    result.push_str(word);
+                }
+                in_word = true;
+            }
+        }
+
+        result
+    }
+
+    /// Fix an ATX heading line
+    fn fix_atx_heading(
+        &self,
+        _line: &str,
+        heading: &crate::lint_context::HeadingInfo,
+        flavor: crate::config::MarkdownFlavor,
+    ) -> String {
+        // Parse the line to preserve structure
+        let indent = " ".repeat(heading.marker_column);
+        let hashes = "#".repeat(heading.level as usize);
+
+        // Apply capitalization to the text
+        let fixed_text = self.apply_capitalization(&heading.raw_text, flavor);
+
+        // Reconstruct with closing sequence if present
+        let closing = &heading.closing_sequence;
+        if heading.has_closing_sequence {
+            format!("{indent}{hashes} {fixed_text} {closing}")
+        } else {
+            format!("{indent}{hashes} {fixed_text}")
+        }
+    }
+
+    /// Fix a Setext heading line
+    fn fix_setext_heading(
+        &self,
+        line: &str,
+        heading: &crate::lint_context::HeadingInfo,
+        flavor: crate::config::MarkdownFlavor,
+    ) -> String {
+        // Apply capitalization to the text
+        let fixed_text = self.apply_capitalization(&heading.raw_text, flavor);
+
+        // Preserve leading whitespace from original line
+        let leading_ws: String = line.chars().take_while(|c| c.is_whitespace()).collect();
+
+        format!("{leading_ws}{fixed_text}")
+    }
+}
+
+impl Rule for MD063HeadingCapitalization {
+    fn name(&self) -> &'static str {
+        "MD063"
+    }
+
+    fn description(&self) -> &'static str {
+        "Heading capitalization"
+    }
+
+    fn category(&self) -> RuleCategory {
+        RuleCategory::Heading
+    }
+
+    fn should_skip(&self, ctx: &crate::lint_context::LintContext) -> bool {
+        !ctx.likely_has_headings() || !ctx.lines.iter().any(|line| line.heading.is_some())
+    }
+
+    fn check(&self, ctx: &crate::lint_context::LintContext) -> LintResult {
+        let content = ctx.content;
+
+        if content.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut warnings = Vec::new();
+
+        for (line_num, line_info) in ctx.lines.iter().enumerate() {
+            if let Some(heading) = &line_info.heading {
+                // Check level filter
+                if heading.level < self.config.min_level || heading.level > self.config.max_level {
+                    continue;
+                }
+
+                // Skip headings in code blocks (indented headings)
+                if line_info.visual_indent >= 4 && matches!(heading.style, crate::lint_context::HeadingStyle::ATX) {
+                    continue;
+                }
+
+                // Skip invalid headings (e.g., `#tag` which lacks required space after #)
+                if !heading.is_valid {
+                    continue;
+                }
+
+                // Apply capitalization and compare
+                let original_text = &heading.raw_text;
+                let fixed_text = self.apply_capitalization(original_text, ctx.flavor);
+
+                if original_text != &fixed_text {
+                    let line = line_info.content(ctx.content);
+                    let style_name = match self.config.style {
+                        HeadingCapStyle::TitleCase => "title case",
+                        HeadingCapStyle::SentenceCase => "sentence case",
+                        HeadingCapStyle::AllCaps => "ALL CAPS",
+                    };
+
+                    warnings.push(LintWarning {
+                        rule_name: Some(self.name().to_string()),
+                        line: line_num + 1,
+                        column: byte_to_char_count(line, heading.content_column),
+                        end_line: line_num + 1,
+                        end_column: byte_to_char_count(line, heading.content_column) + original_text.chars().count(),
+                        message: format!("Heading should use {style_name}: '{original_text}' -> '{fixed_text}'"),
+                        severity: Severity::Warning,
+                        fix: Some(Fix::new(
+                            ctx.line_content_byte_range(line_num + 1),
+                            match heading.style {
+                                crate::lint_context::HeadingStyle::ATX => {
+                                    self.fix_atx_heading(line, heading, ctx.flavor)
+                                }
+                                _ => self.fix_setext_heading(line, heading, ctx.flavor),
+                            },
+                        )),
+                    });
+                }
+            }
+        }
+
+        Ok(warnings)
+    }
+
+    fn fix(&self, ctx: &crate::lint_context::LintContext) -> Result<String, LintError> {
+        let content = ctx.content;
+
+        if content.is_empty() {
+            return Ok(content.to_string());
+        }
+
+        let lines = ctx.raw_lines();
+        let mut fixed_lines: Vec<String> = lines.iter().map(|&s| s.to_string()).collect();
+
+        for (line_num, line_info) in ctx.lines.iter().enumerate() {
+            // Skip lines where the rule is disabled via inline config
+            if ctx.is_rule_disabled(self.name(), line_num + 1) {
+                continue;
+            }
+
+            if let Some(heading) = &line_info.heading {
+                // Check level filter
+                if heading.level < self.config.min_level || heading.level > self.config.max_level {
+                    continue;
+                }
+
+                // Skip headings in code blocks
+                if line_info.visual_indent >= 4 && matches!(heading.style, crate::lint_context::HeadingStyle::ATX) {
+                    continue;
+                }
+
+                // Skip invalid headings (e.g., `#tag` which lacks required space after #)
+                if !heading.is_valid {
+                    continue;
+                }
+
+                let original_text = &heading.raw_text;
+                let fixed_text = self.apply_capitalization(original_text, ctx.flavor);
+
+                if original_text != &fixed_text {
+                    let line = line_info.content(ctx.content);
+                    fixed_lines[line_num] = match heading.style {
+                        crate::lint_context::HeadingStyle::ATX => self.fix_atx_heading(line, heading, ctx.flavor),
+                        _ => self.fix_setext_heading(line, heading, ctx.flavor),
+                    };
+                }
+            }
+        }
+
+        // Reconstruct content preserving line endings
+        let mut result = String::with_capacity(content.len());
+        for (i, line) in fixed_lines.iter().enumerate() {
+            result.push_str(line);
+            if i < fixed_lines.len() - 1 || content.ends_with('\n') {
+                result.push('\n');
+            }
+        }
+
+        Ok(result)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    crate::impl_rule_config_sections!(MD063Config);
+
+    fn from_config(config: &crate::config::Config) -> Box<dyn Rule>
+    where
+        Self: Sized,
+    {
+        let rule_config = crate::rule_config_serde::load_rule_config::<MD063Config>(config);
+        let md044_config =
+            crate::rule_config_serde::load_rule_config::<crate::rules::md044_proper_names::MD044Config>(config);
+        let mut rule = Self::from_config_struct(rule_config);
+        rule.proper_names = md044_config.names;
+        Box::new(rule)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lint_context::LintContext;
+
+    fn create_rule() -> MD063HeadingCapitalization {
+        let config = MD063Config {
+            enabled: true,
+            ..Default::default()
+        };
+        MD063HeadingCapitalization::from_config_struct(config)
+    }
+
+    fn create_rule_with_style(style: HeadingCapStyle) -> MD063HeadingCapitalization {
+        let config = MD063Config {
+            enabled: true,
+            style,
+            ..Default::default()
+        };
+        MD063HeadingCapitalization::from_config_struct(config)
+    }
+
+    // Title case tests
+    #[test]
+    fn test_an_escaped_tag_does_not_hide_the_element_written_inside_it() {
+        // `\<span` is text, so the `<a>` where its attribute value would be is a
+        // real element and only its bytes are HTML.
+        let text = r#"\<span title='<a id="x"></a>'>foo"#;
+        assert_eq!(MD063HeadingCapitalization::html_regions(text, &[]), vec![(14, 28)]);
+    }
+
+    #[test]
+    fn test_title_case_basic() {
+        let rule = create_rule();
+        let content = "# hello world\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].message.contains("Hello World"));
+    }
+
+    #[test]
+    fn test_title_case_lowercase_words() {
+        let rule = create_rule();
+        let content = "# the quick brown fox\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        // "The" should be capitalized (first word), "quick", "brown", "fox" should be capitalized
+        assert!(result[0].message.contains("The Quick Brown Fox"));
+    }
+
+    #[test]
+    fn test_title_case_already_correct() {
+        let rule = create_rule();
+        let content = "# The Quick Brown Fox\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty(), "Already correct heading should not be flagged");
+    }
+
+    #[test]
+    fn test_title_case_hyphenated() {
+        let rule = create_rule();
+        let content = "# self-documenting code\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].message.contains("Self-Documenting Code"));
+    }
+
+    #[test]
+    fn test_title_case_preserves_url_with_nested_parens() {
+        let rule = create_rule();
+        // The URL contains a parenthesised segment followed by more URL text.
+        let content = "# guide for [the api](https://example.com/docs/v(2)beta)\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        // The whole URL, including the lowercase "beta" after the nested
+        // parens, must be preserved exactly and never title-cased.
+        assert!(
+            fixed.contains("https://example.com/docs/v(2)beta"),
+            "URL with nested parens was corrupted: {fixed:?}"
+        );
+    }
+
+    #[test]
+    fn test_title_case_does_not_recase_image_alt() {
+        let rule = create_rule();
+        let content = "# overview ![a small icon](icon.png)\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        // Image (alt text and all) is preserved as-is; only prose is recased.
+        assert!(
+            fixed.contains("![a small icon](icon.png)"),
+            "image alt text was modified: {fixed:?}"
+        );
+        assert!(
+            fixed.contains("# Overview"),
+            "surrounding prose should still be title-cased: {fixed:?}"
+        );
+    }
+
+    // Sentence case tests
+    #[test]
+    fn test_sentence_case_basic() {
+        let rule = create_rule_with_style(HeadingCapStyle::SentenceCase);
+        let content = "# The Quick Brown Fox\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].message.contains("The quick brown fox"));
+    }
+
+    #[test]
+    fn test_sentence_case_already_correct() {
+        let rule = create_rule_with_style(HeadingCapStyle::SentenceCase);
+        let content = "# The quick brown fox\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_sentence_case_preserves_first_person_pronoun() {
+        // Regression test for issue #845.
+        let rule = create_rule_with_style(HeadingCapStyle::SentenceCase);
+        let content = "# How do I debug playbooks?\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+
+        assert!(rule.check(&ctx).unwrap().is_empty());
+        assert_eq!(rule.fix(&ctx).unwrap(), content);
+    }
+
+    #[test]
+    fn test_sentence_case_preserves_first_person_contractions() {
+        let rule = create_rule_with_style(HeadingCapStyle::SentenceCase);
+
+        for content in [
+            "# What I'd change\n",
+            "# Where I'll look\n",
+            "# Why I'm here\n",
+            "# What I've learned\n",
+            "# What I’d change\n",
+            "# Where I’ll look\n",
+            "# Why I’m here\n",
+            "# What I’ve learned\n",
+        ] {
+            let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+            assert!(rule.check(&ctx).unwrap().is_empty(), "{content:?}");
+            assert_eq!(rule.fix(&ctx).unwrap(), content);
+        }
+    }
+
+    #[test]
+    fn test_sentence_case_pronoun_handles_markup_punctuation_and_suffix_case() {
+        let rule = create_rule_with_style(HeadingCapStyle::SentenceCase);
+        let cases = [
+            ("# What (**I**) would change\n", "# What (**I**) would change\n"),
+            ("# Why **I**'M changing it\n", "# Why **I**'m changing it\n"),
+            ("# What I’LL change\n", "# What I’ll change\n"),
+            ("# What I—really want\n", "# What I—really want\n"),
+            ("# What I’d—reluctantly change\n", "# What I’d—reluctantly change\n"),
+            ("# What I—yes—I—would do\n", "# What I—yes—I—would do\n"),
+            ("# What [I'll change](plan.md)\n", "# What [I'll change](plan.md)\n"),
+            ("# [What I—really want](plan.md)\n", "# [What I—really want](plan.md)\n"),
+        ];
+
+        for (content, expected) in cases {
+            let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+            assert_eq!(rule.fix(&ctx).unwrap(), expected, "{content:?}");
+        }
+    }
+
+    #[test]
+    fn test_sentence_case_pronoun_is_independent_of_cased_word_preservation() {
+        let config = MD063Config {
+            enabled: true,
+            style: HeadingCapStyle::SentenceCase,
+            preserve_cased_words: false,
+            ..Default::default()
+        };
+        let rule = MD063HeadingCapitalization::from_config_struct(config);
+        let content = "# How do I debug what I’LL change?\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+
+        assert_eq!(rule.fix(&ctx).unwrap(), "# How do I debug what I’ll change?\n");
+    }
+
+    #[test]
+    fn test_sentence_case_explicit_ignore_wins_over_pronoun_normalization() {
+        let config = MD063Config {
+            enabled: true,
+            style: HeadingCapStyle::SentenceCase,
+            ignore_words: vec!["I'LL".to_string(), "I’LL".to_string()],
+            ..Default::default()
+        };
+        let rule = MD063HeadingCapitalization::from_config_struct(config);
+        let content = "# Why I'LL stay and why I’LL leave\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+
+        assert!(rule.check(&ctx).unwrap().is_empty());
+        assert_eq!(rule.fix(&ctx).unwrap(), content);
+    }
+
+    #[test]
+    fn test_sentence_case_pronoun_does_not_preserve_other_single_letters_or_compounds() {
+        let rule = create_rule_with_style(HeadingCapStyle::SentenceCase);
+        let content = "# Compare i, A, I/O, and A.I. values\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+
+        assert_eq!(rule.fix(&ctx).unwrap(), "# Compare i, a, i/o, and a.i. values\n");
+    }
+
+    // All caps tests
+    #[test]
+    fn test_all_caps_basic() {
+        let rule = create_rule_with_style(HeadingCapStyle::AllCaps);
+        let content = "# hello world\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].message.contains("HELLO WORLD"));
+    }
+
+    // Preserve tests
+    #[test]
+    fn test_preserve_ignore_words() {
+        let config = MD063Config {
+            enabled: true,
+            ignore_words: vec!["iPhone".to_string(), "macOS".to_string()],
+            ..Default::default()
+        };
+        let rule = MD063HeadingCapitalization::from_config_struct(config);
+
+        let content = "# using iPhone on macOS\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        // iPhone and macOS should be preserved
+        assert!(result[0].message.contains("iPhone"));
+        assert!(result[0].message.contains("macOS"));
+    }
+
+    #[test]
+    fn test_preserve_cased_words() {
+        let rule = create_rule();
+        let content = "# using GitHub actions\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        // GitHub should be preserved (has internal capital)
+        assert!(result[0].message.contains("GitHub"));
+    }
+
+    // Inline code tests
+    #[test]
+    fn test_inline_code_preserved() {
+        let rule = create_rule();
+        let content = "# using `const` in javascript\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        // `const` should be preserved, rest capitalized
+        assert!(result[0].message.contains("`const`"));
+        assert!(result[0].message.contains("Javascript") || result[0].message.contains("JavaScript"));
+    }
+
+    // Level filter tests
+    #[test]
+    fn test_level_filter() {
+        let config = MD063Config {
+            enabled: true,
+            min_level: 2,
+            max_level: 4,
+            ..Default::default()
+        };
+        let rule = MD063HeadingCapitalization::from_config_struct(config);
+
+        let content = "# h1 heading\n## h2 heading\n### h3 heading\n##### h5 heading\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+
+        // Only h2 and h3 should be flagged (h1 < min_level, h5 > max_level)
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].line, 2); // h2
+        assert_eq!(result[1].line, 3); // h3
+    }
+
+    // Fix tests
+    #[test]
+    fn test_fix_atx_heading() {
+        let rule = create_rule();
+        let content = "# hello world\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, "# Hello World\n");
+    }
+
+    #[test]
+    fn test_fix_multiple_headings() {
+        let rule = create_rule();
+        let content = "# first heading\n\n## second heading\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, "# First Heading\n\n## Second Heading\n");
+    }
+
+    // Setext heading tests
+    #[test]
+    fn test_setext_heading() {
+        let rule = create_rule();
+        let content = "hello world\n============\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].message.contains("Hello World"));
+    }
+
+    // Custom ID tests
+    #[test]
+    fn test_custom_id_preserved() {
+        let rule = create_rule();
+        let content = "# getting started {#intro}\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        // Custom ID should be preserved
+        assert!(result[0].message.contains("{#intro}"));
+    }
+
+    // Acronym preservation tests
+    #[test]
+    fn test_skip_obsidian_tags_not_headings() {
+        let rule = create_rule();
+
+        // #tag (no space after #) is an Obsidian tag, not a heading
+        let content = "# H1\n\n#tag\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Obsidian, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty() || result.iter().all(|w| w.line != 3),
+            "Obsidian tag #tag should not be treated as a heading: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_skip_invalid_atx_headings_no_space() {
+        let rule = create_rule();
+
+        // #NoSpace is not a valid ATX heading (requires space after #)
+        let content = "#notaheading\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Invalid ATX heading without space should not be flagged: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_fix_skips_obsidian_tags() {
+        let rule = create_rule();
+
+        let content = "# hello world\n\n#tag\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Obsidian, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        // Should fix the real heading but leave the tag alone
+        assert!(fixed.contains("#tag"), "Fix should not modify Obsidian tag #tag");
+        assert!(fixed.contains("# Hello World"), "Fix should still fix real headings");
+    }
+
+    #[test]
+    fn test_preserve_all_caps_acronyms() {
+        let rule = create_rule();
+        let ctx = |c| LintContext::new(c, crate::config::MarkdownFlavor::Standard, None);
+
+        // Basic acronyms should be preserved
+        let fixed = rule.fix(&ctx("# using API in production\n")).unwrap();
+        assert_eq!(fixed, "# Using API in Production\n");
+
+        // Multiple acronyms
+        let fixed = rule.fix(&ctx("# API and GPU integration\n")).unwrap();
+        assert_eq!(fixed, "# API and GPU Integration\n");
+
+        // Two-letter acronyms
+        let fixed = rule.fix(&ctx("# IO performance guide\n")).unwrap();
+        assert_eq!(fixed, "# IO Performance Guide\n");
+
+        // Acronyms with numbers
+        let fixed = rule.fix(&ctx("# HTTP2 and MD5 hashing\n")).unwrap();
+        assert_eq!(fixed, "# HTTP2 and MD5 Hashing\n");
+    }
+
+    #[test]
+    fn test_preserve_acronyms_in_hyphenated_words() {
+        let rule = create_rule();
+        let ctx = |c| LintContext::new(c, crate::config::MarkdownFlavor::Standard, None);
+
+        // Acronyms at start of hyphenated word
+        let fixed = rule.fix(&ctx("# API-driven architecture\n")).unwrap();
+        assert_eq!(fixed, "# API-Driven Architecture\n");
+
+        // Multiple acronyms with hyphens
+        let fixed = rule.fix(&ctx("# GPU-accelerated CPU-intensive tasks\n")).unwrap();
+        assert_eq!(fixed, "# GPU-Accelerated CPU-Intensive Tasks\n");
+    }
+
+    #[test]
+    fn test_single_letters_not_treated_as_acronyms() {
+        let rule = create_rule();
+        let ctx = |c| LintContext::new(c, crate::config::MarkdownFlavor::Standard, None);
+
+        // Single uppercase letters should follow title case rules, not be preserved
+        let fixed = rule.fix(&ctx("# i am a heading\n")).unwrap();
+        assert_eq!(fixed, "# I Am a Heading\n");
+    }
+
+    #[test]
+    fn test_lowercase_terms_need_ignore_words() {
+        let ctx = |c| LintContext::new(c, crate::config::MarkdownFlavor::Standard, None);
+
+        // Without ignore_words: npm gets capitalized
+        let rule = create_rule();
+        let fixed = rule.fix(&ctx("# using npm packages\n")).unwrap();
+        assert_eq!(fixed, "# Using Npm Packages\n");
+
+        // With ignore_words: npm preserved
+        let config = MD063Config {
+            enabled: true,
+            ignore_words: vec!["npm".to_string()],
+            ..Default::default()
+        };
+        let rule = MD063HeadingCapitalization::from_config_struct(config);
+        let fixed = rule.fix(&ctx("# using npm packages\n")).unwrap();
+        assert_eq!(fixed, "# Using npm Packages\n");
+    }
+
+    #[test]
+    fn test_acronyms_with_mixed_case_preserved() {
+        let rule = create_rule();
+        let ctx = |c| LintContext::new(c, crate::config::MarkdownFlavor::Standard, None);
+
+        // Both acronyms (API, GPU) and mixed-case (GitHub) should be preserved
+        let fixed = rule.fix(&ctx("# using API with GitHub\n")).unwrap();
+        assert_eq!(fixed, "# Using API with GitHub\n");
+    }
+
+    #[test]
+    fn test_real_world_acronyms() {
+        let rule = create_rule();
+        let ctx = |c| LintContext::new(c, crate::config::MarkdownFlavor::Standard, None);
+
+        // Common technical acronyms from tested repositories
+        let content = "# FFI bindings for CPU optimization\n";
+        let fixed = rule.fix(&ctx(content)).unwrap();
+        assert_eq!(fixed, "# FFI Bindings for CPU Optimization\n");
+
+        let content = "# DOM manipulation and SSR rendering\n";
+        let fixed = rule.fix(&ctx(content)).unwrap();
+        assert_eq!(fixed, "# DOM Manipulation and SSR Rendering\n");
+
+        let content = "# CVE security and RNN models\n";
+        let fixed = rule.fix(&ctx(content)).unwrap();
+        assert_eq!(fixed, "# CVE Security and RNN Models\n");
+    }
+
+    #[test]
+    fn test_is_all_caps_acronym() {
+        let rule = create_rule();
+
+        // Should return true for all-caps with 2+ letters
+        assert!(rule.is_all_caps_acronym("API"));
+        assert!(rule.is_all_caps_acronym("IO"));
+        assert!(rule.is_all_caps_acronym("GPU"));
+        assert!(rule.is_all_caps_acronym("HTTP2")); // Numbers don't break it
+
+        // Should return false for single letters
+        assert!(!rule.is_all_caps_acronym("A"));
+        assert!(!rule.is_all_caps_acronym("I"));
+
+        // Should return false for words with lowercase
+        assert!(!rule.is_all_caps_acronym("Api"));
+        assert!(!rule.is_all_caps_acronym("npm"));
+        assert!(!rule.is_all_caps_acronym("iPhone"));
+    }
+
+    #[test]
+    fn test_sentence_case_starts_after_a_leading_empty_anchor() {
+        // The anchor renders nothing, so the sentence still starts at `the`.
+        let config = MD063Config {
+            enabled: true,
+            style: HeadingCapStyle::SentenceCase,
+            ..Default::default()
+        };
+        let rule = MD063HeadingCapitalization::from_config_struct(config);
+
+        let content = "# <a id=\"top\"></a>the beginning\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        assert_eq!(rule.check(&ctx).unwrap().len(), 1);
+        assert_eq!(rule.fix(&ctx).unwrap(), "# <a id=\"top\"></a>The beginning\n");
+
+        // Visible HTML is an element of its own, so the prose after it is mid-sentence.
+        let content = "# <kbd>ctrl</kbd> the key\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        assert!(rule.check(&ctx).unwrap().is_empty());
+
+        // An image paints something without holding text, so it is visible too,
+        // whether written as HTML or as Markdown.
+        for content in ["# <img src=\"x.png\"> the picture\n", "# ![x](x.png) the picture\n"] {
+            let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+            assert!(rule.check(&ctx).unwrap().is_empty(), "{content:?}");
+        }
+    }
+
+    #[test]
+    fn test_sentence_case_ignore_words_first_word() {
+        let config = MD063Config {
+            enabled: true,
+            style: HeadingCapStyle::SentenceCase,
+            ignore_words: vec!["nvim".to_string()],
+            ..Default::default()
+        };
+        let rule = MD063HeadingCapitalization::from_config_struct(config);
+
+        // "nvim" as first word should be preserved exactly
+        let content = "# nvim config\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "nvim in ignore-words should not be flagged. Got: {result:?}"
+        );
+
+        // Verify fix also preserves it
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, "# nvim config\n");
+    }
+
+    #[test]
+    fn test_sentence_case_ignore_words_not_first() {
+        let config = MD063Config {
+            enabled: true,
+            style: HeadingCapStyle::SentenceCase,
+            ignore_words: vec!["nvim".to_string()],
+            ..Default::default()
+        };
+        let rule = MD063HeadingCapitalization::from_config_struct(config);
+
+        // "nvim" in middle should also be preserved
+        let content = "# Using nvim editor\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "nvim in ignore-words should be preserved. Got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_preserve_cased_words_ios() {
+        let config = MD063Config {
+            enabled: true,
+            style: HeadingCapStyle::SentenceCase,
+            preserve_cased_words: true,
+            ..Default::default()
+        };
+        let rule = MD063HeadingCapitalization::from_config_struct(config);
+
+        // "iOS" should be preserved (has mixed case: lowercase 'i' + uppercase 'OS')
+        let content = "## This is iOS\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "iOS should be preserved with preserve-cased-words. Got: {result:?}"
+        );
+
+        // Verify fix also preserves it
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, "## This is iOS\n");
+    }
+
+    #[test]
+    fn test_preserve_cased_words_ios_title_case() {
+        let config = MD063Config {
+            enabled: true,
+            style: HeadingCapStyle::TitleCase,
+            preserve_cased_words: true,
+            ..Default::default()
+        };
+        let rule = MD063HeadingCapitalization::from_config_struct(config);
+
+        // "iOS" should be preserved in title case too
+        let content = "# developing for iOS\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, "# Developing for iOS\n");
+    }
+
+    #[test]
+    fn test_has_internal_capitals_ios() {
+        let rule = create_rule();
+
+        // iOS should be detected as having internal capitals
+        assert!(
+            rule.has_internal_capitals("iOS"),
+            "iOS has mixed case (lowercase i, uppercase OS)"
+        );
+
+        // Other mixed-case words
+        assert!(rule.has_internal_capitals("iPhone"));
+        assert!(rule.has_internal_capitals("macOS"));
+        assert!(rule.has_internal_capitals("GitHub"));
+        assert!(rule.has_internal_capitals("JavaScript"));
+        assert!(rule.has_internal_capitals("eBay"));
+
+        // All-caps should NOT be detected (handled by is_all_caps_acronym)
+        assert!(!rule.has_internal_capitals("API"));
+        assert!(!rule.has_internal_capitals("GPU"));
+
+        // All-lowercase should NOT be detected
+        assert!(!rule.has_internal_capitals("npm"));
+        assert!(!rule.has_internal_capitals("config"));
+
+        // Regular capitalized words should NOT be detected
+        assert!(!rule.has_internal_capitals("The"));
+        assert!(!rule.has_internal_capitals("Hello"));
+    }
+
+    #[test]
+    fn test_lowercase_words_before_trailing_code() {
+        let config = MD063Config {
+            enabled: true,
+            style: HeadingCapStyle::TitleCase,
+            lowercase_words: vec![
+                "a".to_string(),
+                "an".to_string(),
+                "and".to_string(),
+                "at".to_string(),
+                "but".to_string(),
+                "by".to_string(),
+                "for".to_string(),
+                "from".to_string(),
+                "into".to_string(),
+                "nor".to_string(),
+                "on".to_string(),
+                "onto".to_string(),
+                "or".to_string(),
+                "the".to_string(),
+                "to".to_string(),
+                "upon".to_string(),
+                "via".to_string(),
+                "vs".to_string(),
+                "with".to_string(),
+                "without".to_string(),
+            ],
+            preserve_cased_words: true,
+            ..Default::default()
+        };
+        let rule = MD063HeadingCapitalization::from_config_struct(config);
+
+        // Test: "subtitle with a `app`" (all lowercase input)
+        // Expected fix: "Subtitle With a `app`" - capitalize "Subtitle" and "With",
+        // but keep "a" lowercase (it's in lowercase-words and not the last word)
+        // Incorrect: "Subtitle with A `app`" (would incorrectly capitalize "a")
+        let content = "## subtitle with a `app`\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+
+        // Should flag it
+        assert!(!result.is_empty(), "Should flag incorrect capitalization");
+        let fixed = rule.fix(&ctx).unwrap();
+        // "a" should remain lowercase (not "A") because inline code at end doesn't change lowercase-words behavior
+        assert!(
+            fixed.contains("with a `app`"),
+            "Expected 'with a `app`' but got: {fixed:?}"
+        );
+        assert!(
+            !fixed.contains("with A `app`"),
+            "Should not capitalize 'a' to 'A'. Got: {fixed:?}"
+        );
+        // "Subtitle" should be capitalized, "with" and "a" should remain lowercase (they're in lowercase-words)
+        assert!(
+            fixed.contains("Subtitle with a `app`"),
+            "Expected 'Subtitle with a `app`' but got: {fixed:?}"
+        );
+    }
+
+    #[test]
+    fn test_lowercase_words_preserved_before_trailing_code_variant() {
+        let config = MD063Config {
+            enabled: true,
+            style: HeadingCapStyle::TitleCase,
+            lowercase_words: vec!["a".to_string(), "the".to_string(), "with".to_string()],
+            ..Default::default()
+        };
+        let rule = MD063HeadingCapitalization::from_config_struct(config);
+
+        // Another variant: "Title with the `code`"
+        let content = "## Title with the `code`\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        // "the" should remain lowercase
+        assert!(
+            fixed.contains("with the `code`"),
+            "Expected 'with the `code`' but got: {fixed:?}"
+        );
+        assert!(
+            !fixed.contains("with The `code`"),
+            "Should not capitalize 'the' to 'The'. Got: {fixed:?}"
+        );
+    }
+
+    #[test]
+    fn test_last_word_capitalized_when_no_trailing_code() {
+        // Verify that when there's NO trailing code, the last word IS capitalized
+        // (even if it's in lowercase-words) - this is the normal title case behavior
+        let config = MD063Config {
+            enabled: true,
+            style: HeadingCapStyle::TitleCase,
+            lowercase_words: vec!["a".to_string(), "the".to_string()],
+            ..Default::default()
+        };
+        let rule = MD063HeadingCapitalization::from_config_struct(config);
+
+        // "title with a word" - "word" is last, should be capitalized
+        // "a" is in lowercase-words and not last, so should be lowercase
+        let content = "## title with a word\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        // "a" should be lowercase, "word" should be capitalized (it's last)
+        assert!(
+            fixed.contains("With a Word"),
+            "Expected 'With a Word' but got: {fixed:?}"
+        );
+    }
+
+    #[test]
+    fn test_multiple_lowercase_words_before_code() {
+        let config = MD063Config {
+            enabled: true,
+            style: HeadingCapStyle::TitleCase,
+            lowercase_words: vec![
+                "a".to_string(),
+                "the".to_string(),
+                "with".to_string(),
+                "for".to_string(),
+            ],
+            ..Default::default()
+        };
+        let rule = MD063HeadingCapitalization::from_config_struct(config);
+
+        // Multiple lowercase words before code - all should remain lowercase
+        let content = "## Guide for the `user`\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        assert!(
+            fixed.contains("for the `user`"),
+            "Expected 'for the `user`' but got: {fixed:?}"
+        );
+        assert!(
+            !fixed.contains("For The `user`"),
+            "Should not capitalize lowercase words before code. Got: {fixed:?}"
+        );
+    }
+
+    #[test]
+    fn test_code_in_middle_normal_rules_apply() {
+        let config = MD063Config {
+            enabled: true,
+            style: HeadingCapStyle::TitleCase,
+            lowercase_words: vec!["a".to_string(), "the".to_string(), "for".to_string()],
+            ..Default::default()
+        };
+        let rule = MD063HeadingCapitalization::from_config_struct(config);
+
+        // Code in the middle - normal title case rules apply (last word capitalized)
+        let content = "## Using `const` for the code\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        // "for" and "the" should be lowercase (middle), "code" should be capitalized (last)
+        assert!(
+            fixed.contains("for the Code"),
+            "Expected 'for the Code' but got: {fixed:?}"
+        );
+    }
+
+    #[test]
+    fn test_link_at_end_same_as_code() {
+        let config = MD063Config {
+            enabled: true,
+            style: HeadingCapStyle::TitleCase,
+            lowercase_words: vec!["a".to_string(), "the".to_string(), "for".to_string()],
+            ..Default::default()
+        };
+        let rule = MD063HeadingCapitalization::from_config_struct(config);
+
+        // Link at the end - same behavior as code (lowercase words before should remain lowercase)
+        let content = "## Guide for the [link](./page.md)\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        // "for" and "the" should remain lowercase (not last word because link follows)
+        assert!(
+            fixed.contains("for the [Link]"),
+            "Expected 'for the [Link]' but got: {fixed:?}"
+        );
+        assert!(
+            !fixed.contains("for The [Link]"),
+            "Should not capitalize 'the' before link. Got: {fixed:?}"
+        );
+    }
+
+    #[test]
+    fn test_multiple_code_segments() {
+        let config = MD063Config {
+            enabled: true,
+            style: HeadingCapStyle::TitleCase,
+            lowercase_words: vec!["a".to_string(), "the".to_string(), "with".to_string()],
+            ..Default::default()
+        };
+        let rule = MD063HeadingCapitalization::from_config_struct(config);
+
+        // Multiple code segments - last segment is code, so lowercase words before should remain lowercase
+        let content = "## Using `const` with a `variable`\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        // "a" should remain lowercase (not last word because code follows)
+        assert!(
+            fixed.contains("with a `variable`"),
+            "Expected 'with a `variable`' but got: {fixed:?}"
+        );
+        assert!(
+            !fixed.contains("with A `variable`"),
+            "Should not capitalize 'a' before trailing code. Got: {fixed:?}"
+        );
+    }
+
+    #[test]
+    fn test_code_and_link_combination() {
+        let config = MD063Config {
+            enabled: true,
+            style: HeadingCapStyle::TitleCase,
+            lowercase_words: vec!["a".to_string(), "the".to_string(), "for".to_string()],
+            ..Default::default()
+        };
+        let rule = MD063HeadingCapitalization::from_config_struct(config);
+
+        // Code then link - last segment is link, so lowercase words before code should remain lowercase
+        let content = "## Guide for the `code` [link](./page.md)\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        // "for" and "the" should remain lowercase (not last word because link follows)
+        assert!(
+            fixed.contains("for the `code`"),
+            "Expected 'for the `code`' but got: {fixed:?}"
+        );
+    }
+
+    #[test]
+    fn test_text_after_code_capitalizes_last() {
+        let config = MD063Config {
+            enabled: true,
+            style: HeadingCapStyle::TitleCase,
+            lowercase_words: vec!["a".to_string(), "the".to_string(), "for".to_string()],
+            ..Default::default()
+        };
+        let rule = MD063HeadingCapitalization::from_config_struct(config);
+
+        // Code in middle, text after - last word should be capitalized
+        let content = "## Using `const` for the code\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        // "for" and "the" should be lowercase, "code" is last word, should be capitalized
+        assert!(
+            fixed.contains("for the Code"),
+            "Expected 'for the Code' but got: {fixed:?}"
+        );
+    }
+
+    #[test]
+    fn test_preserve_cased_words_with_trailing_code() {
+        let config = MD063Config {
+            enabled: true,
+            style: HeadingCapStyle::TitleCase,
+            lowercase_words: vec!["a".to_string(), "the".to_string(), "for".to_string()],
+            preserve_cased_words: true,
+            ..Default::default()
+        };
+        let rule = MD063HeadingCapitalization::from_config_struct(config);
+
+        // Preserve-cased words should still work with trailing code
+        let content = "## Guide for iOS `app`\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        // "iOS" should be preserved, "for" should be lowercase
+        assert!(
+            fixed.contains("for iOS `app`"),
+            "Expected 'for iOS `app`' but got: {fixed:?}"
+        );
+        assert!(
+            !fixed.contains("For iOS `app`"),
+            "Should not capitalize 'for' before trailing code. Got: {fixed:?}"
+        );
+    }
+
+    #[test]
+    fn test_ignore_words_with_trailing_code() {
+        let config = MD063Config {
+            enabled: true,
+            style: HeadingCapStyle::TitleCase,
+            lowercase_words: vec!["a".to_string(), "the".to_string(), "with".to_string()],
+            ignore_words: vec!["npm".to_string()],
+            ..Default::default()
+        };
+        let rule = MD063HeadingCapitalization::from_config_struct(config);
+
+        // Ignore-words should still work with trailing code
+        let content = "## Using npm with a `script`\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        // "npm" should be preserved, "with" and "a" should be lowercase
+        assert!(
+            fixed.contains("npm with a `script`"),
+            "Expected 'npm with a `script`' but got: {fixed:?}"
+        );
+        assert!(
+            !fixed.contains("with A `script`"),
+            "Should not capitalize 'a' before trailing code. Got: {fixed:?}"
+        );
+    }
+
+    #[test]
+    fn test_empty_text_segment_edge_case() {
+        let config = MD063Config {
+            enabled: true,
+            style: HeadingCapStyle::TitleCase,
+            lowercase_words: vec!["a".to_string(), "with".to_string()],
+            ..Default::default()
+        };
+        let rule = MD063HeadingCapitalization::from_config_struct(config);
+
+        // Edge case: code at start, then text with lowercase word, then code at end
+        let content = "## `start` with a `end`\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        // "with" is first word in text segment, so capitalized (correct)
+        // "a" should remain lowercase (not last word because code follows) - this is the key test
+        assert!(fixed.contains("a `end`"), "Expected 'a `end`' but got: {fixed:?}");
+        assert!(
+            !fixed.contains("A `end`"),
+            "Should not capitalize 'a' before trailing code. Got: {fixed:?}"
+        );
+    }
+
+    #[test]
+    fn test_sentence_case_with_trailing_code() {
+        let config = MD063Config {
+            enabled: true,
+            style: HeadingCapStyle::SentenceCase,
+            lowercase_words: vec!["a".to_string(), "the".to_string()],
+            ..Default::default()
+        };
+        let rule = MD063HeadingCapitalization::from_config_struct(config);
+
+        // Sentence case should also respect lowercase words before code
+        let content = "## guide for the `user`\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        // First word capitalized, rest lowercase including "the" before code
+        assert!(
+            fixed.contains("Guide for the `user`"),
+            "Expected 'Guide for the `user`' but got: {fixed:?}"
+        );
+    }
+
+    #[test]
+    fn test_hyphenated_word_before_code() {
+        let config = MD063Config {
+            enabled: true,
+            style: HeadingCapStyle::TitleCase,
+            lowercase_words: vec!["a".to_string(), "the".to_string(), "with".to_string()],
+            ..Default::default()
+        };
+        let rule = MD063HeadingCapitalization::from_config_struct(config);
+
+        // Hyphenated word before code - last part should respect lowercase-words
+        let content = "## Self-contained with a `feature`\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        // "with" and "a" should remain lowercase (not last word because code follows)
+        assert!(
+            fixed.contains("with a `feature`"),
+            "Expected 'with a `feature`' but got: {fixed:?}"
+        );
+    }
+
+    // Issue #228: Sentence case with inline code at heading start
+    // When a heading starts with inline code, the first word after the code
+    // should NOT be capitalized because the heading already has a "first element"
+
+    #[test]
+    fn test_sentence_case_code_at_start_basic() {
+        // The exact case from issue #228
+        let rule = create_rule_with_style(HeadingCapStyle::SentenceCase);
+        let content = "# `rumdl` is a linter\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        // Should be correct as-is: code is first, "is" stays lowercase
+        assert!(
+            result.is_empty(),
+            "Heading with code at start should not flag 'is' for capitalization. Got: {:?}",
+            result.iter().map(|w| &w.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_sentence_case_code_at_start_incorrect_capitalization() {
+        // Verify we detect incorrect capitalization after code at start
+        let rule = create_rule_with_style(HeadingCapStyle::SentenceCase);
+        let content = "# `rumdl` Is a Linter\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        // Should flag: "Is" and "Linter" should be lowercase
+        assert_eq!(result.len(), 1, "Should detect incorrect capitalization");
+        assert!(
+            result[0].message.contains("`rumdl` is a linter"),
+            "Should suggest lowercase after code. Got: {:?}",
+            result[0].message
+        );
+    }
+
+    #[test]
+    fn test_sentence_case_code_at_start_fix() {
+        let rule = create_rule_with_style(HeadingCapStyle::SentenceCase);
+        let content = "# `rumdl` Is A Linter\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        assert!(
+            fixed.contains("# `rumdl` is a linter"),
+            "Should fix to lowercase after code. Got: {fixed:?}"
+        );
+    }
+
+    #[test]
+    fn test_sentence_case_text_at_start_still_capitalizes() {
+        // Ensure normal headings still capitalize first word
+        let rule = create_rule_with_style(HeadingCapStyle::SentenceCase);
+        let content = "# the quick brown fox\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(
+            result[0].message.contains("The quick brown fox"),
+            "Text-first heading should capitalize first word. Got: {:?}",
+            result[0].message
+        );
+    }
+
+    #[test]
+    fn test_sentence_case_link_at_start() {
+        // Link labels are visible prose, so an opening label starts the sentence.
+        let rule = create_rule_with_style(HeadingCapStyle::SentenceCase);
+        let content = "# [api](api.md) reference guide\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].message.contains("[Api](api.md) reference guide"));
+    }
+
+    #[test]
+    fn test_sentence_case_link_preserves_acronyms() {
+        // Acronyms in link text should be preserved (API, HTTP, etc.)
+        let rule = create_rule_with_style(HeadingCapStyle::SentenceCase);
+        let content = "# [API](api.md) Reference Guide\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        // "API" should be preserved (acronym), "Reference Guide" should be lowercased
+        assert!(
+            result[0].message.contains("[API](api.md) reference guide"),
+            "Should preserve acronym 'API' but lowercase following text. Got: {:?}",
+            result[0].message
+        );
+    }
+
+    #[test]
+    fn test_sentence_case_link_preserves_brand_names() {
+        // Brand names with internal capitals should be preserved
+        let config = MD063Config {
+            enabled: true,
+            style: HeadingCapStyle::SentenceCase,
+            preserve_cased_words: true,
+            ..Default::default()
+        };
+        let rule = MD063HeadingCapitalization::from_config_struct(config);
+        let content = "# [iPhone](iphone.md) Features Guide\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        // "iPhone" should be preserved, "Features Guide" should be lowercased
+        assert!(
+            result[0].message.contains("[iPhone](iphone.md) features guide"),
+            "Should preserve 'iPhone' but lowercase following text. Got: {:?}",
+            result[0].message
+        );
+    }
+
+    #[test]
+    fn test_sentence_case_link_lowercases_regular_words() {
+        // The first link word is capitalized and later words are lowercased.
+        let rule = create_rule_with_style(HeadingCapStyle::SentenceCase);
+        let content = "# [Documentation](docs.md) Reference\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(
+            result[0].message.contains("[Documentation](docs.md) reference"),
+            "Should preserve the sentence-initial capital. Got: {:?}",
+            result[0].message
+        );
+    }
+
+    #[test]
+    fn test_sentence_case_opening_link_label_is_sentence_initial() {
+        // Regression test for issue #844.
+        let rule = create_rule_with_style(HeadingCapStyle::SentenceCase);
+        let content = "# [Foo bar](https://example.com)\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+
+        assert!(rule.check(&ctx).unwrap().is_empty());
+        assert_eq!(rule.fix(&ctx).unwrap(), content);
+    }
+
+    #[test]
+    fn test_sentence_case_link_at_start_correct_already() {
+        // Link with correct casing should not be flagged
+        let rule = create_rule_with_style(HeadingCapStyle::SentenceCase);
+        let content = "# [API](api.md) reference guide\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Correctly cased heading with link should not be flagged. Got: {:?}",
+            result.iter().map(|w| &w.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_sentence_case_link_github_preserved() {
+        // GitHub should be preserved (internal capitals)
+        let config = MD063Config {
+            enabled: true,
+            style: HeadingCapStyle::SentenceCase,
+            preserve_cased_words: true,
+            ..Default::default()
+        };
+        let rule = MD063HeadingCapitalization::from_config_struct(config);
+        let content = "# [GitHub](gh.md) Repository Setup\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(
+            result[0].message.contains("[GitHub](gh.md) repository setup"),
+            "Should preserve 'GitHub'. Got: {:?}",
+            result[0].message
+        );
+    }
+
+    #[test]
+    fn test_sentence_case_multiple_code_spans() {
+        let rule = create_rule_with_style(HeadingCapStyle::SentenceCase);
+        let content = "# `foo` and `bar` are methods\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        // All text after first code should be lowercase
+        assert!(
+            result.is_empty(),
+            "Should not capitalize words between/after code spans. Got: {:?}",
+            result.iter().map(|w| &w.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_sentence_case_code_only_heading() {
+        // Heading with only code, no text
+        let rule = create_rule_with_style(HeadingCapStyle::SentenceCase);
+        let content = "# `rumdl`\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Code-only heading should be fine. Got: {:?}",
+            result.iter().map(|w| &w.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_sentence_case_code_at_end() {
+        // Heading ending with code, text before should still capitalize first word
+        let rule = create_rule_with_style(HeadingCapStyle::SentenceCase);
+        let content = "# install the `rumdl` tool\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        // "install" should be capitalized (first word), rest lowercase
+        assert_eq!(result.len(), 1);
+        assert!(
+            result[0].message.contains("Install the `rumdl` tool"),
+            "First word should still be capitalized when text comes first. Got: {:?}",
+            result[0].message
+        );
+    }
+
+    #[test]
+    fn test_sentence_case_code_in_middle() {
+        // Code in middle, text at start should capitalize first word
+        let rule = create_rule_with_style(HeadingCapStyle::SentenceCase);
+        let content = "# using the `rumdl` linter for markdown\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        // "using" should be capitalized, rest lowercase
+        assert_eq!(result.len(), 1);
+        assert!(
+            result[0].message.contains("Using the `rumdl` linter for markdown"),
+            "First word should be capitalized. Got: {:?}",
+            result[0].message
+        );
+    }
+
+    #[test]
+    fn test_sentence_case_preserved_word_after_code() {
+        // Preserved words (like iPhone) should stay preserved even after code
+        let config = MD063Config {
+            enabled: true,
+            style: HeadingCapStyle::SentenceCase,
+            preserve_cased_words: true,
+            ..Default::default()
+        };
+        let rule = MD063HeadingCapitalization::from_config_struct(config);
+        let content = "# `swift` iPhone development\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        // "iPhone" should be preserved, "development" lowercase
+        assert!(
+            result.is_empty(),
+            "Preserved words after code should stay. Got: {:?}",
+            result.iter().map(|w| &w.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_title_case_code_at_start_still_capitalizes() {
+        // Title case should still capitalize words even after code at start
+        let rule = create_rule_with_style(HeadingCapStyle::TitleCase);
+        let content = "# `api` quick start guide\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        // Title case: all major words capitalized
+        assert_eq!(result.len(), 1);
+        assert!(
+            result[0].message.contains("Quick Start Guide") || result[0].message.contains("quick Start Guide"),
+            "Title case should capitalize major words after code. Got: {:?}",
+            result[0].message
+        );
+    }
+
+    // ======== HTML TAG TESTS ========
+
+    #[test]
+    fn test_sentence_case_html_tag_at_start() {
+        // HTML tag at start: text after should NOT capitalize first word
+        let rule = create_rule_with_style(HeadingCapStyle::SentenceCase);
+        let content = "# <kbd>Ctrl</kbd> is a Modifier Key\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        // "is", "a", "Modifier", "Key" should all be lowercase (except preserved words)
+        assert_eq!(result.len(), 1);
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(
+            fixed, "# <kbd>Ctrl</kbd> is a modifier key\n",
+            "Text after HTML at start should be lowercase"
+        );
+    }
+
+    #[test]
+    fn test_sentence_case_html_tag_preserves_content() {
+        // Content inside HTML tags should be preserved as-is
+        let rule = create_rule_with_style(HeadingCapStyle::SentenceCase);
+        let content = "# The <abbr>API</abbr> documentation guide\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        // "The" is first, "API" inside tag preserved, rest lowercase
+        assert!(
+            result.is_empty(),
+            "HTML tag content should be preserved. Got: {:?}",
+            result.iter().map(|w| &w.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_sentence_case_html_tag_at_start_with_acronym() {
+        // HTML tag at start with acronym content
+        let rule = create_rule_with_style(HeadingCapStyle::SentenceCase);
+        let content = "# <abbr>API</abbr> Documentation Guide\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(
+            fixed, "# <abbr>API</abbr> documentation guide\n",
+            "Text after HTML at start should be lowercase, HTML content preserved"
+        );
+    }
+
+    #[test]
+    fn test_sentence_case_html_tag_in_middle() {
+        // HTML tag in middle: first word still capitalized
+        let rule = create_rule_with_style(HeadingCapStyle::SentenceCase);
+        let content = "# using the <code>config</code> File\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(
+            fixed, "# Using the <code>config</code> file\n",
+            "First word capitalized, HTML preserved, rest lowercase"
+        );
+    }
+
+    #[test]
+    fn test_html_tag_strong_emphasis() {
+        // <strong> tag handling
+        let rule = create_rule_with_style(HeadingCapStyle::SentenceCase);
+        let content = "# The <strong>Bold</strong> Way\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(
+            fixed, "# The <strong>Bold</strong> way\n",
+            "<strong> tag content should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_html_tag_with_attributes() {
+        // HTML tags with attributes should still be detected
+        let rule = create_rule_with_style(HeadingCapStyle::SentenceCase);
+        let content = "# <span class=\"highlight\">Important</span> Notice Here\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(
+            fixed, "# <span class=\"highlight\">Important</span> notice here\n",
+            "HTML tag with attributes should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_multiple_html_tags() {
+        // Multiple HTML tags in heading
+        let rule = create_rule_with_style(HeadingCapStyle::SentenceCase);
+        let content = "# <kbd>Ctrl</kbd>+<kbd>C</kbd> to Copy Text\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(
+            fixed, "# <kbd>Ctrl</kbd>+<kbd>C</kbd> to copy text\n",
+            "Multiple HTML tags should all be preserved"
+        );
+    }
+
+    #[test]
+    fn test_html_and_code_mixed() {
+        // Mix of HTML tags and inline code
+        let rule = create_rule_with_style(HeadingCapStyle::SentenceCase);
+        let content = "# <kbd>Ctrl</kbd>+`v` Paste command\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(
+            fixed, "# <kbd>Ctrl</kbd>+`v` paste command\n",
+            "HTML and code should both be preserved"
+        );
+    }
+
+    #[test]
+    fn test_self_closing_html_tag() {
+        // Self-closing tags like <br/>
+        let rule = create_rule_with_style(HeadingCapStyle::SentenceCase);
+        let content = "# Line one<br/>Line Two Here\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(
+            fixed, "# Line one<br/>line two here\n",
+            "Self-closing HTML tags should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_title_case_with_html_tags() {
+        // Title case with HTML tags
+        let rule = create_rule_with_style(HeadingCapStyle::TitleCase);
+        let content = "# the <kbd>ctrl</kbd> key is a modifier\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        let fixed = rule.fix(&ctx).unwrap();
+        // "the" as first word should be "The", content inside <kbd> preserved
+        assert!(
+            fixed.contains("<kbd>ctrl</kbd>"),
+            "HTML tag content should be preserved in title case. Got: {fixed}"
+        );
+        assert!(
+            fixed.starts_with("# The ") || fixed.starts_with("# the "),
+            "Title case should work with HTML. Got: {fixed}"
+        );
+    }
+
+    // ======== CARET NOTATION TESTS ========
+
+    #[test]
+    fn test_sentence_case_preserves_caret_notation() {
+        // Caret notation for control characters should be preserved
+        let rule = create_rule_with_style(HeadingCapStyle::SentenceCase);
+        let content = "## Ctrl+A, Ctrl+R output ^A, ^R on zsh\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        // Should not flag - ^A and ^R are preserved
+        assert!(
+            result.is_empty(),
+            "Caret notation should be preserved. Got: {:?}",
+            result.iter().map(|w| &w.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_sentence_case_caret_notation_various() {
+        // Various caret notation patterns
+        let rule = create_rule_with_style(HeadingCapStyle::SentenceCase);
+
+        // ^C for interrupt
+        let content = "## Press ^C to cancel\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "^C should be preserved. Got: {:?}",
+            result.iter().map(|w| &w.message).collect::<Vec<_>>()
+        );
+
+        // ^Z for suspend
+        let content = "## Use ^Z for background\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "^Z should be preserved. Got: {:?}",
+            result.iter().map(|w| &w.message).collect::<Vec<_>>()
+        );
+
+        // ^[ for escape
+        let content = "## Press ^[ for escape\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "^[ should be preserved. Got: {:?}",
+            result.iter().map(|w| &w.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_caret_notation_detection() {
+        let rule = create_rule();
+
+        // Valid caret notation
+        assert!(rule.is_caret_notation("^A"));
+        assert!(rule.is_caret_notation("^Z"));
+        assert!(rule.is_caret_notation("^C"));
+        assert!(rule.is_caret_notation("^@")); // NUL
+        assert!(rule.is_caret_notation("^[")); // ESC
+        assert!(rule.is_caret_notation("^]")); // GS
+        assert!(rule.is_caret_notation("^^")); // RS
+        assert!(rule.is_caret_notation("^_")); // US
+
+        // Not caret notation
+        assert!(!rule.is_caret_notation("^a")); // lowercase
+        assert!(!rule.is_caret_notation("A")); // no caret
+        assert!(!rule.is_caret_notation("^")); // caret alone
+        assert!(!rule.is_caret_notation("^1")); // digit
+    }
+
+    // MD044 proper names integration tests
+    //
+    // When MD063 (sentence case) and MD044 (proper names) are both active, MD063 must
+    // preserve the exact capitalization of MD044 proper names rather than lowercasing them.
+    // Without this, the two rules oscillate: MD044 re-capitalizes what MD063 lowercases.
+
+    fn create_sentence_case_rule_with_proper_names(names: Vec<String>) -> MD063HeadingCapitalization {
+        let config = MD063Config {
+            enabled: true,
+            style: HeadingCapStyle::SentenceCase,
+            ..Default::default()
+        };
+        let mut rule = MD063HeadingCapitalization::from_config_struct(config);
+        rule.proper_names = names;
+        rule
+    }
+
+    #[test]
+    fn test_sentence_case_preserves_single_word_proper_name() {
+        let rule = create_sentence_case_rule_with_proper_names(vec!["JavaScript".to_string()]);
+        // "javascript" in non-first position should become "JavaScript", not "javascript"
+        let content = "# installing javascript\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1, "Should flag the heading");
+        let fix_text = result[0].fix.as_ref().unwrap().replacement.as_str();
+        assert!(
+            fix_text.contains("JavaScript"),
+            "Fix should preserve proper name 'JavaScript', got: {fix_text:?}"
+        );
+        assert!(
+            !fix_text.contains("javascript"),
+            "Fix should not have lowercase 'javascript', got: {fix_text:?}"
+        );
+    }
+
+    #[test]
+    fn test_sentence_case_preserves_multi_word_proper_name() {
+        let rule = create_sentence_case_rule_with_proper_names(vec!["Good Application".to_string()]);
+        // "Good Application" is a proper name; sentence case must not lowercase "Application"
+        let content = "# using good application features\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1, "Should flag the heading");
+        let fix_text = result[0].fix.as_ref().unwrap().replacement.as_str();
+        assert!(
+            fix_text.contains("Good Application"),
+            "Fix should preserve 'Good Application' as a phrase, got: {fix_text:?}"
+        );
+    }
+
+    #[test]
+    fn test_sentence_case_proper_name_at_start_of_heading() {
+        let rule = create_sentence_case_rule_with_proper_names(vec!["Good Application".to_string()]);
+        // The proper name "Good Application" starts the heading; both words must be canonical
+        let content = "# good application overview\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1, "Should flag the heading");
+        let fix_text = result[0].fix.as_ref().unwrap().replacement.as_str();
+        assert!(
+            fix_text.contains("Good Application"),
+            "Fix should produce 'Good Application' at start of heading, got: {fix_text:?}"
+        );
+        assert!(
+            fix_text.contains("overview"),
+            "Non-proper-name word 'overview' should be lowercase, got: {fix_text:?}"
+        );
+    }
+
+    #[test]
+    fn test_sentence_case_with_proper_names_no_oscillation() {
+        // This is the core convergence test: applying the fix once must produce
+        // output that is already correct (no further changes needed).
+        let rule = create_sentence_case_rule_with_proper_names(vec!["Good Application".to_string()]);
+
+        // First application of fix
+        let content = "# installing good application on your system\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        let fixed_heading = result[0].fix.as_ref().unwrap().replacement.as_str();
+
+        // The fixed heading should contain the proper name preserved
+        assert!(
+            fixed_heading.contains("Good Application"),
+            "After fix, proper name must be preserved: {fixed_heading:?}"
+        );
+
+        // Second application: must produce no further warnings (convergence)
+        let fixed_line = format!("{fixed_heading}\n");
+        let ctx2 = LintContext::new(&fixed_line, crate::config::MarkdownFlavor::Standard, None);
+        let result2 = rule.check(&ctx2).unwrap();
+        assert!(
+            result2.is_empty(),
+            "After one fix, heading must already satisfy both MD063 and MD044 - no oscillation. \
+             Second pass warnings: {result2:?}"
+        );
+    }
+
+    #[test]
+    fn test_sentence_case_proper_names_already_correct() {
+        let rule = create_sentence_case_rule_with_proper_names(vec!["Good Application".to_string()]);
+        // Heading already has correct sentence case with proper name preserved
+        let content = "# Installing Good Application\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Correct sentence-case heading with proper name should not be flagged, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_sentence_case_multiple_proper_names_in_heading() {
+        let rule = create_sentence_case_rule_with_proper_names(vec!["TypeScript".to_string(), "React".to_string()]);
+        let content = "# using typescript with react\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        let fix_text = result[0].fix.as_ref().unwrap().replacement.as_str();
+        assert!(
+            fix_text.contains("TypeScript"),
+            "Fix should preserve 'TypeScript', got: {fix_text:?}"
+        );
+        assert!(
+            fix_text.contains("React"),
+            "Fix should preserve 'React', got: {fix_text:?}"
+        );
+    }
+
+    #[test]
+    fn test_sentence_case_unicode_casefold_expansion_before_proper_name() {
+        // Regression for Unicode case-fold expansion: `İ` lowercases to `i̇` (2 code points),
+        // so matching offsets must be computed from the original text, not from a lowercased copy.
+        let rule = create_sentence_case_rule_with_proper_names(vec!["Österreich".to_string()]);
+        let content = "# İ österreich guide\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+
+        // Should not panic and should preserve canonical proper-name casing.
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1, "Should flag heading for canonical proper-name casing");
+        let fix_text = result[0].fix.as_ref().unwrap().replacement.as_str();
+        assert!(
+            fix_text.contains("Österreich"),
+            "Fix should preserve canonical 'Österreich', got: {fix_text:?}"
+        );
+    }
+
+    #[test]
+    fn test_sentence_case_preserves_trailing_punctuation_on_proper_name() {
+        let rule = create_sentence_case_rule_with_proper_names(vec!["JavaScript".to_string()]);
+        let content = "# using javascript, today\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1, "Should flag heading");
+        let fix_text = result[0].fix.as_ref().unwrap().replacement.as_str();
+        assert!(
+            fix_text.contains("JavaScript,"),
+            "Fix should preserve trailing punctuation, got: {fix_text:?}"
+        );
+    }
+
+    // Title case + MD044 conflict tests
+    //
+    // In title case, short words like "the", "a", "of" are kept lowercase by MD063.
+    // If those words are part of an MD044 proper name (e.g. "The Rolling Stones"),
+    // the same oscillation problem occurs.  The fix must extend to title case too.
+
+    fn create_title_case_rule_with_proper_names(names: Vec<String>) -> MD063HeadingCapitalization {
+        let config = MD063Config {
+            enabled: true,
+            style: HeadingCapStyle::TitleCase,
+            ..Default::default()
+        };
+        let mut rule = MD063HeadingCapitalization::from_config_struct(config);
+        rule.proper_names = names;
+        rule
+    }
+
+    #[test]
+    fn test_title_case_preserves_proper_name_with_lowercase_article() {
+        // "The" is in the lowercase_words list for title case, so "the" in the middle
+        // of a heading would normally stay lowercase.  But "The Rolling Stones" is a
+        // proper name that must be capitalised exactly.
+        let rule = create_title_case_rule_with_proper_names(vec!["The Rolling Stones".to_string()]);
+        let content = "# listening to the rolling stones today\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1, "Should flag the heading");
+        let fix_text = result[0].fix.as_ref().unwrap().replacement.as_str();
+        assert!(
+            fix_text.contains("The Rolling Stones"),
+            "Fix should preserve proper name 'The Rolling Stones', got: {fix_text:?}"
+        );
+    }
+
+    #[test]
+    fn test_title_case_proper_name_no_oscillation() {
+        // One fix pass must produce output that title case already accepts.
+        let rule = create_title_case_rule_with_proper_names(vec!["The Rolling Stones".to_string()]);
+        let content = "# listening to the rolling stones today\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        let fixed_heading = result[0].fix.as_ref().unwrap().replacement.as_str();
+
+        let fixed_line = format!("{fixed_heading}\n");
+        let ctx2 = LintContext::new(&fixed_line, crate::config::MarkdownFlavor::Standard, None);
+        let result2 = rule.check(&ctx2).unwrap();
+        assert!(
+            result2.is_empty(),
+            "After one title-case fix, heading must already satisfy both rules. \
+             Second pass warnings: {result2:?}"
+        );
+    }
+
+    #[test]
+    fn test_title_case_unicode_casefold_expansion_before_proper_name() {
+        let rule = create_title_case_rule_with_proper_names(vec!["Österreich".to_string()]);
+        let content = "# İ österreich guide\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1, "Should flag the heading");
+        let fix_text = result[0].fix.as_ref().unwrap().replacement.as_str();
+        assert!(
+            fix_text.contains("Österreich"),
+            "Fix should preserve canonical proper-name casing, got: {fix_text:?}"
+        );
+    }
+
+    // End-to-end integration test: from_config wires MD044 names into MD063
+    //
+    // This tests the actual code path used in production, where both rules are
+    // configured in a rumdl.toml and the rule registry calls from_config.
+
+    #[test]
+    fn test_from_config_loads_md044_names_into_md063() {
+        use crate::config::{Config, RuleConfig};
+        use crate::rule::Rule;
+        use std::collections::BTreeMap;
+
+        let mut config = Config::default();
+
+        // Configure MD063 with sentence_case
+        let mut md063_values = BTreeMap::new();
+        md063_values.insert("style".to_string(), toml::Value::String("sentence_case".to_string()));
+        md063_values.insert("enabled".to_string(), toml::Value::Boolean(true));
+        config.rules.insert(
+            "MD063".to_string(),
+            RuleConfig {
+                values: md063_values,
+                severity: None,
+            },
+        );
+
+        // Configure MD044 with a proper name
+        let mut md044_values = BTreeMap::new();
+        md044_values.insert(
+            "names".to_string(),
+            toml::Value::Array(vec![toml::Value::String("Good Application".to_string())]),
+        );
+        config.rules.insert(
+            "MD044".to_string(),
+            RuleConfig {
+                values: md044_values,
+                severity: None,
+            },
+        );
+
+        // Build MD063 via the production code path
+        let rule = MD063HeadingCapitalization::from_config(&config);
+
+        // Verify MD044 names were loaded: the fix must preserve "Good Application"
+        let content = "# using good application features\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1, "Should flag the heading");
+        let fix_text = result[0].fix.as_ref().unwrap().replacement.as_str();
+        assert!(
+            fix_text.contains("Good Application"),
+            "from_config should wire MD044 names into MD063; fix should preserve \
+             'Good Application', got: {fix_text:?}"
+        );
+    }
+
+    #[test]
+    fn test_title_case_short_word_not_confused_with_substring() {
+        // Verify that short preposition matching ("in") does not trigger on
+        // substrings of longer words ("insert"). Title case must capitalize
+        // "insert" while keeping "in" lowercase.
+        let rule = create_rule_with_style(HeadingCapStyle::TitleCase);
+
+        // "in" is a short preposition (should be lowercase in title case)
+        // "insert" contains "in" as substring but is a regular word (should be capitalized)
+        let content = "# in the insert\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1, "Should flag the heading");
+        let fix = result[0].fix.as_ref().expect("Fix should be present");
+        // "In" capitalized as first word, "the" lowercase as article, "Insert" capitalized
+        assert!(
+            fix.replacement.contains("In the Insert"),
+            "Expected 'In the Insert', got: {:?}",
+            fix.replacement
+        );
+    }
+
+    #[test]
+    fn test_title_case_or_not_confused_with_orchestra() {
+        let rule = create_rule_with_style(HeadingCapStyle::TitleCase);
+
+        // "or" is a conjunction (should be lowercase in title case)
+        // "orchestra" contains "or" as substring but is a regular word
+        let content = "# or the orchestra\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1, "Should flag the heading");
+        let fix = result[0].fix.as_ref().expect("Fix should be present");
+        // "Or" capitalized as first word, "the" lowercase, "Orchestra" capitalized
+        assert!(
+            fix.replacement.contains("Or the Orchestra"),
+            "Expected 'Or the Orchestra', got: {:?}",
+            fix.replacement
+        );
+    }
+
+    #[test]
+    fn test_all_caps_preserves_all_words() {
+        let rule = create_rule_with_style(HeadingCapStyle::AllCaps);
+
+        let content = "# in the insert\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1, "Should flag the heading");
+        let fix = result[0].fix.as_ref().expect("Fix should be present");
+        assert!(
+            fix.replacement.contains("IN THE INSERT"),
+            "All caps should uppercase all words, got: {:?}",
+            fix.replacement
+        );
+    }
+
+    // Numbered prefix tests — words following a period-terminated token must be capitalized
+    #[test]
+    fn test_title_case_numbered_prefix_lowercase_word() {
+        // "to" follows "1." and must be treated as the start of a new phrase
+        let rule = create_rule();
+        let content = "## 1. To Be a Thing\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not flag '## 1. To Be a Thing', got: {result:?}"
+        );
+
+        let content_lower = "## 1. to be a thing\n";
+        let ctx2 = LintContext::new(content_lower, crate::config::MarkdownFlavor::Standard, None);
+        let result2 = rule.check(&ctx2).unwrap();
+        assert!(!result2.is_empty(), "Should flag '## 1. to be a thing'");
+        let fix = result2[0].fix.as_ref().expect("Should have a fix");
+        assert!(
+            fix.replacement.contains("1. To Be a Thing"),
+            "Fix should capitalize 'To', got: {:?}",
+            fix.replacement
+        );
+    }
+
+    #[test]
+    fn test_title_case_numbered_prefix_article() {
+        // "a" follows "2." and must be capitalized as the first word of the phrase
+        let rule = create_rule();
+        let content = "## 2. A Guide to the Galaxy\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not flag '## 2. A Guide to the Galaxy', got: {result:?}"
+        );
+
+        let content_lower = "## 2. a guide to the galaxy\n";
+        let ctx2 = LintContext::new(content_lower, crate::config::MarkdownFlavor::Standard, None);
+        let result2 = rule.check(&ctx2).unwrap();
+        assert!(!result2.is_empty(), "Should flag '## 2. a guide to the galaxy'");
+        let fix = result2[0].fix.as_ref().expect("Should have a fix");
+        assert!(
+            fix.replacement.contains("2. A Guide to the Galaxy"),
+            "Fix should capitalize 'A', got: {:?}",
+            fix.replacement
+        );
+    }
+
+    #[test]
+    fn test_title_case_mid_sentence_period_word() {
+        // "introduction" follows "1." embedded in a phrase — must be capitalized
+        let rule = create_rule();
+        let content = "## Step 1. Introduction to the Problem\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not flag '## Step 1. Introduction to the Problem', got: {result:?}"
+        );
+
+        let content_lower = "## Step 1. introduction to the problem\n";
+        let ctx2 = LintContext::new(content_lower, crate::config::MarkdownFlavor::Standard, None);
+        let result2 = rule.check(&ctx2).unwrap();
+        assert!(
+            !result2.is_empty(),
+            "Should flag '## Step 1. introduction to the problem'"
+        );
+        let fix = result2[0].fix.as_ref().expect("Should have a fix");
+        assert!(
+            fix.replacement.contains("Step 1. Introduction to the Problem"),
+            "Fix should capitalize 'Introduction', got: {:?}",
+            fix.replacement
+        );
+    }
+
+    #[test]
+    fn test_title_case_numbered_prefix_in_link_text() {
+        // apply_title_case (link text path) must also respect after_period.
+        // A heading whose only content is a link: ## [1. to be a thing](url)
+        let config = MD063Config {
+            enabled: true,
+            style: HeadingCapStyle::TitleCase,
+            ..Default::default()
+        };
+        let rule = MD063HeadingCapitalization::from_config_struct(config);
+
+        // Correct heading — link text already title-cased after numbered prefix
+        let content = "## [1. To Be a Thing](https://example.com)\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not flag '## [1. To Be a Thing](url)', got: {result:?}"
+        );
+
+        // Incorrect heading — "to" in link text must be capitalized after "1."
+        let content_lower = "## [1. to be a thing](https://example.com)\n";
+        let ctx2 = LintContext::new(content_lower, crate::config::MarkdownFlavor::Standard, None);
+        let result2 = rule.check(&ctx2).unwrap();
+        assert!(!result2.is_empty(), "Should flag '## [1. to be a thing](url)'");
+        let fix = result2[0].fix.as_ref().expect("Should have a fix");
+        assert!(
+            fix.replacement.contains("1. To Be a Thing"),
+            "Fix should capitalize 'To' in link text, got: {:?}",
+            fix.replacement
+        );
+    }
+
+    // Numeric-ordinal tests (issue #608): "1st", "2nd", "3rd", "4th", "21st"
+    // and so on must keep their alphabetic suffix lower-cased in title case
+    // and must be normalised back from mis-cased forms like "5Th".
+
+    #[test]
+    fn test_is_numeric_ordinal_recognises_canonical_forms() {
+        for word in &[
+            "1st", "2nd", "3rd", "4th", "5th", "11th", "21st", "22nd", "23rd", "100th", "1ST", "5Th", "21St", "21sT",
+        ] {
+            assert!(
+                MD063HeadingCapitalization::is_numeric_ordinal(word),
+                "expected `{word}` to be detected as a numeric ordinal"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_numeric_ordinal_rejects_non_ordinals() {
+        // Words without a digit prefix, an unrecognised alphabetic suffix,
+        // or a non-ordinal alpha tail are all rejected. Compound forms with
+        // hyphens are handled by `handle_hyphenated_word` so the helper's
+        // behaviour on them is intentionally unconstrained.
+        for word in &[
+            "first", "1stop", "ist", "5", "th", "abc", "4G", "4K", "30s", "100k", "5x", "1.5", "iPhone6S",
+        ] {
+            assert!(
+                !MD063HeadingCapitalization::is_numeric_ordinal(word),
+                "expected `{word}` NOT to be detected as a numeric ordinal"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_numeric_ordinal_strips_trailing_punctuation() {
+        for word in &["5th.", "1st,", "21st!", "3rd:", "4th)", "5th's"] {
+            assert!(
+                MD063HeadingCapitalization::is_numeric_ordinal(word),
+                "expected `{word}` to be detected as a numeric ordinal (with punctuation)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_numeric_ordinal_ignores_wrapping_punctuation() {
+        // A word reaches this check as a whitespace-split token, so it still
+        // carries whatever punctuation wraps it. A leading wrapper hid the
+        // digits, and the capitaliser then uppercased the first letter it could
+        // find, turning `(2nd` into `(2Nd`.
+        for word in &[
+            "(2nd", "[2nd", "\"2nd", "'2nd", "*2nd", "(21st)", "\"3rd\"", "**5th**", "_1st_",
+        ] {
+            assert!(
+                MD063HeadingCapitalization::is_numeric_ordinal(word),
+                "expected `{word}` to be detected as a numeric ordinal"
+            );
+        }
+
+        // Only the wrapping comes off. An interior separator still makes the
+        // token something other than an ordinal, and a token with no core at
+        // all must be rejected rather than read as an empty ordinal.
+        for word in &["2-nd", "2 nd", "(", "\"\"", "()", "(nd", "(2"] {
+            assert!(
+                !MD063HeadingCapitalization::is_numeric_ordinal(word),
+                "expected `{word}` NOT to be detected as a numeric ordinal"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ordinal_wrapped_in_punctuation_survives_a_fix() {
+        // Already correct in each style: the wrapped ordinal is preserved, so
+        // nothing is reported and the fix leaves the heading byte-identical.
+        for (style, content) in [
+            (HeadingCapStyle::SentenceCase, "# The second (2nd) attempt\n"),
+            (HeadingCapStyle::SentenceCase, "# Ranked \"3rd\" overall\n"),
+            (HeadingCapStyle::SentenceCase, "# Plain 2nd place\n"),
+            (HeadingCapStyle::TitleCase, "# The Second (2nd) Attempt\n"),
+            (HeadingCapStyle::TitleCase, "# Ranked \"3rd\" Overall\n"),
+        ] {
+            let rule = create_rule_with_style(style);
+            let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+            let result = rule.check(&ctx).unwrap();
+            assert!(
+                result.is_empty(),
+                "{style:?} should not flag {content:?}, got: {result:?}"
+            );
+            assert_eq!(
+                rule.fix(&ctx).unwrap(),
+                content,
+                "{style:?} must leave {content:?} alone"
+            );
+        }
+
+        // Positive control: on a heading that does need recasing the fix runs,
+        // recases the prose around the ordinal and still leaves the ordinal
+        // itself untouched. A second pass changes nothing more.
+        for (style, content, expected) in [
+            (
+                HeadingCapStyle::SentenceCase,
+                "# The Second (2nd) Attempt\n",
+                "# The second (2nd) attempt\n",
+            ),
+            (
+                HeadingCapStyle::TitleCase,
+                "# the second (2nd) attempt\n",
+                "# The Second (2nd) Attempt\n",
+            ),
+        ] {
+            let rule = create_rule_with_style(style);
+            let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+            assert!(
+                !rule.check(&ctx).unwrap().is_empty(),
+                "{style:?} should flag {content:?}"
+            );
+            let fixed = rule.fix(&ctx).unwrap();
+            assert_eq!(fixed, expected, "{style:?} fix of {content:?}");
+
+            let refixed = rule
+                .fix(&LintContext::new(&fixed, crate::config::MarkdownFlavor::Standard, None))
+                .unwrap();
+            assert_eq!(refixed, expected, "{style:?} second pass over {fixed:?}");
+        }
+    }
+
+    #[test]
+    fn test_wrapped_ordinal_corrupted_by_the_old_fix_is_repaired() {
+        // A document already rewritten by the buggy capitaliser has to come back,
+        // not stay wrong: `(2Nd)` was not recognised as an ordinal either, so the
+        // old behaviour was stable and `check` reported nothing about it.
+        for (style, content, expected) in [
+            (
+                HeadingCapStyle::SentenceCase,
+                "# The second (2Nd) attempt\n",
+                "# The second (2nd) attempt\n",
+            ),
+            (
+                HeadingCapStyle::TitleCase,
+                "# The Second (2Nd) Attempt\n",
+                "# The Second (2nd) Attempt\n",
+            ),
+            (
+                HeadingCapStyle::SentenceCase,
+                "# Ranked \"3Rd\" overall\n",
+                "# Ranked \"3rd\" overall\n",
+            ),
+        ] {
+            let rule = create_rule_with_style(style);
+            let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+            assert!(
+                !rule.check(&ctx).unwrap().is_empty(),
+                "{style:?} should flag {content:?}"
+            );
+            assert_eq!(rule.fix(&ctx).unwrap(), expected, "{style:?} fix of {content:?}");
+        }
+    }
+
+    #[test]
+    fn test_title_case_ordinal_first_word_not_flagged() {
+        let rule = create_rule();
+        for content in &[
+            "# 1st Place\n",
+            "# 2nd Edition\n",
+            "# 3rd Time\n",
+            "# 5th Avenue\n",
+            "# 21st Century Skills\n",
+            "# 100th Customer\n",
+        ] {
+            let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+            let result = rule.check(&ctx).unwrap();
+            assert!(result.is_empty(), "Should not flag {content:?}, got: {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_title_case_ordinal_mid_heading_not_flagged() {
+        let rule = create_rule();
+        for content in &[
+            "# May 3rd Notes\n",
+            "# Top 100th Customer\n",
+            "# Notes for the 5th of May\n",
+        ] {
+            let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+            let result = rule.check(&ctx).unwrap();
+            assert!(result.is_empty(), "Should not flag {content:?}, got: {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_title_case_ordinal_corrupted_form_is_fixed() {
+        // The "sticky" case: a heading already mangled by the buggy
+        // capitaliser must be flagged and corrected back, not left alone.
+        let rule = create_rule();
+        for (input, expected) in &[
+            ("# 1St Place\n", "1st Place"),
+            ("# 5Th Avenue\n", "5th Avenue"),
+            ("# 21St Century Skills\n", "21st Century Skills"),
+            ("# May 3Rd Notes\n", "May 3rd Notes"),
+            ("# 22Nd Edition\n", "22nd Edition"),
+        ] {
+            let ctx = LintContext::new(input, crate::config::MarkdownFlavor::Standard, None);
+            let result = rule.check(&ctx).unwrap();
+            assert!(!result.is_empty(), "Should flag {input:?}");
+            let fix = result[0].fix.as_ref().expect("should have a fix");
+            assert!(
+                fix.replacement.contains(expected),
+                "Fix for {input:?} should contain {expected:?}, got: {:?}",
+                fix.replacement
+            );
+        }
+    }
+
+    #[test]
+    fn test_title_case_ordinal_lowercase_other_words_capitalised() {
+        // Non-ordinal words around an ordinal still need title-casing.
+        let rule = create_rule();
+        let content = "# 5th avenue\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        let fix = result[0].fix.as_ref().expect("should have a fix");
+        assert!(
+            fix.replacement.contains("5th Avenue"),
+            "Fix should produce '5th Avenue', got: {:?}",
+            fix.replacement
+        );
+    }
+
+    #[test]
+    fn test_title_case_ordinal_with_trailing_punctuation() {
+        let rule = create_rule();
+        let content = "# Released on the 5th.\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty(), "Should not flag {content:?}, got: {result:?}");
+    }
+
+    #[test]
+    fn test_title_case_ordinal_hyphenated() {
+        let rule = create_rule();
+        for content in &["# 21st-Century Skills\n", "# A 19th-Century Novel\n"] {
+            let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+            let result = rule.check(&ctx).unwrap();
+            assert!(result.is_empty(), "Should not flag {content:?}, got: {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_sentence_case_ordinal_corrupted_form_is_fixed() {
+        let rule = create_rule_with_style(HeadingCapStyle::SentenceCase);
+        let content = "# 5Th avenue\n";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        let fix = result[0].fix.as_ref().expect("should have a fix");
+        assert!(
+            fix.replacement.contains("5th avenue"),
+            "Fix should produce '5th avenue', got: {:?}",
+            fix.replacement
+        );
+    }
+
+    #[test]
+    fn test_title_case_digit_acronym_unchanged() {
+        // Non-ordinal digit-prefixed tokens (4G, 4K) must still be preserved
+        // as all-caps acronyms — the ordinal carve-out must not catch them.
+        let rule = create_rule();
+        for content in &["# 4G Networks\n", "# 4K Streaming\n"] {
+            let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+            let result = rule.check(&ctx).unwrap();
+            assert!(result.is_empty(), "Should not flag {content:?}, got: {result:?}");
+        }
+    }
+
+    // --- sentence-case-restart-after ---
+
+    fn restart_rule(boundaries: &[&str]) -> MD063HeadingCapitalization {
+        let config = MD063Config {
+            enabled: true,
+            style: HeadingCapStyle::SentenceCase,
+            sentence_case_restart_after: boundaries.iter().copied().map(String::from).collect(),
+            ..Default::default()
+        };
+        MD063HeadingCapitalization::from_config_struct(config)
+    }
+
+    /// The heading text MD063 would rewrite this content to, or `None` when it is
+    /// already compliant.
+    fn suggested(rule: &MD063HeadingCapitalization, content: &str) -> Option<String> {
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let warnings = rule.check(&ctx).unwrap();
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(
+            warnings.is_empty(),
+            fixed == content,
+            "a warning and a rewrite must agree for {content:?}"
+        );
+        (!warnings.is_empty()).then(|| fixed.trim_start_matches('#').trim().to_string())
+    }
+
+    #[test]
+    fn test_restart_after_capitalizes_the_word_following_a_boundary() {
+        let rule = restart_rule(&[":"]);
+        assert_eq!(
+            suggested(&rule, "# Requirement 1: Struct to Logger Slice Conversion\n").as_deref(),
+            Some("Requirement 1: Struct to logger slice conversion")
+        );
+    }
+
+    #[test]
+    fn test_restart_after_defaults_to_no_boundaries() {
+        // The empty default must leave sentence case as it was: first word only.
+        let rule = create_rule_with_style(HeadingCapStyle::SentenceCase);
+        assert_eq!(
+            suggested(&rule, "# Requirement 1: Struct to Logger Slice Conversion\n").as_deref(),
+            Some("Requirement 1: struct to logger slice conversion")
+        );
+    }
+
+    #[test]
+    fn test_restart_after_only_honors_configured_punctuation() {
+        // A colon-only configuration must not drag in the dash and semicolon cases.
+        let rule = restart_rule(&[":"]);
+        assert_eq!(
+            suggested(&rule, "# Design - Data Model Overview\n").as_deref(),
+            Some("Design - data model overview")
+        );
+        assert_eq!(
+            suggested(&rule, "# Setup; Then Run\n").as_deref(),
+            Some("Setup; then run")
+        );
+
+        let rule = restart_rule(&[";", "\u{2014}"]);
+        assert_eq!(
+            suggested(&rule, "# Setup; Then Run\n").as_deref(),
+            Some("Setup; Then run")
+        );
+        assert_eq!(
+            suggested(&rule, "# Part One \u{2014} The Big Idea\n").as_deref(),
+            Some("Part one \u{2014} The big idea")
+        );
+    }
+
+    #[test]
+    fn test_restart_after_matches_only_at_the_end_of_a_word() {
+        // An intra-word hyphen is not a sentence boundary, so a configured dash must
+        // not restart inside `Well-Known`, and a URL's punctuation must not either.
+        let rule = restart_rule(&["-", ":"]);
+        assert_eq!(
+            suggested(&rule, "# Ports: Well-Known Ports Explained\n").as_deref(),
+            Some("Ports: Well-Known ports explained")
+        );
+        assert_eq!(
+            suggested(&rule, "# See https://example.com/A/B For Details\n").as_deref(),
+            Some("See https://example.com/A/B for details")
+        );
+    }
+
+    #[test]
+    fn test_restart_after_a_trailing_boundary_is_a_no_op() {
+        let rule = restart_rule(&[":"]);
+        assert_eq!(suggested(&rule, "# Setup:\n"), None);
+    }
+
+    #[test]
+    fn test_restart_after_does_not_override_preserved_words() {
+        // The likeliest regression: a preserved brand name landing right after a
+        // boundary must not be re-capitalized into `IPhone`.
+        let rule = restart_rule(&[":"]);
+        assert_eq!(
+            suggested(&rule, "# Devices: iPhone And Android\n").as_deref(),
+            Some("Devices: iPhone and android")
+        );
+
+        let config = MD063Config {
+            enabled: true,
+            style: HeadingCapStyle::SentenceCase,
+            sentence_case_restart_after: vec![":".to_string()],
+            ignore_words: vec!["kubectl".to_string()],
+            preserve_cased_words: false,
+            ..Default::default()
+        };
+        let rule = MD063HeadingCapitalization::from_config_struct(config);
+        assert_eq!(
+            suggested(&rule, "# Tools: kubectl And Helm\n").as_deref(),
+            Some("Tools: kubectl and helm")
+        );
+    }
+
+    #[test]
+    fn test_restart_after_keeps_md044_canonical_forms() {
+        let config = MD063Config {
+            enabled: true,
+            style: HeadingCapStyle::SentenceCase,
+            sentence_case_restart_after: vec![":".to_string()],
+            ..Default::default()
+        };
+        let mut rule = MD063HeadingCapitalization::from_config_struct(config);
+        rule.proper_names = vec!["GitHub".to_string()];
+
+        // The canonical form wins over the restart, so this is `GitHub`, not `Github`.
+        assert_eq!(
+            suggested(&rule, "# Docs: github Actions Guide\n").as_deref(),
+            Some("Docs: GitHub actions guide")
+        );
+        assert_eq!(suggested(&rule, "# Docs: GitHub actions guide\n"), None);
+    }
+
+    #[test]
+    fn test_restart_after_carries_across_segments() {
+        // A boundary in one segment governs the next, so a heading with a link behaves
+        // the same as one without.
+        let rule = restart_rule(&[":"]);
+        assert_eq!(
+            suggested(
+                &rule,
+                "# Overview: [Some Link Here](https://example.com) Trailing Words\n"
+            )
+            .as_deref(),
+            Some("Overview: [Some link here](https://example.com) trailing words")
+        );
+        assert_eq!(
+            suggested(&rule, "# Overview: `code` Then More Words\n").as_deref(),
+            Some("Overview: `code` then more words")
+        );
+    }
+
+    #[test]
+    fn test_restart_after_ends_a_sentence_at_the_end_of_link_text() {
+        // A reader sees `[see:](url)` as `see:`, so the boundary is where they read it,
+        // not at the closing paren of the destination. This is the complement of a
+        // boundary before a link carrying into its text.
+        let rule = restart_rule(&[":"]);
+        assert_eq!(
+            suggested(&rule, "# Topic [See:](https://example.com) More Words\n").as_deref(),
+            Some("Topic [see:](https://example.com) More words")
+        );
+
+        // A boundary that only appears in the destination is not visible prose.
+        assert_eq!(
+            suggested(&rule, "# Topic [See](https://example.com) More Words\n").as_deref(),
+            Some("Topic [see](https://example.com) more words")
+        );
+    }
+
+    #[test]
+    fn test_restart_after_ignores_boundaries_inside_opaque_segments() {
+        // Code, HTML and image alt text are preserved verbatim rather than capitalized,
+        // so a boundary inside them is not one this rule offers the reader.
+        let rule = restart_rule(&[":"]);
+        for content in [
+            "# Topic `see:` More Words\n",
+            "# Topic ![alt:](image.png) More Words\n",
+            "# Topic <span title=\"x:\">y</span> More Words\n",
+        ] {
+            let fixed = suggested(&rule, content).expect("heading should be rewritten");
+            assert!(
+                fixed.ends_with("more words"),
+                "opaque segment restarted the sentence in {content:?}: {fixed}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_restart_after_treats_a_leading_link_as_sentence_initial() {
+        // A heading opening with visible link text starts the sentence, whether or not
+        // sentence restarts are configured.
+        for rule in [restart_rule(&[]), restart_rule(&[":"])] {
+            assert_eq!(
+                suggested(&rule, "# [Some Link Here](https://example.com) Trailing Words\n").as_deref(),
+                Some("[Some link here](https://example.com) trailing words")
+            );
+        }
+    }
+
+    #[test]
+    fn test_restart_after_fix_is_idempotent() {
+        let rule = restart_rule(&[":", ";", "-", "\u{2014}"]);
+        for content in [
+            "# Requirement 1: Struct to Logger Slice Conversion\n",
+            "# Ports: Well-Known Ports Explained\n",
+            "# Devices: iPhone And Android\n",
+            "# Overview: [Some Link Here](https://example.com) Trailing Words\n",
+            "# Setup:\n",
+        ] {
+            let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+            let once = rule.fix(&ctx).unwrap();
+            let ctx = LintContext::new(&once, crate::config::MarkdownFlavor::Standard, None);
+            assert_eq!(rule.fix(&ctx).unwrap(), once, "fix is not idempotent for {content:?}");
+        }
+    }
+
+    #[test]
+    fn test_restart_after_ignores_empty_boundary_entries() {
+        // An empty string would otherwise end every word, capitalizing the whole heading.
+        let rule = restart_rule(&[""]);
+        assert_eq!(
+            suggested(&rule, "# Requirement 1: Struct to Logger Slice Conversion\n").as_deref(),
+            Some("Requirement 1: struct to logger slice conversion")
+        );
+    }
+
+    // Markdown with Gherkin
+
+    const STYLES: [HeadingCapStyle; 3] = [
+        HeadingCapStyle::TitleCase,
+        HeadingCapStyle::SentenceCase,
+        HeadingCapStyle::AllCaps,
+    ];
+
+    /// Every Gherkin structure keyword, each with a name all three styles rewrite:
+    /// (heading, title case, sentence case, all caps).
+    const GHERKIN_STRUCTURES: [(&str, &str, &str, &str); 6] = [
+        (
+            "# Feature: the system under test",
+            "# Feature: The System Under Test",
+            "# Feature: The system under test",
+            "# Feature: THE SYSTEM UNDER TEST",
+        ),
+        (
+            "## Background: a shared setup",
+            "## Background: A Shared Setup",
+            "## Background: A shared setup",
+            "## Background: A SHARED SETUP",
+        ),
+        (
+            "## Rule: money is never lost",
+            "## Rule: Money Is Never Lost",
+            "## Rule: Money is never lost",
+            "## Rule: MONEY IS NEVER LOST",
+        ),
+        (
+            "### Scenario: add two numbers",
+            "### Scenario: Add Two Numbers",
+            "### Scenario: Add two numbers",
+            "### Scenario: ADD TWO NUMBERS",
+        ),
+        (
+            "### Scenario Outline: add two numbers",
+            "### Scenario Outline: Add Two Numbers",
+            "### Scenario Outline: Add two numbers",
+            "### Scenario Outline: ADD TWO NUMBERS",
+        ),
+        (
+            "#### Examples: happy path",
+            "#### Examples: Happy Path",
+            "#### Examples: Happy path",
+            "#### Examples: HAPPY PATH",
+        ),
+    ];
+
+    /// The heading MD063 leaves behind under `flavor`, rewritten or not.
+    fn recased(style: HeadingCapStyle, heading: &str, flavor: crate::config::MarkdownFlavor) -> String {
+        let rule = create_rule_with_style(style);
+        let content = format!("{heading}\n");
+        let ctx = LintContext::new(&content, flavor, None);
+        let warnings = rule.check(&ctx).unwrap();
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(
+            warnings.is_empty(),
+            fixed == content,
+            "a warning and a rewrite must agree for {content:?} under {flavor:?}"
+        );
+        fixed.trim_end().to_string()
+    }
+
+    #[test]
+    fn test_mdg_keeps_the_keyword_of_every_structure() {
+        // A keyword only names a structure when spelled exactly, so a recased one
+        // silently turns the structure into prose.
+        for (heading, ..) in GHERKIN_STRUCTURES {
+            let keyword = &heading[..=heading.find(':').unwrap()];
+            for style in STYLES {
+                let fixed = recased(style, heading, crate::config::MarkdownFlavor::MDG);
+                assert!(
+                    fixed.starts_with(keyword),
+                    "{style:?} lost the keyword of {heading:?}: {fixed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_mdg_recases_only_the_name_of_a_structure() {
+        for (heading, title, sentence, caps) in GHERKIN_STRUCTURES {
+            let mdg = crate::config::MarkdownFlavor::MDG;
+            assert_eq!(recased(HeadingCapStyle::TitleCase, heading, mdg), title);
+            assert_eq!(recased(HeadingCapStyle::SentenceCase, heading, mdg), sentence);
+            assert_eq!(recased(HeadingCapStyle::AllCaps, heading, mdg), caps);
+        }
+    }
+
+    #[test]
+    fn test_standard_flavor_recases_a_keyword_like_any_other_word() {
+        // The exemption belongs to the flavor, not to the rule.
+        let standard = crate::config::MarkdownFlavor::Standard;
+        assert_eq!(
+            recased(HeadingCapStyle::TitleCase, "# Feature: the system under test", standard),
+            "# Feature: the System Under Test"
+        );
+        assert_eq!(
+            recased(
+                HeadingCapStyle::SentenceCase,
+                "### Scenario Outline: add two numbers",
+                standard
+            ),
+            "### Scenario outline: add two numbers"
+        );
+        assert_eq!(
+            recased(HeadingCapStyle::AllCaps, "# Feature: the system under test", standard),
+            "# FEATURE: THE SYSTEM UNDER TEST"
+        );
+    }
+
+    #[test]
+    fn test_mdg_leaves_a_heading_without_a_colon_to_the_normal_rule() {
+        for heading in ["## notes about the system", "## Notes", "# THE SYSTEM"] {
+            for style in STYLES {
+                assert_eq!(
+                    recased(style, heading, crate::config::MarkdownFlavor::MDG),
+                    recased(style, heading, crate::config::MarkdownFlavor::Standard),
+                    "{style:?} treated {heading:?} as a Gherkin structure"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_mdg_splits_at_the_first_colon_only() {
+        // A later colon belongs to the name, which is prose this rule still owns.
+        let mdg = crate::config::MarkdownFlavor::MDG;
+        let heading = "## Scenario: ratio: two to one";
+        assert_eq!(
+            recased(HeadingCapStyle::TitleCase, heading, mdg),
+            "## Scenario: Ratio: Two to One"
+        );
+        assert_eq!(
+            recased(HeadingCapStyle::SentenceCase, heading, mdg),
+            "## Scenario: Ratio: two to one"
+        );
+        assert_eq!(
+            recased(HeadingCapStyle::AllCaps, heading, mdg),
+            "## Scenario: RATIO: TWO TO ONE"
+        );
+    }
+
+    #[test]
+    fn test_mdg_leaves_a_colon_behind_a_backtick_to_the_normal_rule() {
+        // Dialect keywords are plain words, so such a colon is inside a code span rather
+        // than after a keyword. Splitting there would hide the span from the segment
+        // parser and recase what a reader sees as code.
+        for heading in [
+            "# See `x: y` Notes",
+            "# `a: b`",
+            "# `code` Feature: a name",
+            "# `x: y` Feature: a name",
+        ] {
+            for style in STYLES {
+                assert_eq!(
+                    recased(style, heading, crate::config::MarkdownFlavor::MDG),
+                    recased(style, heading, crate::config::MarkdownFlavor::Standard),
+                    "{style:?} split {heading:?} at a colon inside a code span"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_mdg_splits_at_a_keyword_colon_that_precedes_a_code_span() {
+        // The backtick is in the name, so the keyword colon still governs.
+        let mdg = crate::config::MarkdownFlavor::MDG;
+        let heading = "# Scenario: use `a: b` here";
+        assert_eq!(
+            recased(HeadingCapStyle::TitleCase, heading, mdg),
+            "# Scenario: Use `a: b` Here"
+        );
+        assert_eq!(
+            recased(HeadingCapStyle::SentenceCase, heading, mdg),
+            "# Scenario: Use `a: b` here"
+        );
+        assert_eq!(
+            recased(HeadingCapStyle::AllCaps, heading, mdg),
+            "# Scenario: USE `a: b` HERE"
+        );
+    }
+
+    #[test]
+    fn test_mdg_splits_at_a_keyword_colon_before_an_unbalanced_backtick() {
+        // An unclosed backtick opens no code span for either flavor, so the tail stays
+        // prose and only the keyword is held back.
+        let mdg = crate::config::MarkdownFlavor::MDG;
+        let heading = "# Scenario: a ` b";
+        assert_eq!(recased(HeadingCapStyle::TitleCase, heading, mdg), "# Scenario: A ` B");
+        assert_eq!(
+            recased(HeadingCapStyle::SentenceCase, heading, mdg),
+            "# Scenario: A ` b"
+        );
+        assert_eq!(recased(HeadingCapStyle::AllCaps, heading, mdg), "# Scenario: A ` B");
+    }
+
+    #[test]
+    fn test_mdg_keeps_a_keyword_with_nothing_left_to_recase() {
+        for style in STYLES {
+            assert_eq!(
+                recased(style, "# Feature:", crate::config::MarkdownFlavor::MDG),
+                "# Feature:"
+            );
+        }
+    }
+
+    #[test]
+    fn test_mdg_keeps_a_custom_id_after_the_name() {
+        assert_eq!(
+            recased(
+                HeadingCapStyle::TitleCase,
+                "# Feature: the system {#overview}",
+                crate::config::MarkdownFlavor::MDG
+            ),
+            "# Feature: The System {#overview}"
+        );
+    }
+
+    #[test]
+    fn test_mdg_fix_is_idempotent() {
+        for (heading, ..) in GHERKIN_STRUCTURES {
+            for style in STYLES {
+                let rule = create_rule_with_style(style);
+                let content = format!("{heading}\n");
+                let ctx = LintContext::new(&content, crate::config::MarkdownFlavor::MDG, None);
+                let once = rule.fix(&ctx).unwrap();
+                let ctx = LintContext::new(&once, crate::config::MarkdownFlavor::MDG, None);
+                assert_eq!(
+                    rule.fix(&ctx).unwrap(),
+                    once,
+                    "fix is not idempotent for {heading:?} ({style:?})"
+                );
+            }
+        }
+    }
+}

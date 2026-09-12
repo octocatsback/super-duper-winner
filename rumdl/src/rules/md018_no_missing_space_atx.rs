@@ -1,0 +1,1812 @@
+/// Rule MD018: No missing space after ATX heading marker
+///
+/// See [docs/md018.md](../../docs/md018.md) for full documentation, configuration, and examples.
+mod md018_config;
+
+pub(super) use md018_config::MD018Config;
+
+use crate::config::MarkdownFlavor;
+use crate::rule::{Fix, LintError, LintResult, LintWarning, Rule, RuleCategory, Severity};
+use crate::utils::obsidian_tag::TAG_PATTERN;
+use crate::utils::range_utils::{byte_to_char_count, calculate_single_line_range};
+use regex::Regex;
+use std::sync::LazyLock;
+
+// Emoji and Unicode hashtag patterns
+const EMOJI_HASHTAG_PATTERN_STR: &str = r"^#️⃣|^#⃣";
+const UNICODE_HASHTAG_PATTERN_STR: &str = r"^#[\u{FE0F}\u{20E3}]";
+static EMOJI_HASHTAG_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(EMOJI_HASHTAG_PATTERN_STR).unwrap());
+static UNICODE_HASHTAG_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(UNICODE_HASHTAG_PATTERN_STR).unwrap());
+
+// MagicLink issue/PR reference pattern: #123, #10, etc.
+// Matches # followed by one or more digits, then either end of string,
+// whitespace, or punctuation (not alphanumeric continuation)
+const MAGICLINK_REF_PATTERN_STR: &str = r"^#\d+(?:\s|[^a-zA-Z0-9]|$)";
+static MAGICLINK_REF_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(MAGICLINK_REF_PATTERN_STR).unwrap());
+
+#[derive(Clone)]
+pub struct MD018NoMissingSpaceAtx {
+    config: MD018Config,
+}
+
+impl Default for MD018NoMissingSpaceAtx {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MD018NoMissingSpaceAtx {
+    pub fn new() -> Self {
+        Self {
+            config: MD018Config::default(),
+        }
+    }
+
+    pub fn from_config_struct(config: MD018Config) -> Self {
+        Self { config }
+    }
+
+    /// Check if a line is a MagicLink-style issue/PR reference (e.g., #123, #10)
+    /// Used by MkDocs flavor to skip PyMdown MagicLink patterns
+    fn is_magiclink_ref(line: &str) -> bool {
+        MAGICLINK_REF_PATTERN.is_match(line.trim_start())
+    }
+
+    /// Check if a line is a tag (e.g., #tagname, #project/active, #3d_printing)
+    fn is_tag(line: &str) -> bool {
+        TAG_PATTERN.is_match(line.trim_start())
+    }
+
+    /// Whether tag patterns should be recognized for the given flavor
+    fn tags_enabled(&self, flavor: MarkdownFlavor) -> bool {
+        self.config.tags_enabled(flavor)
+    }
+
+    /// Check if an ATX heading line is missing space after the marker
+    fn check_atx_heading_line(&self, line: &str, flavor: MarkdownFlavor) -> Option<(usize, String)> {
+        // Look for ATX marker at start of line (with optional indentation)
+        let trimmed_line = line.trim_start();
+        let indent = line.len() - trimmed_line.len();
+
+        if !trimmed_line.starts_with('#') {
+            return None;
+        }
+
+        // Only flag patterns at column 1 (no indentation) to match markdownlint behavior
+        // Indented patterns are likely:
+        // - Multi-line link continuations (e.g., "  #sig-contribex](url)")
+        // - List item content
+        // - Other continuation contexts
+        if indent > 0 {
+            return None;
+        }
+
+        // Skip emoji hashtags and Unicode hashtag patterns
+        let is_emoji = EMOJI_HASHTAG_PATTERN.is_match(trimmed_line);
+        let is_unicode = UNICODE_HASHTAG_PATTERN.is_match(trimmed_line);
+        if is_emoji || is_unicode {
+            return None;
+        }
+
+        // Count the number of hashes
+        let hash_count = trimmed_line.chars().take_while(|&c| c == '#').count();
+        if hash_count == 0 || hash_count > 6 {
+            return None;
+        }
+
+        // Check what comes after the hashes
+        let after_hashes = &trimmed_line[hash_count..];
+
+        // Skip if what follows the hashes is an emoji modifier or variant selector
+        if after_hashes
+            .chars()
+            .next()
+            .is_some_and(|ch| matches!(ch, '\u{FE0F}' | '\u{20E3}' | '\u{FE0E}'))
+        {
+            return None;
+        }
+
+        // If there's content immediately after hashes (no space), it needs fixing
+        if !after_hashes.is_empty() && !after_hashes.starts_with(' ') && !after_hashes.starts_with('\t') {
+            // Additional checks to avoid false positives
+            let content = after_hashes.trim();
+
+            // Skip if it's just more hashes (horizontal rule)
+            if content.chars().all(|c| c == '#') {
+                return None;
+            }
+
+            // Skip if content is too short to be meaningful
+            if content.len() < 2 {
+                return None;
+            }
+
+            // Skip if it starts with emphasis markers
+            if content.starts_with('*') || content.starts_with('_') {
+                return None;
+            }
+
+            // MagicLink config: skip MagicLink-style issue/PR refs (#123, #10, etc.)
+            // MagicLink only uses single #, so check hash_count == 1
+            if self.config.magiclink && hash_count == 1 && Self::is_magiclink_ref(line) {
+                return None;
+            }
+
+            // Tags mode: skip tag syntax (#tagname, #project/active, etc.)
+            // Tags only use single #
+            if self.tags_enabled(flavor) && hash_count == 1 && Self::is_tag(line) {
+                return None;
+            }
+
+            // This looks like a malformed heading that needs a space
+            let fixed = format!("{}{} {}", " ".repeat(indent), "#".repeat(hash_count), after_hashes);
+            return Some((indent + hash_count, fixed));
+        }
+
+        None
+    }
+
+    // Calculate the byte range for a specific line in the content
+    fn get_line_byte_range(&self, content: &str, line_num: usize) -> std::ops::Range<usize> {
+        let mut current_line = 1;
+        let mut start_byte = 0;
+
+        for (i, c) in content.char_indices() {
+            if current_line == line_num && c == '\n' {
+                return start_byte..i;
+            } else if c == '\n' {
+                current_line += 1;
+                if current_line == line_num {
+                    start_byte = i + 1;
+                }
+            }
+        }
+
+        // If we're looking for the last line and it doesn't end with a newline
+        if current_line == line_num {
+            return start_byte..content.len();
+        }
+
+        // Fallback if line not found (shouldn't happen)
+        0..0
+    }
+}
+
+impl Rule for MD018NoMissingSpaceAtx {
+    fn name(&self) -> &'static str {
+        "MD018"
+    }
+
+    fn description(&self) -> &'static str {
+        "No space after hash in heading"
+    }
+
+    fn check(&self, ctx: &crate::lint_context::LintContext) -> LintResult {
+        let mut warnings = Vec::new();
+
+        // Check all lines that have ATX headings from cached info
+        for (line_num, line_info) in ctx.lines.iter().enumerate() {
+            // Skip lines inside HTML blocks, HTML comments, or PyMdown blocks
+            if line_info.in_html_block
+                || line_info.in_html_comment
+                || line_info.in_mdx_comment
+                || line_info.in_pymdown_block
+            {
+                continue;
+            }
+
+            if let Some(heading) = &line_info.heading {
+                // Only check ATX headings
+                if matches!(heading.style, crate::lint_context::HeadingStyle::ATX) {
+                    // Skip indented headings to match markdownlint behavior
+                    // Markdownlint only flags patterns at column 1
+                    if line_info.indent > 0 {
+                        continue;
+                    }
+
+                    // Check if there's a space after the marker
+                    let line = line_info.content(ctx.content);
+                    let trimmed = line.trim_start();
+
+                    // Skip emoji hashtags and Unicode hashtag patterns
+                    let is_emoji = EMOJI_HASHTAG_PATTERN.is_match(trimmed);
+                    let is_unicode = UNICODE_HASHTAG_PATTERN.is_match(trimmed);
+                    if is_emoji || is_unicode {
+                        continue;
+                    }
+
+                    // MagicLink config: skip MagicLink-style issue/PR refs (#123, #10, etc.)
+                    if self.config.magiclink && heading.level == 1 && Self::is_magiclink_ref(line) {
+                        continue;
+                    }
+
+                    // Tags mode: skip tag syntax (#tagname, #project/active, etc.)
+                    if self.tags_enabled(ctx.flavor) && heading.level == 1 && Self::is_tag(line) {
+                        continue;
+                    }
+
+                    if trimmed.len() > heading.marker.len() {
+                        let after_marker = &trimmed[heading.marker.len()..];
+                        if !after_marker.is_empty() && !after_marker.starts_with(' ') && !after_marker.starts_with('\t')
+                        {
+                            // Missing space after ATX marker. The indent and '#' markers
+                            // are ASCII, so convert the byte offset to a character column.
+                            let hash_end_col = byte_to_char_count(line, line_info.indent + heading.marker.len());
+                            let (start_line, start_col, end_line, end_col) = calculate_single_line_range(
+                                line_num + 1, // Convert to 1-indexed
+                                hash_end_col,
+                                0, // Zero-width to indicate missing space
+                            );
+
+                            warnings.push(LintWarning {
+                                rule_name: Some(self.name().to_string()),
+                                message: format!("No space after {} in heading", "#".repeat(heading.level as usize)),
+                                line: start_line,
+                                column: start_col,
+                                end_line,
+                                end_column: end_col,
+                                severity: Severity::Warning,
+                                fix: Some(Fix::new(self.get_line_byte_range(ctx.content, line_num + 1), {
+                                    // Preserve original indentation (including tabs)
+                                    let line = line_info.content(ctx.content);
+                                    let original_indent = &line[..line_info.indent];
+                                    format!("{original_indent}{} {after_marker}", heading.marker)
+                                })),
+                            });
+                        }
+                    }
+                }
+            } else if !line_info.in_code_block
+                && !line_info.in_front_matter
+                && !line_info.in_html_comment
+                && !line_info.in_mdx_comment
+                && !line_info.is_blank
+            {
+                // Check for malformed headings that weren't detected as proper headings
+                if let Some((hash_end_pos, fixed_line)) =
+                    self.check_atx_heading_line(line_info.content(ctx.content), ctx.flavor)
+                {
+                    let (start_line, start_col, end_line, end_col) = calculate_single_line_range(
+                        line_num + 1,     // Convert to 1-indexed
+                        hash_end_pos + 1, // 1-indexed column
+                        0,                // Zero-width to indicate missing space
+                    );
+
+                    warnings.push(LintWarning {
+                        rule_name: Some(self.name().to_string()),
+                        message: "No space after hash in heading".to_string(),
+                        line: start_line,
+                        column: start_col,
+                        end_line,
+                        end_column: end_col,
+                        severity: Severity::Warning,
+                        fix: Some(Fix::new(
+                            self.get_line_byte_range(ctx.content, line_num + 1),
+                            fixed_line,
+                        )),
+                    });
+                }
+            }
+        }
+
+        Ok(warnings)
+    }
+
+    fn fix(&self, ctx: &crate::lint_context::LintContext) -> Result<String, LintError> {
+        let warnings = self.check(ctx)?;
+        let warnings =
+            crate::utils::fix_utils::filter_warnings_by_inline_config(warnings, ctx.inline_config(), self.name());
+        let warning_lines: std::collections::HashSet<usize> = warnings.iter().map(|w| w.line).collect();
+
+        let mut lines = Vec::new();
+
+        for (idx, line_info) in ctx.lines.iter().enumerate() {
+            let mut fixed = false;
+
+            if !warning_lines.contains(&(idx + 1)) {
+                lines.push(line_info.content(ctx.content).to_string());
+                continue;
+            }
+
+            if let Some(heading) = &line_info.heading {
+                // Fix ATX headings missing space
+                if matches!(heading.style, crate::lint_context::HeadingStyle::ATX) {
+                    let line = line_info.content(ctx.content);
+                    let trimmed = line.trim_start();
+
+                    // Skip emoji hashtags and Unicode hashtag patterns
+                    let is_emoji = EMOJI_HASHTAG_PATTERN.is_match(trimmed);
+                    let is_unicode = UNICODE_HASHTAG_PATTERN.is_match(trimmed);
+
+                    // MagicLink config: skip MagicLink-style issue/PR refs (#123, #10, etc.)
+                    let is_magiclink = self.config.magiclink && heading.level == 1 && Self::is_magiclink_ref(line);
+
+                    // Tags mode: skip tag syntax (#tagname, #project/active, etc.)
+                    let is_tag = self.tags_enabled(ctx.flavor) && heading.level == 1 && Self::is_tag(line);
+
+                    // Only attempt fix if not a special pattern
+                    if !is_emoji && !is_unicode && !is_magiclink && !is_tag && trimmed.len() > heading.marker.len() {
+                        let after_marker = &trimmed[heading.marker.len()..];
+                        if !after_marker.is_empty() && !after_marker.starts_with(' ') && !after_marker.starts_with('\t')
+                        {
+                            // Add space after marker, preserving original indentation (including tabs)
+                            let line = line_info.content(ctx.content);
+                            let original_indent = &line[..line_info.indent];
+                            lines.push(format!("{original_indent}{} {after_marker}", heading.marker));
+                            fixed = true;
+                        }
+                    }
+                }
+            } else if !line_info.in_code_block
+                && !line_info.in_front_matter
+                && !line_info.in_html_comment
+                && !line_info.in_mdx_comment
+                && !line_info.is_blank
+            {
+                // Fix malformed headings
+                if let Some((_, fixed_line)) = self.check_atx_heading_line(line_info.content(ctx.content), ctx.flavor) {
+                    lines.push(fixed_line);
+                    fixed = true;
+                }
+            }
+
+            if !fixed {
+                lines.push(line_info.content(ctx.content).to_string());
+            }
+        }
+
+        // Reconstruct content preserving line endings
+        let mut result = lines.join("\n");
+        if ctx.content.ends_with('\n') && !result.ends_with('\n') {
+            result.push('\n');
+        }
+
+        Ok(result)
+    }
+
+    /// Get the category of this rule for selective processing
+    fn category(&self) -> RuleCategory {
+        RuleCategory::Heading
+    }
+
+    /// Check if this rule should be skipped
+    fn should_skip(&self, ctx: &crate::lint_context::LintContext) -> bool {
+        // Fast path: check if document likely has headings
+        !ctx.likely_has_headings()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    crate::impl_rule_config_methods!(MD018Config);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lint_context::LintContext;
+
+    #[test]
+    fn test_basic_functionality() {
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        // Test with correct space
+        let content = "# Heading 1\n## Heading 2\n### Heading 3";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty());
+
+        // Test with missing space
+        let content = "#Heading 1\n## Heading 2\n###Heading 3";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 2); // Should flag the two headings with missing spaces
+        assert_eq!(result[0].line, 1);
+        assert_eq!(result[1].line, 3);
+    }
+
+    #[test]
+    fn test_malformed_heading_detection() {
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        // Test the check_atx_heading_line method
+        assert!(
+            rule.check_atx_heading_line("##Introduction", MarkdownFlavor::Standard)
+                .is_some()
+        );
+        assert!(
+            rule.check_atx_heading_line("###Background", MarkdownFlavor::Standard)
+                .is_some()
+        );
+        assert!(
+            rule.check_atx_heading_line("####Details", MarkdownFlavor::Standard)
+                .is_some()
+        );
+        assert!(
+            rule.check_atx_heading_line("#Summary", MarkdownFlavor::Standard)
+                .is_some()
+        );
+        assert!(
+            rule.check_atx_heading_line("######Conclusion", MarkdownFlavor::Standard)
+                .is_some()
+        );
+        assert!(
+            rule.check_atx_heading_line("##Table of Contents", MarkdownFlavor::Standard)
+                .is_some()
+        );
+
+        // Should NOT detect these
+        assert!(rule.check_atx_heading_line("###", MarkdownFlavor::Standard).is_none()); // Just hashes
+        assert!(rule.check_atx_heading_line("#", MarkdownFlavor::Standard).is_none()); // Single hash
+        assert!(rule.check_atx_heading_line("##a", MarkdownFlavor::Standard).is_none()); // Too short
+        assert!(
+            rule.check_atx_heading_line("#*emphasis", MarkdownFlavor::Standard)
+                .is_none()
+        ); // Emphasis marker
+        assert!(
+            rule.check_atx_heading_line("#######TooBig", MarkdownFlavor::Standard)
+                .is_none()
+        ); // More than 6 hashes
+    }
+
+    #[test]
+    fn test_malformed_heading_with_context() {
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        // Test with full content that includes code blocks
+        let content = r#"# Test Document
+
+##Introduction
+This should be detected.
+
+    ##CodeBlock
+This should NOT be detected (indented code block).
+
+```
+##FencedCodeBlock
+This should NOT be detected (fenced code block).
+```
+
+##Conclusion
+This should be detected.
+"#;
+
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+
+        // Should detect malformed headings but ignore code blocks
+        let detected_lines: Vec<usize> = result.iter().map(|w| w.line).collect();
+        assert!(detected_lines.contains(&3)); // ##Introduction
+        assert!(detected_lines.contains(&14)); // ##Conclusion (updated line number)
+        assert!(!detected_lines.contains(&6)); // ##CodeBlock (should be ignored)
+        assert!(!detected_lines.contains(&10)); // ##FencedCodeBlock (should be ignored)
+    }
+
+    #[test]
+    fn test_malformed_heading_fix() {
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        let content = r#"##Introduction
+This is a test.
+
+###Background
+More content."#;
+
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+
+        let expected = r#"## Introduction
+This is a test.
+
+### Background
+More content."#;
+
+        assert_eq!(fixed, expected);
+    }
+
+    #[test]
+    fn test_mixed_proper_and_malformed_headings() {
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        let content = r#"# Proper Heading
+
+##Malformed Heading
+
+## Another Proper Heading
+
+###Another Malformed
+
+#### Proper with space
+"#;
+
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+
+        // Should only detect the malformed ones
+        assert_eq!(result.len(), 2);
+        let detected_lines: Vec<usize> = result.iter().map(|w| w.line).collect();
+        assert!(detected_lines.contains(&3)); // ##Malformed Heading
+        assert!(detected_lines.contains(&7)); // ###Another Malformed
+    }
+
+    #[test]
+    fn test_css_selectors_in_html_blocks() {
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        // Test CSS selectors inside <style> tags should not trigger MD018
+        // This is a common pattern in Quarto/RMarkdown files
+        let content = r#"# Proper Heading
+
+<style>
+#slide-1 ol li {
+    margin-top: 0;
+}
+
+#special-slide ol li {
+    margin-top: 2em;
+}
+</style>
+
+## Another Heading
+"#;
+
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+
+        // Should not detect CSS selectors as malformed headings
+        assert_eq!(
+            result.len(),
+            0,
+            "CSS selectors in <style> blocks should not be flagged as malformed headings"
+        );
+    }
+
+    #[test]
+    fn test_js_code_in_script_blocks() {
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        // Test that patterns like #element in <script> tags don't trigger MD018
+        let content = r#"# Heading
+
+<script>
+const element = document.querySelector('#main-content');
+#another-comment
+</script>
+
+## Another Heading
+"#;
+
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+
+        // Should not detect JS code as malformed headings
+        assert_eq!(
+            result.len(),
+            0,
+            "JavaScript code in <script> blocks should not be flagged as malformed headings"
+        );
+    }
+
+    #[test]
+    fn test_all_malformed_headings_detected() {
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        // All patterns at line start should be detected as malformed headings
+        // (matching markdownlint behavior)
+
+        // Lowercase single-hash - should be detected
+        assert!(
+            rule.check_atx_heading_line("#hello", MarkdownFlavor::Standard)
+                .is_some(),
+            "#hello SHOULD be detected as malformed heading"
+        );
+        assert!(
+            rule.check_atx_heading_line("#tag", MarkdownFlavor::Standard).is_some(),
+            "#tag SHOULD be detected as malformed heading"
+        );
+        assert!(
+            rule.check_atx_heading_line("#hashtag", MarkdownFlavor::Standard)
+                .is_some(),
+            "#hashtag SHOULD be detected as malformed heading"
+        );
+        assert!(
+            rule.check_atx_heading_line("#javascript", MarkdownFlavor::Standard)
+                .is_some(),
+            "#javascript SHOULD be detected as malformed heading"
+        );
+
+        // Numeric patterns - should be detected (could be headings like "# 123")
+        assert!(
+            rule.check_atx_heading_line("#123", MarkdownFlavor::Standard).is_some(),
+            "#123 SHOULD be detected as malformed heading"
+        );
+        assert!(
+            rule.check_atx_heading_line("#12345", MarkdownFlavor::Standard)
+                .is_some(),
+            "#12345 SHOULD be detected as malformed heading"
+        );
+        assert!(
+            rule.check_atx_heading_line("#29039)", MarkdownFlavor::Standard)
+                .is_some(),
+            "#29039) SHOULD be detected as malformed heading"
+        );
+
+        // Uppercase single-hash - should be detected
+        assert!(
+            rule.check_atx_heading_line("#Summary", MarkdownFlavor::Standard)
+                .is_some(),
+            "#Summary SHOULD be detected as malformed heading"
+        );
+        assert!(
+            rule.check_atx_heading_line("#Introduction", MarkdownFlavor::Standard)
+                .is_some(),
+            "#Introduction SHOULD be detected as malformed heading"
+        );
+        assert!(
+            rule.check_atx_heading_line("#API", MarkdownFlavor::Standard).is_some(),
+            "#API SHOULD be detected as malformed heading"
+        );
+
+        // Multi-hash patterns - should be detected
+        assert!(
+            rule.check_atx_heading_line("##introduction", MarkdownFlavor::Standard)
+                .is_some(),
+            "##introduction SHOULD be detected as malformed heading"
+        );
+        assert!(
+            rule.check_atx_heading_line("###section", MarkdownFlavor::Standard)
+                .is_some(),
+            "###section SHOULD be detected as malformed heading"
+        );
+        assert!(
+            rule.check_atx_heading_line("###fer", MarkdownFlavor::Standard)
+                .is_some(),
+            "###fer SHOULD be detected as malformed heading"
+        );
+        assert!(
+            rule.check_atx_heading_line("##123", MarkdownFlavor::Standard).is_some(),
+            "##123 SHOULD be detected as malformed heading"
+        );
+    }
+
+    #[test]
+    fn test_patterns_that_should_not_be_flagged() {
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        // Just hashes (horizontal rule or empty)
+        assert!(rule.check_atx_heading_line("###", MarkdownFlavor::Standard).is_none());
+        assert!(rule.check_atx_heading_line("#", MarkdownFlavor::Standard).is_none());
+
+        // Content too short
+        assert!(rule.check_atx_heading_line("##a", MarkdownFlavor::Standard).is_none());
+
+        // Emphasis markers
+        assert!(
+            rule.check_atx_heading_line("#*emphasis", MarkdownFlavor::Standard)
+                .is_none()
+        );
+
+        // More than 6 hashes
+        assert!(
+            rule.check_atx_heading_line("#######TooBig", MarkdownFlavor::Standard)
+                .is_none()
+        );
+
+        // Proper headings with space
+        assert!(
+            rule.check_atx_heading_line("# Hello", MarkdownFlavor::Standard)
+                .is_none()
+        );
+        assert!(
+            rule.check_atx_heading_line("## World", MarkdownFlavor::Standard)
+                .is_none()
+        );
+        assert!(
+            rule.check_atx_heading_line("### Section", MarkdownFlavor::Standard)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_inline_issue_refs_not_at_line_start() {
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        // Inline patterns (not at line start) are not checked by check_atx_heading_line
+        // because that function only checks lines that START with #
+
+        // These should return None because they don't start with #
+        assert!(
+            rule.check_atx_heading_line("See issue #123", MarkdownFlavor::Standard)
+                .is_none()
+        );
+        assert!(
+            rule.check_atx_heading_line("Check #trending on Twitter", MarkdownFlavor::Standard)
+                .is_none()
+        );
+        assert!(
+            rule.check_atx_heading_line("- fix: issue #29039", MarkdownFlavor::Standard)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_lowercase_patterns_full_check() {
+        // Integration test: verify lowercase patterns are flagged through full check() flow
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        let content = "#hello\n\n#world\n\n#tag";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+
+        assert_eq!(result.len(), 3, "All three lowercase patterns should be flagged");
+        assert_eq!(result[0].line, 1);
+        assert_eq!(result[1].line, 3);
+        assert_eq!(result[2].line, 5);
+    }
+
+    #[test]
+    fn test_numeric_patterns_full_check() {
+        // Integration test: verify numeric patterns are flagged through full check() flow
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        let content = "#123\n\n#456\n\n#29039";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+
+        assert_eq!(result.len(), 3, "All three numeric patterns should be flagged");
+    }
+
+    #[test]
+    fn test_fix_lowercase_patterns() {
+        // Verify fix() correctly handles lowercase patterns
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        let content = "#hello\nSome text.\n\n#world";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+
+        let expected = "# hello\nSome text.\n\n# world";
+        assert_eq!(fixed, expected);
+    }
+
+    #[test]
+    fn test_fix_numeric_patterns() {
+        // Verify fix() correctly handles numeric patterns
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        let content = "#123\nContent.\n\n##456";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+
+        let expected = "# 123\nContent.\n\n## 456";
+        assert_eq!(fixed, expected);
+    }
+
+    #[test]
+    fn test_indented_malformed_headings() {
+        // Indented patterns are skipped to match markdownlint behavior.
+        // Markdownlint only flags patterns at column 1 (no indentation).
+        // Indented patterns are often multi-line link continuations or list content.
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        // Indented patterns should NOT be flagged (matches markdownlint)
+        assert!(
+            rule.check_atx_heading_line(" #hello", MarkdownFlavor::Standard)
+                .is_none(),
+            "1-space indented #hello should be skipped"
+        );
+        assert!(
+            rule.check_atx_heading_line("  #hello", MarkdownFlavor::Standard)
+                .is_none(),
+            "2-space indented #hello should be skipped"
+        );
+        assert!(
+            rule.check_atx_heading_line("   #hello", MarkdownFlavor::Standard)
+                .is_none(),
+            "3-space indented #hello should be skipped"
+        );
+
+        // 4+ spaces is a code block, not checked by this function
+        // (code block detection happens at LintContext level)
+
+        // BUT patterns at column 1 (no indentation) ARE flagged
+        assert!(
+            rule.check_atx_heading_line("#hello", MarkdownFlavor::Standard)
+                .is_some(),
+            "Non-indented #hello should be detected"
+        );
+    }
+
+    #[test]
+    fn test_tab_after_hash_is_valid() {
+        // Tab after hash is valid (acts like space)
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        assert!(
+            rule.check_atx_heading_line("#\tHello", MarkdownFlavor::Standard)
+                .is_none(),
+            "Tab after # should be valid"
+        );
+        assert!(
+            rule.check_atx_heading_line("##\tWorld", MarkdownFlavor::Standard)
+                .is_none(),
+            "Tab after ## should be valid"
+        );
+    }
+
+    #[test]
+    fn test_mixed_case_patterns() {
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        // All should be detected regardless of case
+        assert!(
+            rule.check_atx_heading_line("#hELLO", MarkdownFlavor::Standard)
+                .is_some()
+        );
+        assert!(
+            rule.check_atx_heading_line("#Hello", MarkdownFlavor::Standard)
+                .is_some()
+        );
+        assert!(
+            rule.check_atx_heading_line("#HELLO", MarkdownFlavor::Standard)
+                .is_some()
+        );
+        assert!(
+            rule.check_atx_heading_line("#hello", MarkdownFlavor::Standard)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_unicode_lowercase() {
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        // Unicode lowercase should be detected
+        assert!(
+            rule.check_atx_heading_line("#über", MarkdownFlavor::Standard).is_some(),
+            "Unicode lowercase #über should be detected"
+        );
+        assert!(
+            rule.check_atx_heading_line("#café", MarkdownFlavor::Standard).is_some(),
+            "Unicode lowercase #café should be detected"
+        );
+        assert!(
+            rule.check_atx_heading_line("#日本語", MarkdownFlavor::Standard)
+                .is_some(),
+            "Japanese #日本語 should be detected"
+        );
+    }
+
+    #[test]
+    fn test_matches_markdownlint_behavior() {
+        // Comprehensive test matching markdownlint's expected behavior
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        let content = r#"#hello
+
+## world
+
+###fer
+
+#123
+
+#Tag
+"#;
+
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+
+        // markdownlint flags: #hello (line 1), ###fer (line 5), #123 (line 7), #Tag (line 9)
+        // ## world is correct (has space)
+        let flagged_lines: Vec<usize> = result.iter().map(|w| w.line).collect();
+
+        assert!(flagged_lines.contains(&1), "#hello should be flagged");
+        assert!(!flagged_lines.contains(&3), "## world should NOT be flagged");
+        assert!(flagged_lines.contains(&5), "###fer should be flagged");
+        assert!(flagged_lines.contains(&7), "#123 should be flagged");
+        assert!(flagged_lines.contains(&9), "#Tag should be flagged");
+
+        assert_eq!(result.len(), 4, "Should have exactly 4 warnings");
+    }
+
+    #[test]
+    fn test_skip_frontmatter_yaml_comments() {
+        // YAML comments in frontmatter should NOT be flagged as missing space in headings
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        let content = r#"---
+#reviewers:
+#- sig-api-machinery
+#another_comment: value
+title: Test Document
+---
+
+# Valid heading
+
+#invalid heading without space
+"#;
+
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+
+        // Should only flag line 10 (#invalid heading without space)
+        // Lines 2-4 are YAML comments in frontmatter and should be skipped
+        assert_eq!(
+            result.len(),
+            1,
+            "Should only flag the malformed heading outside frontmatter"
+        );
+        assert_eq!(result[0].line, 10, "Should flag line 10");
+    }
+
+    #[test]
+    fn test_skip_html_comments() {
+        // Content inside HTML comments should NOT be flagged
+        // This includes Jupyter cell markers like #%% in commented-out code blocks
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        let content = r#"# Real Heading
+
+Some text.
+
+<!--
+```
+#%% Cell marker
+import matplotlib.pyplot as plt
+
+#%% Another cell
+data = [1, 2, 3]
+```
+-->
+
+More content.
+"#;
+
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+
+        // Should find no issues - the #%% markers are inside HTML comments
+        assert!(
+            result.is_empty(),
+            "Should not flag content inside HTML comments, found {} issues",
+            result.len()
+        );
+    }
+
+    #[test]
+    fn test_mkdocs_magiclink_skips_numeric_refs() {
+        // With magiclink config enabled, should skip MagicLink-style issue/PR refs (#123, #10, etc.)
+        let rule = MD018NoMissingSpaceAtx::from_config_struct(MD018Config {
+            magiclink: true,
+            ..Default::default()
+        });
+
+        // These numeric patterns should be SKIPPED with magiclink enabled
+        assert!(
+            rule.check_atx_heading_line("#10", MarkdownFlavor::Standard).is_none(),
+            "#10 should be skipped with magiclink config (MagicLink issue ref)"
+        );
+        assert!(
+            rule.check_atx_heading_line("#123", MarkdownFlavor::Standard).is_none(),
+            "#123 should be skipped with magiclink config (MagicLink issue ref)"
+        );
+        assert!(
+            rule.check_atx_heading_line("#10 discusses the issue", MarkdownFlavor::Standard)
+                .is_none(),
+            "#10 followed by text should be skipped with magiclink config"
+        );
+        assert!(
+            rule.check_atx_heading_line("#37.", MarkdownFlavor::Standard).is_none(),
+            "#37 followed by punctuation should be skipped with magiclink config"
+        );
+    }
+
+    #[test]
+    fn test_mkdocs_magiclink_still_flags_non_numeric() {
+        // With magiclink config enabled, should still flag non-numeric patterns
+        let rule = MD018NoMissingSpaceAtx::from_config_struct(MD018Config {
+            magiclink: true,
+            ..Default::default()
+        });
+
+        // Non-numeric patterns should still be flagged even with magiclink enabled
+        assert!(
+            rule.check_atx_heading_line("#Summary", MarkdownFlavor::Standard)
+                .is_some(),
+            "#Summary should still be flagged with magiclink config"
+        );
+        assert!(
+            rule.check_atx_heading_line("#hello", MarkdownFlavor::Standard)
+                .is_some(),
+            "#hello should still be flagged with magiclink config"
+        );
+        assert!(
+            rule.check_atx_heading_line("#10abc", MarkdownFlavor::Standard)
+                .is_some(),
+            "#10abc (mixed) should still be flagged with magiclink config"
+        );
+    }
+
+    #[test]
+    fn test_mkdocs_magiclink_only_single_hash() {
+        // MagicLink only uses single #, so ##10 should still be flagged
+        let rule = MD018NoMissingSpaceAtx::from_config_struct(MD018Config {
+            magiclink: true,
+            ..Default::default()
+        });
+
+        assert!(
+            rule.check_atx_heading_line("##10", MarkdownFlavor::Standard).is_some(),
+            "##10 should be flagged with magiclink config (only single # is MagicLink)"
+        );
+        assert!(
+            rule.check_atx_heading_line("###123", MarkdownFlavor::Standard)
+                .is_some(),
+            "###123 should be flagged with magiclink config"
+        );
+    }
+
+    #[test]
+    fn test_standard_flavor_flags_numeric_refs() {
+        // Standard flavor should still flag numeric patterns (no MagicLink awareness)
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        assert!(
+            rule.check_atx_heading_line("#10", MarkdownFlavor::Standard).is_some(),
+            "#10 should be flagged in Standard flavor"
+        );
+        assert!(
+            rule.check_atx_heading_line("#123", MarkdownFlavor::Standard).is_some(),
+            "#123 should be flagged in Standard flavor"
+        );
+    }
+
+    #[test]
+    fn test_mkdocs_magiclink_full_check() {
+        // Integration test: verify magiclink config skips MagicLink refs through full check() flow
+        let rule = MD018NoMissingSpaceAtx::from_config_struct(MD018Config {
+            magiclink: true,
+            ..Default::default()
+        });
+
+        let content = r#"# PRs that are helpful for context
+
+#10 discusses the philosophy behind the project, and #37 shows a good example.
+
+#Summary
+
+##Introduction
+"#;
+
+        // With magiclink enabled - should skip #10 and #37, but flag #Summary and ##Introduction
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+
+        let flagged_lines: Vec<usize> = result.iter().map(|w| w.line).collect();
+        assert!(
+            !flagged_lines.contains(&3),
+            "#10 should NOT be flagged with magiclink config"
+        );
+        assert!(
+            flagged_lines.contains(&5),
+            "#Summary SHOULD be flagged with magiclink config"
+        );
+        assert!(
+            flagged_lines.contains(&7),
+            "##Introduction SHOULD be flagged with magiclink config"
+        );
+    }
+
+    #[test]
+    fn test_mkdocs_magiclink_fix_exact_output() {
+        // Verify fix() produces exact expected output with magiclink config
+        let rule = MD018NoMissingSpaceAtx::from_config_struct(MD018Config {
+            magiclink: true,
+            ..Default::default()
+        });
+
+        let content = "#10 discusses the issue.\n\n#Summary";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+
+        // Exact expected output: #10 preserved, #Summary fixed
+        let expected = "#10 discusses the issue.\n\n# Summary";
+        assert_eq!(
+            fixed, expected,
+            "magiclink config fix should preserve MagicLink refs and fix non-numeric headings"
+        );
+    }
+
+    #[test]
+    fn test_mkdocs_magiclink_edge_cases() {
+        // Test various edge cases for MagicLink pattern matching
+        let rule = MD018NoMissingSpaceAtx::from_config_struct(MD018Config {
+            magiclink: true,
+            ..Default::default()
+        });
+
+        // These should all be SKIPPED with magiclink config (valid MagicLink refs)
+        // Note: #1 alone is skipped due to content length < 2, not MagicLink
+        let valid_refs = [
+            "#10",             // Two digits
+            "#999999",         // Large number
+            "#10 text after",  // Space then text
+            "#10\ttext after", // Tab then text
+            "#10.",            // Period after
+            "#10,",            // Comma after
+            "#10!",            // Exclamation after
+            "#10?",            // Question mark after
+            "#10)",            // Close paren after
+            "#10]",            // Close bracket after
+            "#10;",            // Semicolon after
+            "#10:",            // Colon after
+        ];
+
+        for ref_str in valid_refs {
+            assert!(
+                rule.check_atx_heading_line(ref_str, MarkdownFlavor::Standard).is_none(),
+                "{ref_str:?} should be skipped as MagicLink ref with magiclink config"
+            );
+        }
+
+        // These should still be FLAGGED with magiclink config (not valid MagicLink refs)
+        let invalid_refs = [
+            "#10abc",   // Alphanumeric continuation
+            "#10a",     // Single alpha continuation
+            "#abc10",   // Alpha prefix
+            "#10ABC",   // Uppercase continuation
+            "#Summary", // Pure text
+            "#hello",   // Lowercase text
+        ];
+
+        for ref_str in invalid_refs {
+            assert!(
+                rule.check_atx_heading_line(ref_str, MarkdownFlavor::Standard).is_some(),
+                "{ref_str:?} should be flagged with magiclink config (not a valid MagicLink ref)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_mkdocs_magiclink_hyphenated_continuation() {
+        // Hyphenated patterns like #10-related should still be flagged
+        // because they're likely malformed headings, not MagicLink refs
+        let rule = MD018NoMissingSpaceAtx::from_config_struct(MD018Config {
+            magiclink: true,
+            ..Default::default()
+        });
+
+        // Hyphen is not alphanumeric, so #10- would match as MagicLink
+        // But #10-related has alphanumeric after the hyphen
+        // The regex ^#\d+(?:\s|[^a-zA-Z0-9]|$) would match #10- but not consume -related
+        // So #10-related would match (the -r part is after the match)
+        assert!(
+            rule.check_atx_heading_line("#10-", MarkdownFlavor::Standard).is_none(),
+            "#10- should be skipped with magiclink config (hyphen is non-alphanumeric terminator)"
+        );
+    }
+
+    #[test]
+    fn test_mkdocs_magiclink_standalone_number() {
+        // #10 alone on a line (common in changelogs)
+        let rule = MD018NoMissingSpaceAtx::from_config_struct(MD018Config {
+            magiclink: true,
+            ..Default::default()
+        });
+
+        let content = "See issue:\n\n#10\n\nFor details.";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+
+        // #10 alone should not be flagged with magiclink config
+        assert!(
+            result.is_empty(),
+            "Standalone #10 should not be flagged with magiclink config"
+        );
+
+        // Verify fix doesn't modify it
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, content, "fix() should not modify standalone MagicLink ref");
+    }
+
+    #[test]
+    fn test_standard_flavor_flags_all_numeric() {
+        // Standard flavor should flag ALL numeric patterns (no MagicLink awareness)
+        // Note: #1 is skipped because content length < 2 (existing behavior)
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        let numeric_patterns = ["#10", "#123", "#999999", "#10 text"];
+
+        for pattern in numeric_patterns {
+            assert!(
+                rule.check_atx_heading_line(pattern, MarkdownFlavor::Standard).is_some(),
+                "{pattern:?} should be flagged in Standard flavor"
+            );
+        }
+
+        // #1 is skipped due to content length < 2 rule (not MagicLink related)
+        assert!(
+            rule.check_atx_heading_line("#1", MarkdownFlavor::Standard).is_none(),
+            "#1 should be skipped (content too short, existing behavior)"
+        );
+    }
+
+    #[test]
+    fn test_mkdocs_vs_standard_fix_comparison() {
+        // Compare fix output between magiclink enabled and disabled
+        let content = "#10 is an issue\n#Summary";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+
+        // With magiclink: preserves #10, fixes #Summary
+        let rule_magiclink = MD018NoMissingSpaceAtx::from_config_struct(MD018Config {
+            magiclink: true,
+            ..Default::default()
+        });
+        let fixed_magiclink = rule_magiclink.fix(&ctx).unwrap();
+        assert_eq!(fixed_magiclink, "#10 is an issue\n# Summary");
+
+        // Without magiclink: fixes both
+        let rule_default = MD018NoMissingSpaceAtx::new();
+        let fixed_default = rule_default.fix(&ctx).unwrap();
+        assert_eq!(fixed_default, "# 10 is an issue\n# Summary");
+    }
+
+    // ==================== Tags config tests ====================
+
+    #[test]
+    fn test_tags_config_standard_flavor() {
+        // tags = true with standard flavor should skip tag patterns
+        let rule = MD018NoMissingSpaceAtx::from_config_struct(MD018Config {
+            magiclink: false,
+            tags: Some(true),
+        });
+
+        let content = "#tag\n\n#project/active\n\n##Introduction";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+
+        let flagged_lines: Vec<usize> = result.iter().map(|w| w.line).collect();
+        assert!(!flagged_lines.contains(&1), "#tag should be skipped with tags = true");
+        assert!(
+            !flagged_lines.contains(&3),
+            "#project/active should be skipped with tags = true"
+        );
+        assert!(flagged_lines.contains(&5), "##Introduction should still be flagged");
+    }
+
+    #[test]
+    fn test_tags_config_fix_standard_flavor() {
+        let rule = MD018NoMissingSpaceAtx::from_config_struct(MD018Config {
+            magiclink: false,
+            tags: Some(true),
+        });
+
+        let content = "#tag\n\n##Introduction";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, "#tag\n\n## Introduction");
+    }
+
+    #[test]
+    fn test_tags_config_disabled_obsidian_flavor() {
+        // tags = false with Obsidian flavor should flag tag patterns
+        let rule = MD018NoMissingSpaceAtx::from_config_struct(MD018Config {
+            magiclink: false,
+            tags: Some(false),
+        });
+
+        let content = "#tag\n\n#project/active";
+        let ctx = LintContext::new(content, MarkdownFlavor::Obsidian, None);
+        let result = rule.check(&ctx).unwrap();
+
+        assert_eq!(
+            result.len(),
+            2,
+            "tags = false should flag tag patterns even in Obsidian"
+        );
+    }
+
+    #[test]
+    fn test_tags_config_default_follows_flavor() {
+        // Unset tags should default based on flavor
+        let rule = MD018NoMissingSpaceAtx::new(); // tags: None
+
+        // Standard: should flag
+        let content = "#tag";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(!result.is_empty(), "Default standard should flag #tag");
+
+        // Obsidian: should skip
+        let ctx = LintContext::new(content, MarkdownFlavor::Obsidian, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty(), "Default Obsidian should skip #tag");
+    }
+
+    // ==================== Obsidian flavor tests ====================
+
+    #[test]
+    fn test_obsidian_tag_skips_simple_tags() {
+        // Obsidian flavor should skip tag syntax (#tagname)
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        // Simple tags should be SKIPPED in Obsidian flavor
+        assert!(
+            rule.check_atx_heading_line("#hey", MarkdownFlavor::Obsidian).is_none(),
+            "#hey should be skipped in Obsidian flavor (tag syntax)"
+        );
+        assert!(
+            rule.check_atx_heading_line("#tag", MarkdownFlavor::Obsidian).is_none(),
+            "#tag should be skipped in Obsidian flavor"
+        );
+        assert!(
+            rule.check_atx_heading_line("#hello", MarkdownFlavor::Obsidian)
+                .is_none(),
+            "#hello should be skipped in Obsidian flavor"
+        );
+        assert!(
+            rule.check_atx_heading_line("#myTag", MarkdownFlavor::Obsidian)
+                .is_none(),
+            "#myTag should be skipped in Obsidian flavor"
+        );
+    }
+
+    #[test]
+    fn test_obsidian_tag_skips_complex_tags() {
+        // Obsidian tags can have hyphens, underscores, numbers, and slashes
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        // Complex tag patterns should be SKIPPED in Obsidian flavor
+        assert!(
+            rule.check_atx_heading_line("#project/active", MarkdownFlavor::Obsidian)
+                .is_none(),
+            "#project/active should be skipped in Obsidian flavor (nested tag)"
+        );
+        assert!(
+            rule.check_atx_heading_line("#my-tag", MarkdownFlavor::Obsidian)
+                .is_none(),
+            "#my-tag should be skipped in Obsidian flavor"
+        );
+        assert!(
+            rule.check_atx_heading_line("#my_tag", MarkdownFlavor::Obsidian)
+                .is_none(),
+            "#my_tag should be skipped in Obsidian flavor"
+        );
+        assert!(
+            rule.check_atx_heading_line("#tag2023", MarkdownFlavor::Obsidian)
+                .is_none(),
+            "#tag2023 should be skipped in Obsidian flavor"
+        );
+        assert!(
+            rule.check_atx_heading_line("#project/sub/task", MarkdownFlavor::Obsidian)
+                .is_none(),
+            "#project/sub/task should be skipped in Obsidian flavor"
+        );
+    }
+
+    #[test]
+    fn test_obsidian_tag_with_trailing_content() {
+        // Tags followed by whitespace should still be skipped
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        assert!(
+            rule.check_atx_heading_line("#hey ", MarkdownFlavor::Obsidian).is_none(),
+            "#hey followed by space should be skipped"
+        );
+        assert!(
+            rule.check_atx_heading_line("#tag some text", MarkdownFlavor::Obsidian)
+                .is_none(),
+            "#tag followed by text should be skipped"
+        );
+    }
+
+    #[test]
+    fn test_obsidian_tag_still_flags_multi_hash() {
+        // Obsidian tags only use single #, so ##tag should still be flagged
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        assert!(
+            rule.check_atx_heading_line("##tag", MarkdownFlavor::Obsidian).is_some(),
+            "##tag should be flagged in Obsidian flavor (only single # is a tag)"
+        );
+        assert!(
+            rule.check_atx_heading_line("###hello", MarkdownFlavor::Obsidian)
+                .is_some(),
+            "###hello should be flagged in Obsidian flavor"
+        );
+    }
+
+    #[test]
+    fn test_obsidian_tag_numeric_still_flagged() {
+        // An Obsidian tag needs at least one non-numerical character, so an
+        // all-numeric #123 is not a tag and should still be flagged
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        assert!(
+            rule.check_atx_heading_line("#123", MarkdownFlavor::Obsidian).is_some(),
+            "#123 should be flagged in Obsidian flavor (no non-numerical character)"
+        );
+        assert!(
+            rule.check_atx_heading_line("#10", MarkdownFlavor::Obsidian).is_some(),
+            "#10 should be flagged in Obsidian flavor"
+        );
+    }
+
+    #[test]
+    fn test_obsidian_flavor_full_check() {
+        // Integration test: verify Obsidian flavor skips tags through full check() flow
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        let content = r#"# Real Heading
+
+#hey this is a tag
+
+#project/active also a tag
+
+##Introduction
+
+#123
+"#;
+
+        // Obsidian flavor - should skip #hey and #project/active, but flag ##Introduction and #123
+        let ctx = LintContext::new(content, MarkdownFlavor::Obsidian, None);
+        let result = rule.check(&ctx).unwrap();
+
+        let flagged_lines: Vec<usize> = result.iter().map(|w| w.line).collect();
+        assert!(
+            !flagged_lines.contains(&3),
+            "#hey should NOT be flagged in Obsidian flavor"
+        );
+        assert!(
+            !flagged_lines.contains(&5),
+            "#project/active should NOT be flagged in Obsidian flavor"
+        );
+        assert!(
+            flagged_lines.contains(&7),
+            "##Introduction SHOULD be flagged in Obsidian flavor"
+        );
+        assert!(flagged_lines.contains(&9), "#123 SHOULD be flagged in Obsidian flavor");
+    }
+
+    #[test]
+    fn test_obsidian_flavor_fix_exact_output() {
+        // Verify fix() produces exact expected output
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        // In Obsidian flavor, all single-# patterns that look like tags are preserved
+        // Only multi-hash patterns (##tag) and numeric patterns (#123) are fixed
+        let content = "#hey is a tag.\n\n##Introduction";
+        let ctx = LintContext::new(content, MarkdownFlavor::Obsidian, None);
+        let fixed = rule.fix(&ctx).unwrap();
+
+        // Exact expected output: #hey preserved, ##Introduction fixed
+        let expected = "#hey is a tag.\n\n## Introduction";
+        assert_eq!(
+            fixed, expected,
+            "Obsidian fix should preserve tags and fix multi-hash headings"
+        );
+    }
+
+    #[test]
+    fn test_standard_flavor_flags_obsidian_tags() {
+        // Standard flavor should flag patterns that look like Obsidian tags
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        assert!(
+            rule.check_atx_heading_line("#hey", MarkdownFlavor::Standard).is_some(),
+            "#hey should be flagged in Standard flavor"
+        );
+        assert!(
+            rule.check_atx_heading_line("#tag", MarkdownFlavor::Standard).is_some(),
+            "#tag should be flagged in Standard flavor"
+        );
+        assert!(
+            rule.check_atx_heading_line("#project/active", MarkdownFlavor::Standard)
+                .is_some(),
+            "#project/active should be flagged in Standard flavor"
+        );
+    }
+
+    #[test]
+    fn test_obsidian_vs_standard_fix_comparison() {
+        // Compare fix output between Obsidian and Standard flavors
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        // Use a pattern that clearly shows the difference:
+        // - #hey tag: single-hash, looks like Obsidian tag followed by text
+        // - ##Introduction: multi-hash, clearly a malformed heading
+        let content = "#hey tag\n##Introduction";
+
+        // Obsidian: preserves #hey tag (single-hash tag syntax), fixes ##Introduction
+        let ctx_obsidian = LintContext::new(content, MarkdownFlavor::Obsidian, None);
+        let fixed_obsidian = rule.fix(&ctx_obsidian).unwrap();
+        assert_eq!(fixed_obsidian, "#hey tag\n## Introduction");
+
+        // Standard: fixes both (no tag awareness)
+        let ctx_standard = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let fixed_standard = rule.fix(&ctx_standard).unwrap();
+        assert_eq!(fixed_standard, "# hey tag\n## Introduction");
+    }
+
+    #[test]
+    fn test_obsidian_tag_edge_cases() {
+        // Test various edge cases for Obsidian tag pattern matching
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        // Valid Obsidian tags - should be SKIPPED
+        let valid_tags = [
+            "#a",      // Minimum valid tag (also under the content length < 2 rule)
+            "#tag",    // Simple tag
+            "#Tag",    // Capitalized tag
+            "#TAG",    // Uppercase tag
+            "#my-tag", // Hyphenated tag
+            "#my_tag", // Underscored tag
+            "#tag123", // Tag with trailing numbers
+            "#a1",     // Short tag with number
+            "#日本語", // Unicode tag
+            "#über",   // Unicode with umlaut
+        ];
+
+        for tag in valid_tags {
+            assert!(
+                rule.check_atx_heading_line(tag, MarkdownFlavor::Obsidian).is_none(),
+                "{tag:?} should be skipped in Obsidian flavor (valid tag)"
+            );
+        }
+
+        // Not tags - should be FLAGGED. Every one of these is all-numeric up to
+        // the first character Obsidian would not accept in a tag.
+        let invalid_tags = ["#123", "#1984", "#37.", "#42,"];
+
+        for tag in invalid_tags {
+            assert!(
+                rule.check_atx_heading_line(tag, MarkdownFlavor::Obsidian).is_some(),
+                "{tag:?} should be flagged in Obsidian flavor (no non-numerical character)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_obsidian_tag_alone_on_line() {
+        // Standalone tag on a line (common in Obsidian notes)
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        let content = "Some text\n\n#todo\n\nMore text.";
+        let ctx = LintContext::new(content, MarkdownFlavor::Obsidian, None);
+        let result = rule.check(&ctx).unwrap();
+
+        // #todo alone should not be flagged in Obsidian flavor
+        assert!(
+            result.is_empty(),
+            "Standalone #todo should not be flagged in Obsidian flavor"
+        );
+
+        // Verify fix doesn't modify it
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, content, "fix() should not modify standalone Obsidian tag");
+    }
+
+    #[test]
+    fn test_obsidian_deeply_nested_tags() {
+        // Obsidian supports deeply nested tags with /
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        let nested_tags = [
+            "#a/b",
+            "#a/b/c",
+            "#project/2023/q1/task",
+            "#work/meetings/weekly",
+            "#life/health/exercise/running",
+        ];
+
+        for tag in nested_tags {
+            assert!(
+                rule.check_atx_heading_line(tag, MarkdownFlavor::Obsidian).is_none(),
+                "{tag:?} should be skipped in Obsidian flavor (nested tag)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_obsidian_unicode_tags() {
+        // Obsidian supports Unicode in tags
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        let unicode_tags = [
+            "#日本語", // Japanese
+            "#中文",   // Chinese
+            "#한국어", // Korean
+            "#über",   // German umlaut
+            "#café",   // French accent
+            "#ñoño",   // Spanish tilde
+            "#Москва", // Russian
+            "#αβγ",    // Greek
+        ];
+
+        for tag in unicode_tags {
+            assert!(
+                rule.check_atx_heading_line(tag, MarkdownFlavor::Obsidian).is_none(),
+                "{tag:?} should be skipped in Obsidian flavor (Unicode tag)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_obsidian_tags_with_special_endings() {
+        // Tags followed by various punctuation
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        // Tags followed by space then text should be skipped
+        assert!(
+            rule.check_atx_heading_line("#tag followed by text", MarkdownFlavor::Obsidian)
+                .is_none(),
+            "#tag followed by text should be skipped"
+        );
+
+        // Tag at end of line (no trailing space)
+        let content = "#todo";
+        let ctx = LintContext::new(content, MarkdownFlavor::Obsidian, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty(), "#todo at end of line should be skipped");
+    }
+
+    #[test]
+    fn test_obsidian_combined_with_other_skip_contexts() {
+        // Verify Obsidian tags in code blocks and HTML comments are still skipped
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        // Tag inside code block (should be skipped by code block logic, not Obsidian logic)
+        let content = "```\n#todo\n```";
+        let ctx = LintContext::new(content, MarkdownFlavor::Obsidian, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty(), "Tag in code block should be skipped");
+
+        // Tag inside HTML comment
+        let content = "<!-- #todo -->";
+        let ctx = LintContext::new(content, MarkdownFlavor::Obsidian, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty(), "Tag in HTML comment should be skipped");
+    }
+
+    #[test]
+    fn test_obsidian_boundary_cases() {
+        // Test boundary cases for Obsidian tag detection
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        // Minimum valid tag (single char after #)
+        // Note: #a alone might be skipped by content length < 2 rule
+        // #ab should definitely be recognized as a tag
+        assert!(
+            rule.check_atx_heading_line("#ab", MarkdownFlavor::Obsidian).is_none(),
+            "#ab should be skipped in Obsidian flavor"
+        );
+
+        // Tag with underscore
+        assert!(
+            rule.check_atx_heading_line("#my_tag", MarkdownFlavor::Obsidian)
+                .is_none(),
+            "#my_tag should be skipped"
+        );
+
+        // Tag with hyphen
+        assert!(
+            rule.check_atx_heading_line("#my-tag", MarkdownFlavor::Obsidian)
+                .is_none(),
+            "#my-tag should be skipped"
+        );
+
+        // Tag with mixed case
+        assert!(
+            rule.check_atx_heading_line("#MyTag", MarkdownFlavor::Obsidian)
+                .is_none(),
+            "#MyTag should be skipped"
+        );
+
+        // All caps (could be a tag or acronym)
+        assert!(
+            rule.check_atx_heading_line("#TODO", MarkdownFlavor::Obsidian).is_none(),
+            "#TODO should be skipped in Obsidian flavor"
+        );
+    }
+
+    #[test]
+    fn test_obsidian_tag_may_start_with_a_digit() {
+        // Obsidian requires at least one non-numerical character anywhere in the
+        // tag, not a non-numerical FIRST character.
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        let tags = [
+            "#3d_printing",       // the reported case
+            "#1tag",              // digit then letters
+            "#2023-project",      // digit run then a hyphen
+            "#100DaysOfCode",     // digits then mixed case
+            "#1on1",              // digits on both sides of letters
+            "#5S",                // single digit, single letter
+            "#3/4",               // digit run then a nested-tag separator
+            "#1_2",               // digit run then an underscore
+            "#3🔥",               // digit run then an emoji
+            "#3\u{FE0F}\u{20E3}", // keycap: digit, variation selector, enclosing mark
+        ];
+
+        for tag in tags {
+            assert!(
+                rule.check_atx_heading_line(tag, MarkdownFlavor::Obsidian).is_none(),
+                "{tag:?} contains a non-numerical character and should be skipped as a tag"
+            );
+        }
+    }
+
+    #[test]
+    fn test_numeric_references_are_not_tags() {
+        // The counterpart of the test above: allowing a leading digit run must
+        // not turn an issue reference or a numeric heading into a tag. Without
+        // these, widening the pattern to any non-digit would pass unnoticed.
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        let not_tags = [
+            "#1984",                   // all-numeric, Obsidian's own example
+            "#123",                    // all-numeric
+            "#10",                     // issue reference
+            "#37.",                    // issue reference ending a sentence
+            "#42,",                    // issue reference in a list
+            "#42)",                    // issue reference in parentheses
+            "#404 Not Found",          // numeric heading
+            "#10 discusses the issue", // issue reference opening a line
+        ];
+
+        for line in not_tags {
+            assert!(
+                rule.check_atx_heading_line(line, MarkdownFlavor::Obsidian).is_some(),
+                "{line:?} has no non-numerical tag character and should stay flagged"
+            );
+        }
+    }
+
+    #[test]
+    fn test_digit_leading_tag_survives_check_and_fix() {
+        // End-to-end through the two paths a user actually hits: the Obsidian
+        // flavor default, and `tags = true` on Standard flavor as reported.
+        let obsidian = MD018NoMissingSpaceAtx::new();
+        let standard = MD018NoMissingSpaceAtx::from_config_struct(MD018Config {
+            magiclink: false,
+            tags: Some(true),
+        });
+
+        // ##Heading is the positive control: it must still be flagged and fixed,
+        // otherwise an untouched tag proves nothing about the fix having run.
+        let content = "# Header\n\n#3d_printing\n\n##Heading\n";
+
+        for (rule, flavor, label) in [
+            (&obsidian, MarkdownFlavor::Obsidian, "obsidian flavor"),
+            (&standard, MarkdownFlavor::Standard, "tags = true"),
+        ] {
+            let ctx = LintContext::new(content, flavor, None);
+            let flagged: Vec<usize> = rule.check(&ctx).unwrap().iter().map(|w| w.line).collect();
+            assert_eq!(
+                flagged,
+                vec![5],
+                "{label}: only ##Heading should be flagged, got {flagged:?}"
+            );
+
+            let fixed = rule.fix(&ctx).unwrap();
+            assert_eq!(
+                fixed, "# Header\n\n#3d_printing\n\n## Heading\n",
+                "{label}: fix must leave the tag alone and still fix the heading"
+            );
+        }
+    }
+
+    #[test]
+    fn test_digit_leading_tag_is_still_flagged_without_tags_mode() {
+        // Standard flavor without the option keeps treating it as a malformed
+        // heading, so the fix does not leak tag awareness into other flavors.
+        let rule = MD018NoMissingSpaceAtx::new();
+
+        assert!(
+            rule.check_atx_heading_line("#3d_printing", MarkdownFlavor::Standard)
+                .is_some(),
+            "#3d_printing should be flagged in Standard flavor (tags disabled)"
+        );
+    }
+}

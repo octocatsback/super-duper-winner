@@ -1,0 +1,20 @@
+//! Command handlers for the rumdl CLI.
+//!
+//! Each subcommand has its own module with a public handler function
+//! that `main()` dispatches to.
+
+pub mod check;
+pub mod clean;
+pub mod code_block_tools_docs;
+pub mod completions;
+pub mod config;
+pub mod explain;
+pub mod import;
+pub mod init;
+pub mod rule;
+pub mod schema;
+// The LSP server requires tokio and the native-only `lsp` module.
+#[cfg(feature = "native")]
+pub mod server;
+pub mod version;
+pub mod vscode;
