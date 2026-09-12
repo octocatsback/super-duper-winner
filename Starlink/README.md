@@ -21,27 +21,23 @@ Machine-readable identity: [`site.yaml`](site.yaml).
 
 | Family | Who can use it | Auth | Where |
 | ------ | -------------- | ---- | ----- |
-| **Consumer session (local Device API)** | Anyone on the Starlink LAN | None on the official `Handle` / `get_diagnostics` path (link-local only) | Router `192.168.1.1:9000`, dish `192.168.100.1:9200` |
+| **Consumer session (local Device API)** | Anyone on the Starlink LAN | None (link-local `Handle` only) | Dish `192.168.100.1:9200` (`get_status` / `reboot` / `dish_stow`); router `192.168.1.1:9000` (`get_diagnostics`) |
 | **Public API v2** | Starlink **Business / enterprise** accounts | OIDC client credentials from a **V2 service account** | `https://starlink.com/api/public/v2/...` |
 
 A residential consumer account **cannot** call public v2 until an Admin (or Service Account Management) role on a Business account creates a V2 service account. That is a Gareth decision.
 
 ## Consumer session APIs
 
-Official local gRPC is published by SpaceX as `device.proto` (copied in [`proto/device.proto`](proto/device.proto) from [SpaceExplorationTechnologies/enterprise-api](https://github.com/SpaceExplorationTechnologies/enterprise-api/tree/master/device-api)).
+Local dish commands (same host/port/service, no credentials):
 
-Service: `SpaceX.API.Device.Device`  
-RPC: `Handle(Request) returns (Response)`  
-Supported official request: `get_diagnostics` (field 6000).
-
-```text
-grpcurl -plaintext -d '{"get_diagnostics":{}}' 192.168.1.1:9000 SpaceX.API.Device.Device/Handle
-grpcurl -plaintext -d '{"get_diagnostics":{}}' 192.168.100.1:9200 SpaceX.API.Device.Device/Handle
+```bash
+grpcurl -plaintext -d '{"get_status":{}}' 192.168.100.1:9200 SpaceX.API.Device.Device/Handle
+grpcurl -plaintext -d '{"reboot":{}}' 192.168.100.1:9200 SpaceX.API.Device.Device/Handle
+grpcurl -plaintext -d '{"dish_stow":{}}' 192.168.100.1:9200 SpaceX.API.Device.Device/Handle
+grpcurl -plaintext -d '{"dish_stow":{"unstow":true}}' 192.168.100.1:9200 SpaceX.API.Device.Device/Handle
 ```
 
-The Starlink phone/browser apps also speak **gRPC-Web** on router `:9001` and dish `:9201`. That is the same Device service over HTTP/1.1, still LAN-scoped. Firmware may expose additional reflected RPCs (`get_status`, `wifi_get_clients`, …). This tree stubs **only** the official `get_diagnostics` path so we do not invent undocumented cloud session APIs or scrape cookies.
-
-Minimum software (from SpaceX): router > 2023.55, user terminal > 2023.51.0.
+SpaceX also publishes `get_diagnostics` in [`proto/device.proto`](proto/device.proto) for the router at `192.168.1.1:9000`. See [`docs/CONSUMER_SESSION.md`](docs/CONSUMER_SESSION.md).
 
 See [`docs/CONSUMER_SESSION.md`](docs/CONSUMER_SESSION.md).
 
@@ -61,9 +57,10 @@ See [`docs/PUBLIC_V2.md`](docs/PUBLIC_V2.md).
 
 ```bash
 cd Starlink/stubs
-python3 consumer_session.py          # fixture mode (default)
-python3 public_v2.py                 # fixture / explains missing service account
-STARLINK_LIVE=1 python3 consumer_session.py   # optional LAN call; no secrets
+python3 consumer_session.py                 # dish grpcurl catalog + fixtures
+python3 consumer_session.py get_status
+python3 public_v2.py                        # fixture / explains missing service account
+STARLINK_LIVE=1 python3 consumer_session.py get_status   # optional LAN call; no secrets
 ```
 
 Fixtures live in [`stubs/fixtures/`](stubs/fixtures/). They use the published router id and SSID only.

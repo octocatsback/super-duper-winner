@@ -32,7 +32,13 @@ def main() -> int:
     assert cdoc["mode"] == "fixture"
     assert cdoc["router_id"] == "Router-010000000000000001F29264"
     assert cdoc["ssid"] == "Wanjer"
-    assert cdoc["request"] == {"get_diagnostics": {}}
+    assert cdoc["command"] == "get_status"
+    assert cdoc["request"] == {"get_status": {}}
+    assert "192.168.100.1:9200" in cdoc["grpcurl"]
+    assert "get_status" in cdoc["catalog"]
+    assert "reboot" in cdoc["catalog"]
+    assert "dish_stow" in cdoc["catalog"]
+    assert "unstow" in cdoc["catalog"]
 
     public = subprocess.run(
         [sys.executable, str(STUBS / "public_v2.py")],
