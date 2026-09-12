@@ -1,0 +1,90 @@
+use rumdl_lib::lint_context::LintContext;
+use rumdl_lib::{MD033NoInlineHtml, MD037NoSpaceInEmphasis, MD053LinkImageReferenceDefinitions, rule::Rule};
+use std::time::Instant;
+
+#[test]
+fn test_optimized_rules_performance() {
+    // Generate a large markdown content with HTML and emphasis
+    let mut content = String::with_capacity(100_000);
+    for i in 0..1000 {
+        content.push_str(&format!("Line {i} with <span>HTML</span> and *emphasis*\n"));
+    }
+
+    // Add reference definitions
+    content.push_str("\n\n## Reference Definitions\n\n");
+    for i in 0..200 {
+        // 100 used references
+        if i < 100 {
+            content.push_str(&format!("[ref{i}]: https://example.com/ref{i}\n"));
+            // Add usages for these references
+            content.push_str(&format!("Here is a [link][ref{i}] to example {i}\n"));
+        } else {
+            // 100 unused references (should be detected by MD053)
+            content.push_str(&format!("[unused{i}]: https://example.com/unused{i}\n"));
+        }
+    }
+
+    println!("Generated test content of {} bytes", content.len());
+
+    let ctx = LintContext::new(&content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    // Test MD033 (HTML rule)
+    let html_rule = MD033NoInlineHtml::default();
+    let start = Instant::now();
+    let html_warnings = html_rule.check(&ctx).unwrap();
+    let html_duration = start.elapsed();
+    println!(
+        "MD033 Rule check took: {:?}, found: {} issues",
+        html_duration,
+        html_warnings.len()
+    );
+
+    // Test MD037 (emphasis rule)
+    let emphasis_rule = MD037NoSpaceInEmphasis;
+    let start = Instant::now();
+    let emphasis_warnings = emphasis_rule.check(&ctx).unwrap();
+    let emphasis_duration = start.elapsed();
+    println!(
+        "MD037 Rule check took: {:?}, found: {} issues",
+        emphasis_duration,
+        emphasis_warnings.len()
+    );
+
+    // Test MD053 with caching (first run)
+    let start_time = Instant::now();
+    let reference_rule = MD053LinkImageReferenceDefinitions::default();
+    let ref_warnings = reference_rule.check(&ctx).unwrap();
+    let ref_duration = start_time.elapsed();
+    println!(
+        "MD053 Rule first check (cold cache) took: {:?}, found: {} issues",
+        ref_duration,
+        ref_warnings.len()
+    );
+
+    // Test MD053 with caching (second run - should be faster)
+    let start = Instant::now();
+    let ref_warnings_cached = reference_rule.check(&ctx).unwrap();
+    let ref_cached_duration = start.elapsed();
+    println!(
+        "MD053 Rule second check (warm cache) took: {:?}, found: {} issues",
+        ref_cached_duration,
+        ref_warnings_cached.len()
+    );
+
+    // Verify results
+    assert_eq!(
+        ref_warnings.len(),
+        ref_warnings_cached.len(),
+        "Cached and non-cached runs should return the same number of warnings"
+    );
+    assert!(ref_warnings.len() <= 100, "Should find at most 100 unused references");
+    assert!(
+        ref_cached_duration < ref_duration,
+        "Cached run should be faster than initial run"
+    );
+    assert_eq!(
+        html_warnings.len(),
+        1000,
+        "Should detect 1000 opening HTML tags (MD033 only reports opening tags, not closing tags)"
+    );
+    assert_eq!(emphasis_warnings.len(), 0, "Should not have detected emphasis issues");
+}

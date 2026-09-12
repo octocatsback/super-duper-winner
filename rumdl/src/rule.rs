@@ -1,0 +1,488 @@
+//!
+//! This module defines the Rule trait and related types for implementing linting rules in rumdl.
+
+use dyn_clone::DynClone;
+use serde::{Deserialize, Serialize};
+use std::ops::Range;
+use thiserror::Error;
+
+use crate::lint_context::LintContext;
+
+// Macro to implement box_clone for Rule implementors
+#[macro_export]
+macro_rules! impl_rule_clone {
+    ($ty:ty) => {
+        impl $ty {
+            fn box_clone(&self) -> Box<dyn Rule> {
+                Box::new(self.clone())
+            }
+        }
+    };
+}
+
+#[derive(Debug, Error)]
+pub enum LintError {
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
+    #[error("Fix failed: {0}")]
+    FixFailed(String),
+    #[error("IO error: {0}")]
+    IoError(#[from] std::io::Error),
+    #[error("Parsing error: {0}")]
+    ParsingError(String),
+}
+
+pub type LintResult = Result<Vec<LintWarning>, LintError>;
+
+#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
+pub struct LintWarning {
+    pub message: String,
+    pub line: usize, // 1-indexed start line
+    /// 1-indexed start column, measured in **characters** (not bytes).
+    /// When deriving a column from a byte offset (regex match, `str::find`,
+    /// parser byte offset), convert with `range_utils::byte_to_char_count` or a
+    /// character-based range helper. A raw byte offset mis-positions the
+    /// highlight on lines containing multi-byte UTF-8.
+    pub column: usize,
+    pub end_line: usize, // 1-indexed end line
+    /// 1-indexed end column, measured in **characters** (see `column`). Use
+    /// `str::chars().count()`, not `str::len()`, when computing a span width.
+    pub end_column: usize,
+    pub severity: Severity,
+    pub fix: Option<Fix>,
+    pub rule_name: Option<String>,
+}
+
+/// One atomic fix attached to a `LintWarning`.
+///
+/// `range`/`replacement` describe the primary edit. `additional_edits`
+/// carries any *paired* edits that must apply together with the primary one
+/// for the result to be a valid document — for example, MD054's conversion
+/// of an inline link to a reference style produces the in-place link rewrite
+/// **and** a reference-definition append at end-of-file; applying only one
+/// half would leave a dangling reference.
+///
+/// All fix consumers (the LSP code-action layer, CLI counters, the
+/// `apply_warning_fixes` helper) treat the primary edit and the
+/// `additional_edits` as a single unit. The field is empty by default so
+/// rules that only need a single-location fix can keep using
+/// `Fix::new(range, replacement)`; only rules that need multi-location
+/// atomicity populate it via `Fix::with_additional_edits(...)`.
+///
+/// `additional_edits` is intentionally a flat `Vec<Fix>` — nesting beyond
+/// one level isn't needed today and would complicate the apply contract.
+/// Apply order is "primary first, then additional in their declared order"
+/// when offsets are non-overlapping; consumers that batch multiple fixes
+/// across warnings still sort by `range.start` descending so earlier offsets
+/// remain valid as later edits mutate the buffer.
+#[derive(Debug, PartialEq, Clone, Default, Serialize, Deserialize)]
+pub struct Fix {
+    pub range: Range<usize>,
+    pub replacement: String,
+    /// Edits applied atomically with the primary `range`/`replacement` pair.
+    /// Empty for the common single-edit case. See struct docs for semantics.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_edits: Vec<Fix>,
+}
+
+impl Fix {
+    /// Construct a single-edit fix. Use this for the overwhelming common case
+    /// where a fix is one in-place replacement.
+    pub fn new(range: Range<usize>, replacement: String) -> Self {
+        Self {
+            range,
+            replacement,
+            additional_edits: Vec::new(),
+        }
+    }
+
+    /// Construct a multi-edit fix bundle. The primary edit is applied first,
+    /// followed by every entry in `additional_edits` as part of the same
+    /// atomic operation.
+    pub fn with_additional_edits(range: Range<usize>, replacement: String, additional_edits: Vec<Fix>) -> Self {
+        Self {
+            range,
+            replacement,
+            additional_edits,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    Error,
+    Warning,
+    Info,
+}
+
+impl<'de> serde::Deserialize<'de> for Severity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().as_str() {
+            "error" => Ok(Severity::Error),
+            "warning" => Ok(Severity::Warning),
+            "info" => Ok(Severity::Info),
+            _ => Err(serde::de::Error::custom(format!(
+                "Invalid severity: '{s}'. Valid values: error, warning, info"
+            ))),
+        }
+    }
+}
+
+/// Type of rule for selective processing
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleCategory {
+    Heading,
+    List,
+    CodeBlock,
+    Link,
+    Image,
+    Html,
+    Emphasis,
+    Whitespace,
+    Blockquote,
+    Table,
+    FrontMatter,
+    Other,
+}
+
+/// Capability of a rule to fix issues
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixCapability {
+    /// Rule can automatically fix all violations it detects
+    FullyFixable,
+    /// Rule can fix some violations based on context
+    ConditionallyFixable,
+    /// Rule cannot fix violations (by design)
+    Unfixable,
+}
+
+/// Declares what cross-file data a rule needs
+///
+/// Most rules only need single-file context and should use `None` (the default).
+/// Rules that need to validate references across files (like MD051) should use `Workspace`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CrossFileScope {
+    /// Single-file only - no cross-file analysis needed (default for 99% of rules)
+    #[default]
+    None,
+    /// Needs workspace-wide index for cross-file validation
+    Workspace,
+}
+
+/// A warning an inline disable comment kept out of a document's results.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuppressedWarning {
+    /// Canonical id of the rule that raised the warning, e.g. `MD013`
+    pub rule_name: String,
+    /// 1-indexed line of the warning's range the rule was found disabled on
+    pub line: usize,
+    /// The kind of directive that disabled the rule there
+    pub layer: crate::inline_config::DisableLayer,
+}
+
+/// What a run's inline disable comments actually suppressed.
+///
+/// Assembled once per document, after every single-file rule has run, so a rule
+/// reading it sees the complete picture.
+#[derive(Debug, Clone, Default)]
+pub struct SuppressionReport {
+    /// Every warning an inline disable comment removed, in the order raised
+    pub suppressed: Vec<SuppressedWarning>,
+    /// Canonical ids of the rules whose findings this report accounts for.
+    ///
+    /// A rule outside this set produced nothing the report can see, so nothing
+    /// can be concluded about a comment naming it.
+    pub judged_rules: std::collections::HashSet<String>,
+}
+
+pub trait Rule: DynClone + Send + Sync {
+    fn name(&self) -> &'static str;
+    fn description(&self) -> &'static str;
+    fn check(&self, ctx: &LintContext) -> LintResult;
+    fn fix(&self, ctx: &LintContext) -> Result<String, LintError>;
+
+    /// Check if this rule should quickly skip processing based on content
+    fn should_skip(&self, _ctx: &LintContext) -> bool {
+        false
+    }
+
+    /// Get the category of this rule for selective processing
+    fn category(&self) -> RuleCategory {
+        RuleCategory::Other // Default implementation returns Other
+    }
+
+    /// Whether the content-category prefilter may skip this rule.
+    ///
+    /// The prefilter reads the document's shape alone: a `Link` rule is skipped
+    /// for a document holding no links. A rule whose configuration widens what
+    /// it reads answers `false` for that configuration, so that `should_skip`
+    /// and `check` decide instead. MD051 and MD057 read frontmatter values on
+    /// request, and a document can carry those with no link syntax at all.
+    fn skippable_by_category(&self) -> bool {
+        true
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any;
+
+    // DocumentStructure has been merged into LintContext - this method is no longer used
+    // fn as_maybe_document_structure(&self) -> Option<&dyn MaybeDocumentStructure> {
+    //     None
+    // }
+
+    /// Returns the rule name and default config table if the rule has config.
+    /// If a rule implements this, it MUST be defined on the `impl Rule for ...` block,
+    /// not just the inherent impl.
+    ///
+    /// This is user-facing: it backs `rumdl config`, `rumdl config --defaults` and
+    /// `rumdl explain`, so every value here must be a real default the user could write
+    /// back into a config file. A key whose default cannot be written down (an unset
+    /// `Option`) is therefore absent. Config *validation* reads [`Rule::config_schema`]
+    /// instead, which keeps such keys.
+    fn default_config_section(&self) -> Option<(String, toml::Value)> {
+        None
+    }
+
+    /// Returns the rule name and every config key the rule accepts, for validation.
+    ///
+    /// A key with no representable default (an unset `Option`, or a deserializer that
+    /// accepts several TOML types) carries a sentinel value: the key name is recognized
+    /// while its type check is skipped. Sentinels contain a NUL byte and must never
+    /// reach user-facing output, which is why this is separate from
+    /// [`Rule::default_config_section`].
+    ///
+    /// Defaults to the user-facing table, which is correct for a rule whose every key
+    /// has a representable default.
+    fn config_schema(&self) -> Option<(String, toml::Value)> {
+        self.default_config_section()
+    }
+
+    /// Returns config key aliases for this rule
+    /// This allows rules to accept alternative config key names for backwards compatibility
+    fn config_aliases(&self) -> Option<std::collections::HashMap<String, String>> {
+        None
+    }
+
+    /// Returns the list of config keys whose deserializer accepts more than one TOML
+    /// type (e.g. either a scalar or a list). The schema is built from a serialized
+    /// default that can only encode one variant, so the validator would reject the
+    /// alternative form. The registry replaces the schema entry for each listed key
+    /// with a polymorphic sentinel so type checking is skipped while the key name
+    /// is still validated. The registry rewrites [`Rule::config_schema`], so
+    /// `default_config_section()` keeps returning the clean user-facing default.
+    fn polymorphic_config_keys(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Declares the fix capability of this rule
+    fn fix_capability(&self) -> FixCapability {
+        FixCapability::FullyFixable // Safe default for backward compatibility
+    }
+
+    /// Declares cross-file analysis requirements for this rule
+    ///
+    /// Returns `CrossFileScope::None` by default, meaning the rule only needs
+    /// single-file context. Rules that need workspace-wide data should override
+    /// this to return `CrossFileScope::Workspace`.
+    fn cross_file_scope(&self) -> CrossFileScope {
+        CrossFileScope::None
+    }
+
+    /// Contribute data to the workspace index during linting
+    ///
+    /// Called during the single-file linting phase for rules that return
+    /// `CrossFileScope::Workspace`. Rules should extract headings, links,
+    /// and other data needed for cross-file validation.
+    ///
+    /// This is called as a side effect of linting, so LintContext is already
+    /// created - no duplicate parsing required.
+    fn contribute_to_index(&self, _ctx: &LintContext, _file_index: &mut crate::workspace_index::FileIndex) {
+        // Default: no contribution
+    }
+
+    /// Perform cross-file validation after all files have been linted
+    ///
+    /// Called once per file after the entire workspace has been indexed.
+    /// Rules receive the file_index (from contribute_to_index) and the full
+    /// workspace_index for cross-file lookups.
+    ///
+    /// Note: This receives the FileIndex instead of LintContext to avoid re-parsing
+    /// each file. The FileIndex was already populated during contribute_to_index.
+    ///
+    /// Rules can use workspace_index methods for cross-file validation:
+    /// - `get_file(path)` - to look up headings in target files (for MD051)
+    /// - `files()` - to iterate all indexed files
+    ///
+    /// Returns additional warnings for cross-file issues. These are appended
+    /// to the single-file warnings.
+    fn cross_file_check(
+        &self,
+        _file_path: &std::path::Path,
+        _file_index: &crate::workspace_index::FileIndex,
+        _workspace_index: &crate::workspace_index::WorkspaceIndex,
+    ) -> LintResult {
+        Ok(Vec::new()) // Default: no cross-file warnings
+    }
+
+    /// Whether this rule reports on the inline comments that suppressed warnings
+    ///
+    /// Recording every suppression costs work on each file, so the linting driver
+    /// does it only when a rule asks for it. A rule answering `true` receives the
+    /// result through `check_suppressions`.
+    fn observes_suppressions(&self) -> bool {
+        false
+    }
+
+    /// Report on a document's inline disable comments
+    ///
+    /// Called once per document after every single-file rule has run, for rules
+    /// that return `true` from `observes_suppressions`. The report says which
+    /// warnings the comments removed and which rules the run can account for.
+    ///
+    /// Returns warnings that join the single-file warnings.
+    fn check_suppressions(&self, _ctx: &LintContext, _report: &SuppressionReport) -> LintResult {
+        Ok(Vec::new()) // Default: nothing to report
+    }
+
+    /// Factory: create a rule from config (if present), or use defaults.
+    fn from_config(_config: &crate::config::Config) -> Box<dyn Rule>
+    where
+        Self: Sized,
+    {
+        panic!(
+            "from_config not implemented for rule: {}",
+            std::any::type_name::<Self>()
+        );
+    }
+}
+
+// Implement the cloning logic for the Rule trait object
+dyn_clone::clone_trait_object!(Rule);
+
+/// Extension trait to add downcasting capabilities to Rule
+pub trait RuleExt {
+    fn downcast_ref<T: 'static>(&self) -> Option<&T>;
+}
+
+impl<R: Rule + 'static> RuleExt for Box<R> {
+    fn downcast_ref<T: 'static>(&self) -> Option<&T> {
+        if std::any::TypeId::of::<R>() == std::any::TypeId::of::<T>() {
+            unsafe { Some(&*std::ptr::from_ref(self.as_ref()).cast::<T>()) }
+        } else {
+            None
+        }
+    }
+}
+
+// Inline config parsing functions are in inline_config.rs.
+// Use InlineConfig::from_content() for the full inline configuration system,
+// or inline_config::parse_disable_comment/parse_enable_comment for low-level parsing.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_severity_serialization() {
+        let warning = LintWarning {
+            message: "Test warning".to_string(),
+            line: 1,
+            column: 1,
+            end_line: 1,
+            end_column: 10,
+            severity: Severity::Warning,
+            fix: None,
+            rule_name: Some("MD001".to_string()),
+        };
+
+        let serialized = serde_json::to_string(&warning).unwrap();
+        assert!(serialized.contains("\"severity\":\"warning\""));
+
+        let error = LintWarning {
+            severity: Severity::Error,
+            ..warning
+        };
+
+        let serialized = serde_json::to_string(&error).unwrap();
+        assert!(serialized.contains("\"severity\":\"error\""));
+    }
+
+    #[test]
+    fn test_fix_serialization() {
+        let fix = Fix::new(0..10, "fixed text".to_string());
+
+        let warning = LintWarning {
+            message: "Test warning".to_string(),
+            line: 1,
+            column: 1,
+            end_line: 1,
+            end_column: 10,
+            severity: Severity::Warning,
+            fix: Some(fix),
+            rule_name: Some("MD001".to_string()),
+        };
+
+        let serialized = serde_json::to_string(&warning).unwrap();
+        assert!(serialized.contains("\"fix\""));
+        assert!(serialized.contains("\"replacement\":\"fixed text\""));
+    }
+
+    #[test]
+    fn test_rule_category_equality() {
+        assert_eq!(RuleCategory::Heading, RuleCategory::Heading);
+        assert_ne!(RuleCategory::Heading, RuleCategory::List);
+
+        // Test all categories are distinct
+        let categories = [
+            RuleCategory::Heading,
+            RuleCategory::List,
+            RuleCategory::CodeBlock,
+            RuleCategory::Link,
+            RuleCategory::Image,
+            RuleCategory::Html,
+            RuleCategory::Emphasis,
+            RuleCategory::Whitespace,
+            RuleCategory::Blockquote,
+            RuleCategory::Table,
+            RuleCategory::FrontMatter,
+            RuleCategory::Other,
+        ];
+
+        for (i, cat1) in categories.iter().enumerate() {
+            for (j, cat2) in categories.iter().enumerate() {
+                if i == j {
+                    assert_eq!(cat1, cat2);
+                } else {
+                    assert_ne!(cat1, cat2);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_lint_error_conversions() {
+        use std::io;
+
+        // Test From<io::Error>
+        let io_error = io::Error::new(io::ErrorKind::NotFound, "file not found");
+        let lint_error: LintError = io_error.into();
+        match lint_error {
+            LintError::IoError(_) => {}
+            _ => panic!("Expected IoError variant"),
+        }
+
+        // Test Display trait
+        let invalid_input = LintError::InvalidInput("bad input".to_string());
+        assert_eq!(invalid_input.to_string(), "Invalid input: bad input");
+
+        let fix_failed = LintError::FixFailed("couldn't fix".to_string());
+        assert_eq!(fix_failed.to_string(), "Fix failed: couldn't fix");
+
+        let parsing_error = LintError::ParsingError("parse error".to_string());
+        assert_eq!(parsing_error.to_string(), "Parsing error: parse error");
+    }
+}

@@ -1,0 +1,532 @@
+//! Document linting, diagnostics, code actions, and auto-fix
+//!
+//! Handles the core linting workflow: running rules against documents,
+//! converting warnings to LSP diagnostics, generating code actions,
+//! and applying automatic fixes.
+
+use tower_lsp::lsp_types::*;
+
+use super::Result;
+
+use crate::code_block_tools::CodeBlockToolProcessor;
+use crate::embedded_lint::{check_embedded_markdown_blocks, should_lint_embedded_markdown};
+use crate::rule::FixCapability;
+use crate::rules;
+
+use super::server::RumdlLanguageServer;
+use super::types::{IndexState, warning_to_code_actions_with_md013_config, warnings_to_diagnostics};
+use crate::rules::md013_line_length::MD013Config;
+
+impl RumdlLanguageServer {
+    /// Check if a file URI should be excluded based on exclude patterns
+    pub(super) async fn should_exclude_uri(&self, uri: &Url) -> bool {
+        // Try to convert URI to file path
+        let Some(file_path) = super::resolve_uri(uri) else {
+            return false; // If we can't get a path, don't exclude
+        };
+
+        // Resolve configuration for this specific file to get its exclude patterns
+        let rumdl_config = self.resolve_config_for_file(&file_path).await;
+        let exclude_patterns = &rumdl_config.global.exclude;
+
+        // If no exclude patterns, don't exclude
+        if exclude_patterns.is_empty() {
+            return false;
+        }
+
+        // Relativize for pattern matching, like the CLI relativizes against
+        // the project root: prefer the deepest workspace root containing the
+        // file, fall back to the current directory, then to the path as-is.
+        let base = {
+            let roots = self.workspace_roots.read().await;
+            roots
+                .iter()
+                .filter(|r| file_path.starts_with(r))
+                .max_by_key(|r| r.components().count())
+                .cloned()
+                .or_else(|| std::env::current_dir().ok())
+        };
+        let path_to_check = base.and_then(|base| crate::discovery::path_relative_to(&file_path, &base));
+
+        let matchers = crate::discovery::ExcludeMatchers::new(exclude_patterns);
+        if let Some(pattern) = matchers.matched_pattern_for_file(path_to_check.as_deref(), &file_path) {
+            log::debug!(
+                "Excluding file from LSP linting: {} (pattern '{pattern}')",
+                file_path.display()
+            );
+            return true;
+        }
+
+        false
+    }
+
+    /// Lint a document and return diagnostics.
+    ///
+    /// When `run_external_tools` is false, external code-block-tools (which spawn
+    /// processes) are skipped. Use false for high-frequency events like `did_change`
+    /// to avoid spawning processes on every keystroke.
+    pub(crate) async fn lint_document(
+        &self,
+        uri: &Url,
+        text: &str,
+        run_external_tools: bool,
+    ) -> Result<Vec<Diagnostic>> {
+        let config_guard = self.config.read().await;
+
+        // Skip linting if disabled
+        if !config_guard.enable_linting {
+            return Ok(Vec::new());
+        }
+
+        let lsp_config = config_guard.clone();
+        drop(config_guard); // Release config lock early
+
+        // Check if file should be excluded based on exclude patterns
+        if self.should_exclude_uri(uri).await {
+            return Ok(Vec::new());
+        }
+
+        // Resolve configuration for this specific file
+        let file_path = super::resolve_uri(uri);
+        let file_config = if let Some(ref path) = file_path {
+            self.resolve_config_for_file(path).await
+        } else {
+            // Fallback to global config for non-file URIs
+            (*self.rumdl_config.read().await).clone()
+        };
+
+        // Merge LSP settings with file config based on configuration_preference
+        let rumdl_config = self.merge_lsp_settings(file_config, &lsp_config);
+
+        let all_rules = rules::all_rules(&rumdl_config);
+        // Use the standard filter_rules function which respects config's disabled rules
+        let mut filtered_rules = rules::filter_rules(&all_rules, &rumdl_config.global);
+
+        // Apply LSP config overrides (select_rules, ignore_rules from VSCode settings)
+        filtered_rules = self.apply_lsp_config_overrides(filtered_rules, &lsp_config);
+
+        // The rule set configuration left enabled, which together with
+        // per-file-ignores below decides whether an inline enable can take
+        // effect. Taken here, before per-file-ignores, so the two are separable
+        // and a warning can name the setting actually in play.
+        let active_rules: std::collections::HashSet<String> =
+            filtered_rules.iter().map(|rule| rule.name().to_string()).collect();
+
+        // Apply per-file-ignores filtering
+        let ignored_for_file = match file_path {
+            Some(ref path) => rumdl_config.get_ignored_rules_for_file(path),
+            None => std::collections::HashSet::new(),
+        };
+        if !ignored_for_file.is_empty() {
+            filtered_rules.retain(|rule| !ignored_for_file.contains(rule.name()));
+        }
+
+        // Run rumdl linting with the configured flavor.
+        //
+        // Isolate rule execution with `catch_unwind`: a panic in any single rule
+        // (a slice on a non-char boundary, an unexpected `unwrap`) must not unwind
+        // through the async request handler and take down the whole language
+        // server for every open document. On panic we degrade to no diagnostics
+        // for this document and keep serving. (A stack overflow is not catchable,
+        // which is why the known recursion vectors are fixed at the source rather
+        // than relied upon to be caught here.)
+        let document_run = crate::document_run::DocumentRun::new(text, &filtered_rules, &rumdl_config);
+        let document_run = match file_path.as_deref() {
+            Some(path) => document_run.file_path(path),
+            None => document_run,
+        };
+        let flavor = document_run.flavor();
+        let lint_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            document_run.analyze().map(|analysis| analysis.warnings)
+        }));
+        let mut all_warnings = match lint_outcome {
+            Ok(Ok(warnings)) => warnings,
+            Ok(Err(e)) => {
+                log::error!("Failed to lint document {uri}: {e}");
+                return Ok(Vec::new());
+            }
+            Err(_panic) => {
+                log::error!(
+                    "A rule panicked while linting {uri}; skipping diagnostics for this document to keep the server alive"
+                );
+                return Ok(Vec::new());
+            }
+        };
+
+        // Run cross-file checks if workspace index is ready
+        if let Some(ref path) = file_path {
+            let index_state = self.index_state.read().await.clone();
+            if matches!(index_state, IndexState::Ready) {
+                let workspace_index = self.workspace_index.read().await;
+                if let Some(file_index) = workspace_index.get_file(path) {
+                    match crate::run_cross_file_checks(
+                        path,
+                        file_index,
+                        &filtered_rules,
+                        &workspace_index,
+                        Some(&rumdl_config),
+                    ) {
+                        Ok(cross_file_warnings) => {
+                            all_warnings.extend(cross_file_warnings);
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to run cross-file checks for {uri}: {e}");
+                        }
+                    }
+                }
+            }
+        }
+
+        // Report inline config comments that name something rumdl does not know,
+        // the same set the CLI prints, so an editor shows a directive that silently
+        // does nothing instead of leaving the user to wonder why it had no effect.
+        all_warnings.extend(inline_config_warnings(text, flavor, &active_rules, &ignored_for_file));
+
+        // Check embedded markdown blocks if configured in code-block-tools
+        if should_lint_embedded_markdown(&rumdl_config.code_block_tools) {
+            let embedded_warnings = check_embedded_markdown_blocks(text, &filtered_rules, &rumdl_config);
+            all_warnings.extend(embedded_warnings);
+        }
+
+        // Run external code-block-tools only when requested (skip on keystroke events)
+        if run_external_tools && rumdl_config.code_block_tools.enabled {
+            let processor = CodeBlockToolProcessor::new(&rumdl_config.code_block_tools, flavor);
+            match processor.lint(text) {
+                Ok(diagnostics) => {
+                    let tool_warnings: Vec<_> = diagnostics
+                        .iter()
+                        .map(super::super::code_block_tools::processor::CodeBlockDiagnostic::to_lint_warning)
+                        .collect();
+                    all_warnings.extend(tool_warnings);
+                }
+                Err(e) => {
+                    log::warn!("Code block tools linting failed: {e}");
+                    all_warnings.push(crate::rule::LintWarning {
+                        message: e.to_string(),
+                        line: 1,
+                        column: 1,
+                        end_line: 1,
+                        end_column: 1,
+                        severity: crate::rule::Severity::Error,
+                        fix: None,
+                        rule_name: Some("code-block-tools".to_string()),
+                    });
+                }
+            }
+        }
+
+        Ok(warnings_to_diagnostics(&all_warnings, text))
+    }
+
+    /// Update diagnostics for a document
+    ///
+    /// This method pushes diagnostics to the client via publishDiagnostics.
+    /// When the client supports pull diagnostics (textDocument/diagnostic),
+    /// we skip pushing to avoid duplicate diagnostics.
+    pub(super) async fn update_diagnostics(&self, uri: Url, text: String, run_external_tools: bool) {
+        // When client supports pull diagnostics, publish empty diagnostics to
+        // invalidate the client cache so it refetches via the pull model
+        if *self.client_supports_pull_diagnostics.read().await {
+            log::debug!("Invalidating diagnostics for {uri} - client supports pull model");
+            self.client.publish_diagnostics(uri, Vec::new(), None).await;
+            return;
+        }
+
+        // Get the document version if available
+        let version = {
+            let docs = self.documents.read().await;
+            docs.get(&uri).and_then(|entry| entry.version)
+        };
+
+        match self.lint_document(&uri, &text, run_external_tools).await {
+            Ok(diagnostics) => {
+                self.client.publish_diagnostics(uri, diagnostics, version).await;
+            }
+            Err(e) => {
+                log::error!("Failed to update diagnostics: {e}");
+            }
+        }
+    }
+
+    /// Apply all available fixes to a document
+    pub(super) async fn apply_all_fixes(&self, uri: &Url, text: &str) -> Result<Option<String>> {
+        // Check if file should be excluded based on exclude patterns
+        if self.should_exclude_uri(uri).await {
+            return Ok(None);
+        }
+
+        let config_guard = self.config.read().await;
+        let lsp_config = config_guard.clone();
+        drop(config_guard);
+
+        // Resolve configuration for this specific file
+        let file_path = super::resolve_uri(uri);
+        let file_config = if let Some(ref path) = file_path {
+            self.resolve_config_for_file(path).await
+        } else {
+            // Fallback to global config for non-file URIs
+            (*self.rumdl_config.read().await).clone()
+        };
+
+        // Merge LSP settings with file config based on configuration_preference
+        let rumdl_config = self.merge_lsp_settings(file_config, &lsp_config);
+
+        let all_rules = rules::all_rules(&rumdl_config);
+
+        // Use the standard filter_rules function which respects config's disabled rules
+        let mut filtered_rules = rules::filter_rules(&all_rules, &rumdl_config.global);
+
+        // Apply LSP config overrides (select_rules, ignore_rules from VSCode settings)
+        filtered_rules = self.apply_lsp_config_overrides(filtered_rules, &lsp_config);
+
+        // Apply per-file-ignores filtering
+        if let Some(ref path) = file_path {
+            let ignored = rumdl_config.get_ignored_rules_for_file(path);
+            if !ignored.is_empty() {
+                filtered_rules.retain(|rule| !ignored.contains(rule.name()));
+            }
+        }
+
+        // Apply fixes through the FixCoordinator, the same engine `rumdl fmt`
+        // uses: rules run in dependency order, fixes iterate to a fixpoint
+        // with oscillation detection, inline disable comments and the
+        // fixable/unfixable config lists are honored. Editor fix-all and the
+        // CLI therefore produce identical output.
+        let run = crate::document_run::DocumentRun::new(text, &filtered_rules, &rumdl_config);
+        let run = match file_path.as_deref() {
+            Some(path) => run.file_path(path),
+            None => run,
+        };
+        let fixed_text = match run.fix(100) {
+            Ok((fixed, _)) => fixed,
+            Err(e) => {
+                log::warn!("Failed to apply fixes: {e}");
+                return Ok(None);
+            }
+        };
+
+        if fixed_text != text {
+            Ok(Some(fixed_text))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get the end position of a document
+    pub(super) fn get_end_position(&self, text: &str) -> Position {
+        super::position::end_of_text(text)
+    }
+
+    /// Apply LSP FormattingOptions to content
+    ///
+    /// This implements the standard LSP formatting options that editors send:
+    /// - `trim_trailing_whitespace`: Remove trailing whitespace from each line
+    /// - `insert_final_newline`: Ensure file ends with a newline
+    /// - `trim_final_newlines`: Remove extra blank lines at end of file
+    ///
+    /// This is applied AFTER lint fixes to ensure we respect editor preferences
+    /// even when the editor's buffer content differs from the file on disk
+    /// (e.g., nvim may strip trailing newlines from its buffer representation).
+    ///
+    /// The document keeps its line-ending convention: the options operate on
+    /// LF text and the original ending is restored afterwards, the way
+    /// `DocumentRun::fix` does. A document the options leave alone comes back
+    /// byte-identical.
+    pub(super) fn apply_formatting_options(content: String, options: &FormattingOptions) -> String {
+        // If the original content is empty, keep it empty regardless of options
+        // This prevents marking empty documents as needing formatting
+        if content.is_empty() {
+            return content;
+        }
+
+        let line_ending = crate::utils::detect_line_ending_enum(&content);
+        let normalized = crate::utils::normalize_line_ending(&content, crate::utils::LineEnding::Lf);
+        let mut result = normalized.to_string();
+        let original_ended_with_newline = normalized.ends_with('\n');
+
+        // 1. Trim trailing whitespace from each line (if requested)
+        if options.trim_trailing_whitespace.unwrap_or(false) {
+            result = result.lines().map(str::trim_end).collect::<Vec<_>>().join("\n");
+            // Preserve final newline status for next steps
+            if original_ended_with_newline && !result.ends_with('\n') {
+                result.push('\n');
+            }
+        }
+
+        // 2. Trim final newlines (remove extra blank lines at EOF)
+        // This runs BEFORE insert_final_newline to handle the case where
+        // we have multiple trailing newlines and want exactly one
+        if options.trim_final_newlines.unwrap_or(false) {
+            // Remove all trailing newlines
+            while result.ends_with('\n') {
+                result.pop();
+            }
+            // We'll add back exactly one in the next step if insert_final_newline is true
+        }
+
+        // 3. Insert final newline (ensure file ends with exactly one newline)
+        if options.insert_final_newline.unwrap_or(false) && !result.ends_with('\n') {
+            result.push('\n');
+        }
+
+        if result == *normalized {
+            return content;
+        }
+        crate::utils::normalize_line_ending(&result, line_ending).into_owned()
+    }
+
+    /// Get code actions for diagnostics at a position
+    pub(super) async fn get_code_actions(&self, uri: &Url, text: &str, range: Range) -> Result<Vec<CodeAction>> {
+        let config_guard = self.config.read().await;
+        let lsp_config = config_guard.clone();
+        drop(config_guard);
+
+        // Resolve configuration for this specific file
+        let file_path = super::resolve_uri(uri);
+        let file_config = if let Some(ref path) = file_path {
+            self.resolve_config_for_file(path).await
+        } else {
+            // Fallback to global config for non-file URIs
+            (*self.rumdl_config.read().await).clone()
+        };
+
+        // Merge LSP settings with file config based on configuration_preference
+        let rumdl_config = self.merge_lsp_settings(file_config, &lsp_config);
+
+        let all_rules = rules::all_rules(&rumdl_config);
+        // Use the standard filter_rules function which respects config's disabled rules
+        let mut filtered_rules = rules::filter_rules(&all_rules, &rumdl_config.global);
+
+        // Apply LSP config overrides (select_rules, ignore_rules from VSCode settings)
+        filtered_rules = self.apply_lsp_config_overrides(filtered_rules, &lsp_config);
+
+        // Apply per-file-ignores filtering
+        if let Some(ref path) = file_path {
+            let ignored = rumdl_config.get_ignored_rules_for_file(path);
+            if !ignored.is_empty() {
+                filtered_rules.retain(|rule| !ignored.contains(rule.name()));
+            }
+        }
+
+        // Extract MD013 config once so the "Reflow paragraph" action respects user settings.
+        let md013_config = MD013Config::from_document_config(&rumdl_config);
+
+        let run = crate::document_run::DocumentRun::new(text, &filtered_rules, &rumdl_config);
+        let run = match file_path.as_deref() {
+            Some(path) => run.file_path(path),
+            None => run,
+        };
+        match run.analyze().map(|analysis| analysis.warnings) {
+            Ok(warnings) => {
+                let mut actions = Vec::new();
+
+                for warning in &warnings {
+                    // Offer a warning's quick fixes whenever the requested range overlaps the
+                    // warning's full span, not just its anchor line. A diagnostic can cover
+                    // several lines (e.g. a reflowed paragraph), and editors request code
+                    // actions for the cursor's line; matching only the anchor line left the
+                    // light-bulb popup empty when the cursor sat on a later line of the span.
+                    let warning_start = warning.line.saturating_sub(1) as u32;
+                    let warning_end = warning.end_line.saturating_sub(1).max(warning.line.saturating_sub(1)) as u32;
+                    if warning_start <= range.end.line && warning_end >= range.start.line {
+                        // Get all code actions for this warning (fix + ignore actions)
+                        let mut warning_actions =
+                            warning_to_code_actions_with_md013_config(warning, uri, text, Some(&md013_config));
+                        actions.append(&mut warning_actions);
+                    }
+                }
+
+                // Count fixable warnings across the entire document for the fixAll gate.
+                // source.fixAll.rumdl applies to the whole file, not just the requested range.
+                let fixable_count = warnings.iter().filter(|w| w.fix.is_some()).count();
+
+                if fixable_count > 0 {
+                    // Only apply fixes from fixable rules during "Fix all"
+                    // Unfixable rules provide warning-level fixes for individual Quick Fix actions
+                    let fixable_warnings: Vec<_> = warnings
+                        .iter()
+                        .filter(|w| {
+                            if let Some(rule_name) = &w.rule_name {
+                                filtered_rules
+                                    .iter()
+                                    .find(|r| r.name() == rule_name)
+                                    .is_some_and(|r| r.fix_capability() != FixCapability::Unfixable)
+                            } else {
+                                false
+                            }
+                        })
+                        .cloned()
+                        .collect();
+
+                    // Count total fixable issues (excluding Unfixable rules)
+                    let total_fixable = fixable_warnings.len();
+
+                    if let Ok(fixed_content) = crate::utils::fix_utils::apply_warning_fixes(text, &fixable_warnings)
+                        && fixed_content != text
+                    {
+                        let document_end = self.get_end_position(text);
+
+                        let fix_all_action = CodeAction {
+                            title: format!("Fix all rumdl issues ({total_fixable} fixable)"),
+                            kind: Some(CodeActionKind::new("source.fixAll.rumdl")),
+                            diagnostics: Some(Vec::new()),
+                            edit: Some(WorkspaceEdit {
+                                changes: Some(
+                                    [(
+                                        uri.clone(),
+                                        vec![TextEdit {
+                                            range: Range {
+                                                start: Position { line: 0, character: 0 },
+                                                end: document_end,
+                                            },
+                                            new_text: fixed_content,
+                                        }],
+                                    )]
+                                    .into_iter()
+                                    .collect(),
+                                ),
+                                ..Default::default()
+                            }),
+                            command: None,
+                            is_preferred: Some(true),
+                            disabled: None,
+                            data: None,
+                        };
+
+                        // Insert at the beginning to make it prominent
+                        actions.insert(0, fix_all_action);
+                    }
+                }
+
+                Ok(actions)
+            }
+            Err(e) => {
+                log::error!("Failed to get code actions: {e}");
+                Ok(Vec::new())
+            }
+        }
+    }
+}
+
+/// The inline config problems in a document, as diagnostics.
+///
+/// Mirrors what the CLI validates for every file it checks: a directive naming an
+/// unknown rule or option, and an inline enable that rule selection leaves with
+/// nothing to do. `active_rules` is the set configuration left enabled and
+/// `ignored_for_file` the set per-file-ignores then takes away, which together
+/// decide the second one.
+fn inline_config_warnings(
+    text: &str,
+    flavor: crate::config::MarkdownFlavor,
+    active_rules: &std::collections::HashSet<String>,
+    ignored_for_file: &std::collections::HashSet<String>,
+) -> Vec<crate::rule::LintWarning> {
+    let mut warnings = crate::inline_config::validate_inline_config_rules(text, flavor);
+    warnings.extend(crate::inline_config::validate_inline_enables_against_active_rules(
+        text,
+        flavor,
+        active_rules,
+        ignored_for_file,
+    ));
+    warnings.iter().map(|w| w.to_lint_warning(text)).collect()
+}

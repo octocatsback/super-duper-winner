@@ -1,0 +1,468 @@
+use crate::filtered_lines::FilteredLinesExt;
+use regex::{Regex, RegexBuilder};
+
+use crate::rule::{FixCapability, LintError, LintResult, LintWarning, Rule, RuleCategory, Severity};
+use crate::utils::range_utils::byte_to_char_count;
+
+mod md061_config;
+pub(super) use md061_config::MD061Config;
+
+/// Rule MD061: Forbidden terms
+///
+/// See [docs/md061.md](../../docs/md061.md) for full documentation, configuration, and examples.
+
+#[derive(Debug, Clone, Default)]
+pub struct MD061ForbiddenTerms {
+    config: MD061Config,
+    pattern: Option<Regex>,
+}
+
+impl MD061ForbiddenTerms {
+    pub fn new(terms: Vec<String>, case_sensitive: bool) -> Self {
+        let config = MD061Config { terms, case_sensitive };
+        let pattern = Self::build_pattern(&config);
+        Self { config, pattern }
+    }
+
+    pub fn from_config_struct(config: MD061Config) -> Self {
+        let pattern = Self::build_pattern(&config);
+        Self { config, pattern }
+    }
+
+    fn build_pattern(config: &MD061Config) -> Option<Regex> {
+        if config.terms.is_empty() {
+            return None;
+        }
+
+        // Build alternation pattern from terms, escaping regex metacharacters
+        let escaped_terms: Vec<String> = config.terms.iter().map(|term| regex::escape(term)).collect();
+        let pattern_str = escaped_terms.join("|");
+
+        RegexBuilder::new(&pattern_str)
+            .case_insensitive(!config.case_sensitive)
+            .build()
+            .ok()
+    }
+
+    /// Check if match is at a word boundary
+    fn is_word_boundary(content: &str, start: usize, end: usize) -> bool {
+        let before_ok = if start == 0 {
+            true
+        } else {
+            content[..start]
+                .chars()
+                .last()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+        };
+
+        let after_ok = if end >= content.len() {
+            true
+        } else {
+            content[end..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+        };
+
+        before_ok && after_ok
+    }
+}
+
+impl Rule for MD061ForbiddenTerms {
+    fn name(&self) -> &'static str {
+        "MD061"
+    }
+
+    fn description(&self) -> &'static str {
+        "Forbidden terms"
+    }
+
+    fn check(&self, ctx: &crate::lint_context::LintContext) -> LintResult {
+        // Early return if no terms configured
+        let Some(pattern) = &self.pattern else {
+            return Ok(Vec::new());
+        };
+
+        let mut warnings = Vec::new();
+
+        // Use filtered_lines to skip frontmatter, code blocks, HTML comments, and Obsidian comments
+        for line in ctx
+            .filtered_lines()
+            .skip_front_matter()
+            .skip_code_blocks()
+            .skip_html_comments()
+            .skip_jsx_expressions()
+            .skip_mdx_comments()
+            .skip_obsidian_comments()
+        {
+            let content = line.content;
+
+            // Find all matches in this line
+            for mat in pattern.find_iter(content) {
+                // Skip if inside inline code (col is a 1-indexed character column)
+                if ctx.is_in_code_span(line.line_num, byte_to_char_count(content, mat.start())) {
+                    continue;
+                }
+
+                // Check word boundaries
+                if !Self::is_word_boundary(content, mat.start(), mat.end()) {
+                    continue;
+                }
+
+                // Quote the term as the document writes it. The reported range covers
+                // exactly these bytes, and under case-insensitive matching the text can
+                // differ from the configured spelling, so any case-folded form would
+                // name something that appears in neither the document nor the config.
+                let matched_term = &content[mat.start()..mat.end()];
+
+                warnings.push(LintWarning {
+                    rule_name: Some(self.name().to_string()),
+                    severity: Severity::Warning,
+                    message: format!("Found forbidden term '{matched_term}'"),
+                    line: line.line_num,
+                    column: byte_to_char_count(content, mat.start()),
+                    end_line: line.line_num,
+                    end_column: byte_to_char_count(content, mat.end()),
+                    fix: None, // No auto-fix for warning comments
+                });
+            }
+        }
+
+        Ok(warnings)
+    }
+
+    fn fix(&self, ctx: &crate::lint_context::LintContext) -> Result<String, LintError> {
+        Ok(ctx.content.to_string())
+    }
+
+    fn category(&self) -> RuleCategory {
+        RuleCategory::Other
+    }
+
+    fn fix_capability(&self) -> FixCapability {
+        FixCapability::Unfixable
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn should_skip(&self, _ctx: &crate::lint_context::LintContext) -> bool {
+        // Skip if no terms configured
+        self.config.terms.is_empty()
+    }
+
+    crate::impl_rule_config_methods!(MD061Config);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::MarkdownFlavor;
+    use crate::lint_context::LintContext;
+
+    #[test]
+    fn test_empty_config_no_warnings() {
+        let rule = MD061ForbiddenTerms::default();
+        let content = "# TODO: This should not trigger\n\nFIXME: This too\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_configured_terms_detected() {
+        let rule = MD061ForbiddenTerms::new(vec!["TODO".to_string(), "FIXME".to_string()], false);
+        let content = "# Heading\n\nTODO: Implement this\n\nFIXME: Fix this bug\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 2);
+        assert!(result[0].message.contains("forbidden term"));
+        assert!(result[0].message.contains("TODO"));
+        assert!(result[1].message.contains("forbidden term"));
+        assert!(result[1].message.contains("FIXME"));
+    }
+
+    #[test]
+    fn test_case_sensitive_by_default() {
+        // Default is case-sensitive, so only exact match "TODO" is found
+        let config = MD061Config {
+            terms: vec!["TODO".to_string()],
+            ..Default::default()
+        };
+        let rule = MD061ForbiddenTerms::from_config_struct(config);
+        let content = "todo: lowercase\nTODO: uppercase\nTodo: mixed\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].line, 2); // Only "TODO" on line 2 matches
+    }
+
+    #[test]
+    fn test_case_insensitive_opt_in() {
+        let rule = MD061ForbiddenTerms::new(vec!["TODO".to_string()], false);
+        let content = "todo: lowercase\nTODO: uppercase\nTodo: mixed\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn test_message_quotes_document_casing() {
+        // Case-insensitive matching quotes the document, not a case-folded form:
+        // "DELVE" appears in neither the document nor the configured terms.
+        let rule = MD061ForbiddenTerms::new(vec!["delve".to_string()], false);
+        let content = "We Delve into it.\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].message, "Found forbidden term 'Delve'");
+    }
+
+    #[test]
+    fn test_message_quotes_multi_word_document_casing() {
+        let rule = MD061ForbiddenTerms::new(vec!["at the end of the day".to_string()], false);
+        let content = "At the end of the day it ships.\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].message, "Found forbidden term 'At the end of the day'");
+    }
+
+    #[test]
+    fn test_message_quotes_exact_text_when_case_sensitive() {
+        let rule = MD061ForbiddenTerms::new(vec!["TODO".to_string()], true);
+        let content = "TODO: something\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].message, "Found forbidden term 'TODO'");
+    }
+
+    #[test]
+    fn test_message_quotes_what_the_range_covers() {
+        // The quoted term and the reported range name the same text, including on a
+        // line whose match is preceded by multi-byte characters.
+        let rule = MD061ForbiddenTerms::new(vec!["delve".to_string()], false);
+        let content = "你好 Delve deeper\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+
+        let warning = &result[0];
+        let line: Vec<char> = content.lines().next().unwrap().chars().collect();
+        let spanned: String = line[warning.column - 1..warning.end_column - 1].iter().collect();
+        assert_eq!(spanned, "Delve");
+        assert_eq!(warning.message, format!("Found forbidden term '{spanned}'"));
+    }
+
+    #[test]
+    fn test_case_sensitive_mode() {
+        let rule = MD061ForbiddenTerms::new(vec!["TODO".to_string()], true);
+        let content = "todo: lowercase\nTODO: uppercase\nTodo: mixed\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].line, 2);
+    }
+
+    #[test]
+    fn test_word_boundary_no_false_positive() {
+        let rule = MD061ForbiddenTerms::new(vec!["TODO".to_string()], false);
+        let content = "TODOMORROW is not a match\nTODO is a match\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].line, 2);
+    }
+
+    #[test]
+    fn test_word_boundary_with_punctuation() {
+        let rule = MD061ForbiddenTerms::new(vec!["TODO".to_string()], false);
+        let content = "TODO: colon\nTODO. period\n(TODO) parens\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn test_skip_fenced_code_block() {
+        let rule = MD061ForbiddenTerms::new(vec!["TODO".to_string()], false);
+        let content = "# Heading\n\n```\nTODO: in code block\n```\n\nTODO: outside\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].line, 7);
+    }
+
+    #[test]
+    fn test_skip_indented_code_block() {
+        let rule = MD061ForbiddenTerms::new(vec!["TODO".to_string()], false);
+        let content = "# Heading\n\n    TODO: in indented code\n\nTODO: outside\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].line, 5);
+    }
+
+    #[test]
+    fn test_skip_inline_code() {
+        let rule = MD061ForbiddenTerms::new(vec!["TODO".to_string()], false);
+        let content = "Here is `TODO` in inline code\nTODO: outside inline\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].line, 2);
+    }
+
+    #[test]
+    fn test_skip_frontmatter() {
+        let rule = MD061ForbiddenTerms::new(vec!["TODO".to_string()], false);
+        let content = "---\ntitle: TODO in frontmatter\n---\n\nTODO: outside\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].line, 5);
+    }
+
+    #[test]
+    fn test_multiple_terms_on_same_line() {
+        let rule = MD061ForbiddenTerms::new(vec!["TODO".to_string(), "FIXME".to_string()], false);
+        let content = "TODO: first thing FIXME: second thing\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_term_at_start_of_line() {
+        let rule = MD061ForbiddenTerms::new(vec!["TODO".to_string()], false);
+        let content = "TODO at start\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].column, 1);
+    }
+
+    #[test]
+    fn test_term_at_end_of_line() {
+        let rule = MD061ForbiddenTerms::new(vec!["TODO".to_string()], false);
+        let content = "something TODO\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_custom_terms() {
+        let rule = MD061ForbiddenTerms::new(vec!["HACK".to_string(), "XXX".to_string()], false);
+        let content = "HACK: workaround\nXXX: needs review\nTODO: not configured\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_no_fix_available() {
+        let rule = MD061ForbiddenTerms::new(vec!["TODO".to_string()], false);
+        let content = "TODO: something\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].fix.is_none());
+    }
+
+    #[test]
+    fn test_column_positions() {
+        let rule = MD061ForbiddenTerms::new(vec!["TODO".to_string()], false);
+        // Use 2 spaces, not 4 (4 spaces creates a code block)
+        let content = "  TODO: indented\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].column, 3); // 1-based column, TODO starts at col 3
+        assert_eq!(result[0].end_column, 7);
+    }
+
+    #[test]
+    fn test_config_from_toml() {
+        let mut config = crate::config::Config::default();
+        let mut rule_config = crate::config::RuleConfig::default();
+        rule_config.values.insert(
+            "terms".to_string(),
+            toml::Value::Array(vec![toml::Value::String("FIXME".to_string())]),
+        );
+        config.rules.insert("MD061".to_string(), rule_config);
+
+        let rule = MD061ForbiddenTerms::from_config(&config);
+        let content = "FIXME: configured\nTODO: not configured\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].message.contains("forbidden term"));
+        assert!(result[0].message.contains("FIXME"));
+    }
+
+    #[test]
+    fn test_config_from_toml_case_sensitive_by_default() {
+        // Simulates user config: [MD061] terms = ["TODO"]
+        // Without explicitly setting case_sensitive, should default to true
+        let mut config = crate::config::Config::default();
+        let mut rule_config = crate::config::RuleConfig::default();
+        rule_config.values.insert(
+            "terms".to_string(),
+            toml::Value::Array(vec![toml::Value::String("TODO".to_string())]),
+        );
+        config.rules.insert("MD061".to_string(), rule_config);
+
+        let rule = MD061ForbiddenTerms::from_config(&config);
+        let content = "todo: lowercase\nTODO: uppercase\nTodo: mixed\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+
+        // Should only match "TODO" (uppercase), not "todo" or "Todo"
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].line, 2);
+    }
+
+    #[test]
+    fn test_skip_html_comment() {
+        let rule = MD061ForbiddenTerms::new(vec!["TODO".to_string()], false);
+        let content = "<!-- TODO: in html comment -->\nTODO: outside\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].line, 2);
+    }
+
+    #[test]
+    fn test_skip_double_backtick_inline_code() {
+        let rule = MD061ForbiddenTerms::new(vec!["TODO".to_string()], false);
+        let content = "Here is ``TODO`` in double backticks\nTODO: outside\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].line, 2);
+    }
+
+    #[test]
+    fn test_skip_triple_backtick_inline_code() {
+        let rule = MD061ForbiddenTerms::new(vec!["TODO".to_string()], false);
+        let content = "Here is ```TODO``` in triple backticks\nTODO: outside\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].line, 2);
+    }
+
+    #[test]
+    fn test_inline_code_with_backtick_content() {
+        let rule = MD061ForbiddenTerms::new(vec!["TODO".to_string()], false);
+        // Content with a backtick inside: `` `TODO` ``
+        let content = "Use `` `TODO` `` to show a backtick\nTODO: outside\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].line, 2);
+    }
+}

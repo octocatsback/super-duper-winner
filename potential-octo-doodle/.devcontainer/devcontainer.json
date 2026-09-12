@@ -1,0 +1,40 @@
+{
+  "name": "Mona Astro Website",
+  "image": "mcr.microsoft.com/devcontainers/base:jammy",
+  "features": {
+    "ghcr.io/devcontainers/features/github-cli:1": {},
+    "ghcr.io/devcontainers/features/node:2.0.0": {
+      "version": "lts"
+    }
+  },
+  "forwardPorts": [4321],
+  "portsAttributes": {
+    "4321": {
+      "label": "Mona Astro site",
+      "onAutoForward": "openPreview"
+    }
+  },
+  "postCreateCommand": "bash .devcontainer/postCreate.sh",
+  "postStartCommand": "bash .devcontainer/postStart.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "astro-build.astro-vscode",
+        "github.copilot",
+        "github.copilot-chat"
+      ],
+      "settings": {
+        "task.allowAutomaticTasks": "on",
+        "terminal.integrated.defaultLocation": "editor",
+        "files.exclude": {
+          "**/site/node_modules": true,
+          "**/site/.astro": true,
+          "**/site/dist": true
+        }
+      }
+    }
+  },
+  "remoteEnv": {
+    "ASTRO_TELEMETRY_DISABLED": "1"
+  }
+}

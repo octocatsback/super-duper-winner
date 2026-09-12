@@ -1,0 +1,55 @@
+{
+  "name": "@npmcli/smoke-tests",
+  "description": "The npm cli smoke tests",
+  "version": "1.0.1",
+  "private": true,
+  "scripts": {
+    "lint": "npm run eslint",
+    "postlint": "template-oss-check",
+    "template-oss-apply": "template-oss-apply --force",
+    "lintfix": "npm run eslint -- --fix",
+    "snap": "tap",
+    "test": "tap",
+    "posttest": "npm run lint",
+    "eslint": "eslint \"**/*.{js,cjs,ts,mjs,jsx,tsx}\""
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/npm/cli.git",
+    "directory": "smoke-tests"
+  },
+  "devDependencies": {
+    "@npmcli/eslint-config": "^5.0.1",
+    "@npmcli/mock-registry": "^1.0.0",
+    "@npmcli/promise-spawn": "^10.0.0",
+    "@npmcli/template-oss": "5.1.1",
+    "proxy": "^2.1.1",
+    "rimraf": "^6.0.1",
+    "tap": "^16.3.8",
+    "which": "^7.0.0"
+  },
+  "author": "GitHub Inc.",
+  "license": "ISC",
+  "templateOSS": {
+    "//@npmcli/template-oss": "This file is partially managed by @npmcli/template-oss. Edits may be overwritten.",
+    "version": "5.1.1",
+    "content": "../scripts/template-oss/index.js"
+  },
+  "tap": {
+    "no-coverage": true,
+    "timeout": 600,
+    "jobs": 1,
+    "test-ignore": "fixtures/*",
+    "nyc-arg": [
+      "--exclude",
+      "tap-snapshots/**"
+    ]
+  },
+  "files": [
+    "bin/",
+    "lib/"
+  ],
+  "engines": {
+    "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
+  }
+}

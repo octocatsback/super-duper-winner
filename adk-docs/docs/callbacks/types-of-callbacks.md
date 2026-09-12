@@ -1,0 +1,346 @@
+# Types of Callbacks
+
+<div class="language-support-tag">
+  <span class="lst-supported">Supported in ADK</span><span class="lst-python">Python v0.1.0</span><span class="lst-typescript">TypeScript v0.2.0</span><span class="lst-go">Go v0.1.0</span><span class="lst-java">Java v0.1.0</span>
+</div>
+
+The framework provides different types of callbacks that trigger at various stages of an agent's execution. Understanding when each callback fires and what context it receives is key to using them effectively.
+
+## Agent Lifecycle Callbacks
+
+These callbacks are available on *any* agent that inherits from `BaseAgent` (including `LlmAgent`, `SequentialAgent`, `ParallelAgent`, `LoopAgent`, etc).
+
+!!! Note
+    The specific method names or return types may vary slightly by SDK language (e.g., return `None` in Python, return `Optional.empty()` or `Maybe.empty()` in Java). Refer to the language-specific API documentation for details.
+
+??? warning "Python: Use the documented callback parameter names"
+
+    In Python, callback function parameter names must match the documented
+    names exactly because ADK passes callback arguments by keyword. For example,
+    use `callback_context` for agent and model callbacks, and `tool_context` for
+    tool callbacks. Renaming these parameters to aliases such as `ctx` will cause
+    runtime `TypeError` failures.
+
+    ```python
+    # Correct
+    def before_agent_callback(callback_context):
+        ...
+
+    # Incorrect
+    def before_agent_callback(ctx):
+        ...
+    ```
+
+    | Callback | Required parameter names |
+    |---|---|
+    | `before_agent_callback` | `callback_context` |
+    | `after_agent_callback` | `callback_context` |
+    | `before_model_callback` | `callback_context`, `llm_request` |
+    | `after_model_callback` | `callback_context`, `llm_response` |
+    | `on_model_error_callback` | `callback_context`, `llm_request`, `error` |
+    | `before_tool_callback` | `tool`, `args`, `tool_context` |
+    | `after_tool_callback` | `tool`, `args`, `tool_context`, `tool_response` |
+    | `on_tool_error_callback` | `tool`, `args`, `tool_context`, `error` |
+
+    Only `before_agent_callback` and `after_agent_callback` are fields on every
+    `BaseAgent`. The six model and tool callbacks in this table are fields on
+    `LlmAgent` only.
+
+??? note "Python: `async` callbacks and lists of callbacks"
+
+    In Python, a callback may be a plain `def` or an `async def`. ADK awaits
+    the result either way.
+
+    Every callback field also accepts a list of functions instead of a single
+    function. ADK invokes them in the order listed and stops at the first one
+    that returns a result: that value becomes the callback result, and the
+    remaining callbacks are skipped. What counts as a result differs by family.
+    The six `before_`/`after_` agent, model and tool hooks stop only on a
+    *truthy* value, so a callback returning `None`, or another falsy value such
+    as an empty `dict`, lets the next one run. `on_model_error_callback` and
+    `on_tool_error_callback` stop on any value that is not `None`, so an empty
+    `dict` from an `on_tool_error_callback` ends the chain, suppresses the
+    exception, and becomes the tool result.
+
+    Assign the list to the callback field on the agent:
+
+    ```python
+    root_agent = LlmAgent(
+        name="my_agent",
+        model="gemini-flash-latest",
+        before_model_callback=[check_policy, log_request],
+    )
+    ```
+
+### Before Agent Callback
+
+**When:** Called *immediately before* the agent's `_run_async_impl` (or `_run_live_impl`) method is executed. It runs after the agent's `InvocationContext` is created but *before* its core logic begins.
+
+**Purpose:** Ideal for setting up resources or state needed only for this specific agent's run, performing validation checks on the session state (callback\_context.state) before execution starts, logging the entry point of the agent's activity, or potentially modifying the invocation context before the core logic uses it.
+
+
+??? "Code"
+    === "Python"
+
+        ```python
+        --8<-- "examples/python/snippets/callbacks/before_agent_callback.py"
+        ```
+
+    === "TypeScript"
+        ```typescript
+        --8<-- "examples/typescript/snippets/callbacks/before_agent_callback.ts"
+        ```
+
+    === "Go"
+
+        ```go
+        --8<-- "examples/go/snippets/callbacks/types_of_callbacks/main.go:imports"
+
+
+        --8<-- "examples/go/snippets/callbacks/types_of_callbacks/main.go:before_agent_example"
+        ```
+
+    === "Java"
+
+        ```java
+        --8<-- "examples/java/snippets/src/main/java/callbacks/BeforeAgentCallbackExample.java:init"
+        ```
+
+
+**Note on the `before_agent_callback` Example:**
+
+* **What it Shows:** This example demonstrates the `before_agent_callback`. This callback runs *right before* the agent's main processing logic starts for a given request.
+* **How it Works:** The callback function (`check_if_agent_should_run`) looks at a flag (`skip_llm_agent`) in the session's state.
+    * If the flag is `True`, the callback returns a `types.Content` object. This tells the ADK framework to **skip** the agent's main execution entirely and use the callback's returned content as the final response.
+    * If the flag is `False` (or not set), the callback returns `None` or an empty object. This tells the ADK framework to **proceed** with the agent's normal execution (calling the LLM in this case).
+* **Expected Outcome:** You'll see two scenarios:
+    1. In the session *with* the `skip_llm_agent: True` state, the agent's LLM call is bypassed, and the output comes directly from the callback ("Agent... skipped...").
+    2. In the session *without* that state flag, the callback allows the agent to run, and you see the actual response from the LLM (e.g., "Hello!").
+* **Understanding Callbacks:** This highlights how `before_` callbacks act as **gatekeepers**, allowing you to intercept execution *before* a major step and potentially prevent it based on checks (like state, input validation, permissions).
+
+
+### After Agent Callback
+
+**When:** Called *immediately after* the agent's `_run_async_impl` (or `_run_live_impl`) method successfully completes. It does *not* run if the agent was skipped due to `before_agent_callback` returning content. In Python, setting `end_invocation` during the agent's run also skips it, but only on the `run_async` path; `run_live` does not re-check `end_invocation` after `_run_live_impl` finishes, so the callback still runs there.
+
+**Purpose:** Useful for cleanup tasks, post-execution validation, logging the completion of an agent's activity, or modifying final state.
+
+!!! note "After Agent Callback output modification limitations"
+
+    The `after_agent_callback` can not fully alter the response output because the agent may have called AI models multiple times and omitted multiple events. So modifying the output is not allowed, although you can *append* additional content. If you want to change an AI model response, consider `after_model_callback`.
+
+??? "Code"
+    === "Python"
+
+        ```python
+        --8<-- "examples/python/snippets/callbacks/after_agent_callback.py"
+        ```
+
+    === "TypeScript"
+        ```typescript
+        --8<-- "examples/typescript/snippets/callbacks/after_agent_callback.ts"
+        ```
+
+    === "Go"
+
+        ```go
+        --8<-- "examples/go/snippets/callbacks/types_of_callbacks/main.go:imports"
+
+
+        --8<-- "examples/go/snippets/callbacks/types_of_callbacks/main.go:after_agent_example"
+        ```
+
+    === "Java"
+
+        ```java
+        --8<-- "examples/java/snippets/src/main/java/callbacks/AfterAgentCallbackExample.java:init"
+        ```
+
+
+**Note on the `after_agent_callback` Example:**
+
+* **What it Shows:** This example demonstrates the `after_agent_callback`. This callback runs *right after* the agent's main processing logic has finished and produced its result, but *before* that result is finalized and returned.
+* **How it Works:** The callback function (`modify_output_after_agent`) checks a flag (`add_concluding_note`) in the session's state.
+    * If the flag is `True`, the callback returns a *new* `types.Content` object. This tells the ADK framework to **append** the agent's original output with the content returned by the callback.
+    * If the flag is `False` (or not set), the callback returns `None` or an empty object. This tells the ADK framework to **use** the original output generated by the agent.
+*   **Expected Outcome:** You'll see two scenarios:
+    1. In the session *without* the `add_concluding_note: True` state, the callback allows the agent's original output ("Processing complete!") to be used.
+    2. In the session *with* that state flag, the callback intercepts the agent's original output and appends it with its own message ("Concluding note added...").
+* **Understanding Callbacks:** This example highlights how `after_` callbacks allow **post-processing**. You can inspect the result of a step and decide whether to let it pass through or add to it. An `after_agent_callback` cannot replace the agent's output: the content it returns is emitted as an *additional* event after the agent's own events.
+
+## LLM Interaction Callbacks
+
+These callbacks are specific to `LlmAgent` and provide hooks around the interaction with the Large Language Model. In Python, `LlmAgent` also accepts an `on_model_error_callback`, which runs when the model call raises an exception. If it returns an `LlmResponse`, the exception is suppressed and that response is used instead.
+
+### Before Model Callback
+
+**When:** Called just before the `generate_content_async` (or equivalent) request is sent to the LLM within an `LlmAgent`'s flow.
+
+**Purpose:** Allows inspection and modification of the request going to the LLM. Use cases include adding dynamic instructions, injecting few-shot examples based on state, modifying model config, implementing guardrails (like profanity filters), or implementing request-level caching.
+
+**Return Value Effect:**
+If the callback returns `None` (or a `Maybe.empty()` object in Java), the LLM continues its normal workflow. If the callback returns an `LlmResponse` object, then the call to the LLM is **skipped**. The returned `LlmResponse` is used directly as if it came from the model. This is powerful for implementing guardrails or caching.
+
+??? "Code"
+    === "Python"
+
+        ```python
+        --8<-- "examples/python/snippets/callbacks/before_model_callback.py"
+        ```
+
+    === "TypeScript"
+        ```typescript
+        --8<-- "examples/typescript/snippets/callbacks/before_model_callback.ts"
+        ```
+
+    === "Go"
+
+        ```go
+        --8<-- "examples/go/snippets/callbacks/types_of_callbacks/main.go:imports"
+
+
+        --8<-- "examples/go/snippets/callbacks/types_of_callbacks/main.go:before_model_example"
+        ```
+
+    === "Java"
+
+        ```java
+        --8<-- "examples/java/snippets/src/main/java/callbacks/BeforeModelCallbackExample.java:init"
+        ```
+
+### After Model Callback
+
+**When:** Called just after a response (`LlmResponse`) is received from the LLM, before it's processed further by the invoking agent.
+
+**Purpose:** Allows inspection or modification of the raw LLM response. Use cases include
+
+* logging model outputs,
+* reformatting responses,
+* censoring sensitive information generated by the model,
+* parsing structured data from the LLM response and storing it in `callback_context.state`
+* or handling specific error codes.
+
+??? "Code"
+    === "Python"
+
+        ```python
+        --8<-- "examples/python/snippets/callbacks/after_model_callback.py"
+        ```
+
+    === "TypeScript"
+        ```typescript
+        --8<-- "examples/typescript/snippets/callbacks/after_model_callback.ts"
+        ```
+
+    === "Go"
+
+        ```go
+        --8<-- "examples/go/snippets/callbacks/types_of_callbacks/main.go:imports"
+
+
+        --8<-- "examples/go/snippets/callbacks/types_of_callbacks/main.go:after_model_example"
+        ```
+
+    === "Java"
+
+        ```java
+        --8<-- "examples/java/snippets/src/main/java/callbacks/AfterModelCallbackExample.java:init"
+        ```
+
+## Tool Execution Callbacks
+
+These callbacks are also specific to `LlmAgent` and trigger around the execution of tools that the LLM might request, including `FunctionTool` and `AgentTool`. In Python, `LlmAgent` also accepts an `on_tool_error_callback`, which runs when the tool raises an exception. If it returns a `dict`, the exception is suppressed and that `dict` value is used as the tool result.
+
+### Before Tool Callback
+
+**When:** Called just before a specific tool's `run_async` method is invoked, after the LLM has generated a function call for it.
+
+**Purpose:** Allows inspection and modification of tool arguments, performing authorization checks before execution, logging tool usage attempts, or implementing tool-level caching.
+
+**Return Value Effect:**
+
+1. If the callback returns `None` (or a `Maybe.empty()` object in Java), the tool's `run_async` method is executed with the (potentially modified) `args`.
+2. If a dictionary (or `Map` in Java) is returned, the tool's `run_async` method is **skipped**. The returned dictionary is used directly as the result of the tool call. This is useful for caching or overriding tool behavior.
+
+!!! note "Python: only `None` lets the tool run"
+
+    ADK compares the returned value against `None`, so an empty `dict` counts
+    as an override: the tool is skipped and `{}` becomes the tool result.
+    Return `None`, not `{}`, when you want the tool to execute. With a list of
+    callbacks this applies to the last value produced, because an empty `dict`
+    does not stop the chain and is discarded if a later callback returns
+    something else.
+
+??? "Code"
+    === "Python"
+
+        ```python
+        --8<-- "examples/python/snippets/callbacks/before_tool_callback.py"
+        ```
+
+    === "TypeScript"
+        ```typescript
+        --8<-- "examples/typescript/snippets/callbacks/before_tool_callback.ts"
+        ```
+
+    === "Go"
+
+        ```go
+        --8<-- "examples/go/snippets/callbacks/types_of_callbacks/main.go:imports"
+        --8<-- "examples/go/snippets/callbacks/types_of_callbacks/main.go:tool_defs"
+        --8<-- "examples/go/snippets/callbacks/types_of_callbacks/main.go:before_tool_example"
+        ```
+
+    === "Java"
+
+        ```java
+        --8<-- "examples/java/snippets/src/main/java/callbacks/BeforeToolCallbackExample.java:init"
+        ```
+
+
+### After Tool Callback
+
+**When:** Called just after the tool's `run_async` method completes successfully.
+
+**Purpose:** Allows inspection and modification of the tool's result before it's sent back to the LLM (potentially after summarization). Useful for logging tool results, post-processing or formatting results, or saving specific parts of the result to the session state.
+
+**Return Value Effect:**
+
+1. If the callback returns `None` (or a `Maybe.empty()` object in Java), the original `tool_response` is used.
+2. If a new dictionary is returned, it **replaces** the original `tool_response`. This allows modifying or filtering the result seen by the LLM.
+
+!!! note "Python: `tool_response` types and return values"
+
+    ADK wraps a non-`dict` result into `{"result": <value>}` only *after* the
+    callback has run, so a tool annotated `-> str` hands your
+    `after_tool_callback` a `str`, not a `dict`. Check the type before calling
+    dictionary methods on it.
+
+    ADK also compares the returned value against `None`, so returning `{}`
+    replaces the tool response with `{}`. Return `None` to keep the original.
+
+??? "Code"
+    === "Python"
+
+        ```python
+        --8<-- "examples/python/snippets/callbacks/after_tool_callback.py"
+        ```
+
+    === "TypeScript"
+        ```typescript
+        --8<-- "examples/typescript/snippets/callbacks/after_tool_callback.ts"
+        ```
+
+    === "Go"
+
+        ```go
+        --8<-- "examples/go/snippets/callbacks/types_of_callbacks/main.go:imports"
+        --8<-- "examples/go/snippets/callbacks/types_of_callbacks/main.go:tool_defs"
+        --8<-- "examples/go/snippets/callbacks/types_of_callbacks/main.go:after_tool_example"
+        ```
+
+    === "Java"
+
+        ```java
+        --8<-- "examples/java/snippets/src/main/java/callbacks/AfterToolCallbackExample.java:init"
+        ```

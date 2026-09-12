@@ -1,0 +1,1526 @@
+//! Main Language Server Protocol server implementation for rumdl
+//!
+//! This module implements the core LSP server following Ruff's architecture.
+//! It provides real-time markdown linting, diagnostics, and code actions.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use tokio::sync::{RwLock, mpsc};
+use tower_lsp::jsonrpc::Result as JsonRpcResult;
+use tower_lsp::lsp_types::*;
+use tower_lsp::{Client, LanguageServer};
+
+use crate::config::{Config, ConfigValidated, SourcedConfig, is_valid_rule_name};
+use crate::discovery::{ExcludeMatchers, is_markdown_extension};
+use crate::lsp::index_worker::{IndexWorker, SharedIndexState};
+use crate::lsp::types::{IndexState, IndexUpdate, LspRuleSettings, RelintRequest, RumdlLspConfig};
+use crate::workspace_index::WorkspaceIndex;
+
+/// Maximum number of rules in enable/disable lists (DoS protection)
+const MAX_RULE_LIST_SIZE: usize = 100;
+
+/// Maximum allowed line length value (DoS protection)
+const MAX_LINE_LENGTH: usize = 10_000;
+
+/// Merge the keys present in a `workspace/didChangeConfiguration` payload onto the
+/// current LSP config, returning the merged config.
+///
+/// Only the keys the client actually sent are changed; every other field keeps its
+/// current value, so a partial payload (e.g. just `{"enableSymbols": false}`) never
+/// resets omitted fields to their defaults. A client that sends a full snapshot
+/// still fully applies. Returns `None` only if `incoming` is not a JSON object, the
+/// current config cannot be represented as one, or the merged object fails to
+/// deserialize -- all unreachable for the current field types, which round-trip
+/// through serde JSON; the caller treats `None` as "leave the config unchanged"
+/// rather than clobbering omitted fields.
+fn merge_lsp_config(current: &RumdlLspConfig, incoming: &serde_json::Value) -> Option<RumdlLspConfig> {
+    let serde_json::Value::Object(incoming) = incoming else {
+        return None;
+    };
+    let serde_json::Value::Object(mut base) = serde_json::to_value(current).ok()? else {
+        return None;
+    };
+    for (key, value) in incoming {
+        base.insert(key.clone(), value.clone());
+    }
+    serde_json::from_value(serde_json::Value::Object(base)).ok()
+}
+
+/// Represents a document in the LSP server's cache
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DocumentEntry {
+    /// The document content
+    pub(crate) content: String,
+    /// Version number from the editor (None for disk-loaded documents)
+    pub(crate) version: Option<i32>,
+    /// Whether the document was loaded from disk (true) or opened in editor (false)
+    pub(crate) from_disk: bool,
+}
+
+/// Cache entry for resolved configuration
+#[derive(Clone, Debug)]
+pub(crate) struct ConfigCacheEntry {
+    /// The resolved configuration
+    pub(crate) config: Config,
+    /// The same configuration with provenance intact, kept only when it opts
+    /// into `.editorconfig` reading. That layering is per file (a section glob
+    /// can match one file in a directory and not its neighbour) while this cache
+    /// is per directory, so the sourced form has to survive the cache hit.
+    pub(crate) sourced: Option<Arc<SourcedConfig<ConfigValidated>>>,
+    /// Config file path that was loaded (for invalidation)
+    pub(crate) config_file: Option<PathBuf>,
+    /// True if this entry came from the global/user fallback (no project config)
+    pub(crate) from_global_fallback: bool,
+}
+
+/// Shared per-file configuration resolution used by request handlers and the
+/// background workspace index.
+///
+/// The server keeps the individual handles as part of its established state
+/// surface; this value holds clones of those same `Arc`s, so both consumers use
+/// one cache and observe the same reloads and invalidations.
+#[derive(Clone)]
+pub(crate) struct ConfigResolver {
+    pub(super) config: Arc<RwLock<RumdlLspConfig>>,
+    pub(super) rumdl_config: Arc<RwLock<Config>>,
+    pub(super) rumdl_sourced: Arc<RwLock<Option<Arc<SourcedConfig<ConfigValidated>>>>>,
+    pub(super) workspace_roots: Arc<RwLock<Vec<PathBuf>>>,
+    pub(super) config_cache: Arc<RwLock<HashMap<PathBuf, ConfigCacheEntry>>>,
+    pub(super) cli_config_path: Option<String>,
+}
+
+/// Main LSP server for rumdl
+///
+/// Following Ruff's pattern, this server provides:
+/// - Real-time diagnostics as users type
+/// - Code actions for automatic fixes
+/// - Configuration management
+/// - Multi-file support
+/// - Multi-root workspace support with per-file config resolution
+/// - Cross-file analysis with workspace indexing
+#[derive(Clone)]
+pub struct RumdlLanguageServer {
+    pub(crate) client: Client,
+    /// Configuration for the LSP server
+    pub(crate) config: Arc<RwLock<RumdlLspConfig>>,
+    /// Rumdl core configuration (fallback/default)
+    pub(crate) rumdl_config: Arc<RwLock<Config>>,
+    /// `rumdl_config` with provenance intact, kept only when it opts into
+    /// `.editorconfig` reading; written wherever `rumdl_config` is.
+    pub(crate) rumdl_sourced: Arc<RwLock<Option<Arc<SourcedConfig<ConfigValidated>>>>>,
+    /// Document store for open files and cached disk files
+    pub(crate) documents: Arc<RwLock<HashMap<Url, DocumentEntry>>>,
+    /// Maps a document's resolved URI to every open spelling that names it.
+    ///
+    /// The store is keyed by the editor's spelling, because that is the spelling
+    /// diagnostics must be published against. Navigation asks for a document by
+    /// its resolved spelling, which differs only when the editor reached the file
+    /// through a symlinked ancestor, so this stays empty for most workspaces.
+    /// Without it such a request would read the file on disk and miss the buffer.
+    ///
+    /// One resolved path can have several spellings open at once (two symlinks
+    /// to the same directory, each opened), so this holds all of them rather
+    /// than the latest. A single slot would let the second open displace the
+    /// first and the first close strand the second.
+    pub(crate) document_aliases: Arc<RwLock<HashMap<Url, Vec<Url>>>>,
+    /// Workspace root folders from the client
+    pub(crate) workspace_roots: Arc<RwLock<Vec<PathBuf>>>,
+    /// Configuration cache: maps directory path to resolved config
+    /// Key is the directory where config search started (file's parent dir)
+    pub(crate) config_cache: Arc<RwLock<HashMap<PathBuf, ConfigCacheEntry>>>,
+    /// Shared resolver consumed by document requests and workspace indexing.
+    pub(crate) config_resolver: ConfigResolver,
+    /// Workspace index for cross-file analysis (MD051)
+    pub(crate) workspace_index: Arc<RwLock<WorkspaceIndex>>,
+    /// Current state of the workspace index (building/ready/error)
+    pub(crate) index_state: Arc<RwLock<IndexState>>,
+    /// Channel to send updates to the background index worker.
+    ///
+    /// `None` on the copy a background task holds (see
+    /// [`Self::detached_for_background`]), which must not be able to queue
+    /// index work: it would keep the index worker waiting on a channel that
+    /// can never close, so neither task would stop when the editor goes away.
+    /// Queue through [`Self::queue_index_update`] rather than reading it.
+    update_tx: Option<mpsc::Sender<IndexUpdate>>,
+    /// Whether the client supports pull diagnostics (textDocument/diagnostic)
+    /// When true, we skip pushing diagnostics to avoid duplicates
+    pub(crate) client_supports_pull_diagnostics: Arc<RwLock<bool>>,
+    /// Whether the client supports hierarchical (nested) document symbols.
+    /// When false, `textDocument/documentSymbol` must return the flat
+    /// `SymbolInformation[]` form instead of a `DocumentSymbol` tree.
+    pub(crate) client_supports_hierarchical_symbols: Arc<RwLock<bool>>,
+    /// Config path supplied via `rumdl server --config <path>`.
+    ///
+    /// Held in an immutable field (not in `self.config`) so that client-driven
+    /// updates -- `initialize` initialization options or `workspace/didChangeConfiguration`
+    /// notifications -- cannot drop it. Treated as the highest-priority config source:
+    /// it outranks both client-supplied `configPath` and per-file discovery, mirroring
+    /// the CLI semantics where an explicit `--config` is standalone.
+    pub(crate) cli_config_path: Option<String>,
+}
+
+impl RumdlLanguageServer {
+    pub fn new(client: Client, cli_config_path: Option<&str>) -> Self {
+        let initial_config = RumdlLspConfig::default();
+        let cli_config_path = cli_config_path.map(str::to_string);
+
+        // Create shared state for workspace indexing
+        let workspace_index = Arc::new(RwLock::new(WorkspaceIndex::new()));
+        let index_state = Arc::new(RwLock::new(IndexState::default()));
+        let workspace_roots = Arc::new(RwLock::new(Vec::new()));
+        let config = Arc::new(RwLock::new(initial_config));
+        let rumdl_config = Arc::new(RwLock::new(Config::default()));
+        let rumdl_sourced = Arc::new(RwLock::new(None));
+        let config_cache = Arc::new(RwLock::new(HashMap::new()));
+        let documents = Arc::new(RwLock::new(HashMap::new()));
+
+        let config_resolver = ConfigResolver {
+            config: config.clone(),
+            rumdl_config: rumdl_config.clone(),
+            rumdl_sourced: rumdl_sourced.clone(),
+            workspace_roots: workspace_roots.clone(),
+            config_cache: config_cache.clone(),
+            cli_config_path: cli_config_path.clone(),
+        };
+
+        // Create channels for index worker communication
+        let (update_tx, update_rx) = mpsc::channel::<IndexUpdate>(100);
+        let (relint_tx, relint_rx) = mpsc::channel::<RelintRequest>(100);
+
+        let server = Self {
+            client,
+            config,
+            rumdl_config,
+            rumdl_sourced,
+            documents,
+            document_aliases: Arc::new(RwLock::new(HashMap::new())),
+            workspace_roots,
+            config_cache,
+            config_resolver: config_resolver.clone(),
+            workspace_index,
+            index_state,
+            update_tx: Some(update_tx),
+            client_supports_pull_diagnostics: Arc::new(RwLock::new(false)),
+            client_supports_hierarchical_symbols: Arc::new(RwLock::new(false)),
+            cli_config_path,
+        };
+
+        // Spawn the background index worker after every shared configuration
+        // handle exists, so indexing and request handling receive the same
+        // resolver rather than parallel snapshots.
+        let worker = IndexWorker::new(
+            update_rx,
+            server.client.clone(),
+            relint_tx,
+            SharedIndexState {
+                workspace_index: server.workspace_index.clone(),
+                index_state: server.index_state.clone(),
+                workspace_roots: server.workspace_roots.clone(),
+                config_resolver,
+                documents: server.documents.clone(),
+            },
+        );
+        tokio::spawn(worker.run());
+
+        // Consume the index worker's re-lint requests. Cross-file diagnostics are
+        // computed from the workspace index, so the events that change an answer
+        // reach this server rather than the editor: another file's headings moved,
+        // or the initial scan finished after a document was already linted.
+        tokio::spawn(server.detached_for_background().run_relint_worker(relint_rx));
+
+        server
+    }
+
+    /// A copy of this server for a background task, holding the same state but
+    /// not the connection's claim on the index worker.
+    ///
+    /// A task parked on a channel holds its copy for as long as it runs, and
+    /// the index worker runs until every sender is dropped. A plain clone would
+    /// therefore make the two keep each other alive: the worker waiting on a
+    /// channel the re-lint task holds open, the re-lint task waiting on a
+    /// channel the worker holds open, with the whole server state behind them.
+    /// A client that closes its connection without sending `shutdown` is what
+    /// reaches that.
+    fn detached_for_background(&self) -> Self {
+        Self {
+            update_tx: None,
+            ..self.clone()
+        }
+    }
+
+    /// Queue work for the background index worker.
+    ///
+    /// Answers whether the worker took it. `false` means the worker is gone,
+    /// which is the normal state after shutdown and on a background copy of the
+    /// server; a caller that wants to report it decides what that is worth.
+    pub(crate) async fn queue_index_update(&self, update: IndexUpdate) -> bool {
+        let Some(update_tx) = &self.update_tx else {
+            return false;
+        };
+        update_tx.send(update).await.is_ok()
+    }
+
+    /// Get document content, either from cache or by reading from disk
+    ///
+    /// This method first checks if the document is in the cache (opened in editor).
+    /// If not found, it attempts to read the file from disk and caches it for
+    /// future requests.
+    pub(super) async fn get_document_content(&self, uri: &Url) -> Option<String> {
+        let uri = &self.store_uri(uri).await;
+
+        // First check the cache
+        {
+            let docs = self.documents.read().await;
+            if let Some(entry) = docs.get(uri) {
+                return Some(entry.content.clone());
+            }
+        }
+
+        // If not in cache and it's a file URI, try to read from disk
+        if let Ok(path) = uri.to_file_path() {
+            if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                // Cache the document for future requests
+                let entry = DocumentEntry {
+                    content: content.clone(),
+                    version: None,
+                    from_disk: true,
+                };
+
+                let mut docs = self.documents.write().await;
+                docs.insert(uri.clone(), entry);
+
+                log::debug!("Loaded document from disk and cached: {uri}");
+                return Some(content);
+            } else {
+                log::debug!("Failed to read file from disk: {uri}");
+            }
+        }
+
+        None
+    }
+
+    /// Get document content only if the document is currently open in the editor.
+    ///
+    /// We intentionally do not read from disk here because diagnostics should be
+    /// scoped to open documents. This avoids lingering diagnostics after a file
+    /// is closed when clients use pull diagnostics.
+    async fn get_open_document_content(&self, uri: &Url) -> Option<String> {
+        let uri = self.store_uri(uri).await;
+        let docs = self.documents.read().await;
+        docs.get(&uri)
+            .and_then(|entry| (!entry.from_disk).then(|| entry.content.clone()))
+    }
+
+    /// The URI a document is stored under, given any spelling that names it.
+    ///
+    /// Answers with the request's own URI, except when the file is open only
+    /// under a different spelling of the same path: an alias then finds the
+    /// editor's buffer instead of falling through to the file on disk.
+    ///
+    /// An open buffer under the requested spelling wins over any alias, because
+    /// one file can be open under several spellings at once and the editor holds
+    /// a separate buffer for each. A disk copy cached under the requested
+    /// spelling does not win: it was read before the document was opened
+    /// elsewhere, and the buffer an alias names has since become the truth.
+    async fn store_uri(&self, uri: &Url) -> Url {
+        let Some(spellings) = self.document_aliases.read().await.get(uri).cloned() else {
+            return uri.clone();
+        };
+        let docs = self.documents.read().await;
+        let is_open = |u: &Url| matches!(docs.get(u), Some(entry) if !entry.from_disk);
+        if is_open(uri) {
+            return uri.clone();
+        }
+        // The most recently opened spelling, so a reopen supersedes an older one.
+        spellings
+            .iter()
+            .rev()
+            .find(|u| is_open(u))
+            .cloned()
+            .unwrap_or_else(|| uri.clone())
+    }
+
+    /// Resolve the Markdown flavor for a document, mirroring the per-file flavor
+    /// resolution used by diagnostics and formatting so symbol parsing matches.
+    pub(super) async fn resolve_flavor_for_uri(&self, uri: &Url) -> crate::config::MarkdownFlavor {
+        match super::resolve_uri(uri) {
+            Some(path) => self.resolve_config_for_file(&path).await.get_flavor_for_file(&path),
+            None => self.rumdl_config.read().await.markdown_flavor(),
+        }
+    }
+}
+
+#[tower_lsp::async_trait]
+impl LanguageServer for RumdlLanguageServer {
+    async fn initialize(&self, params: InitializeParams) -> JsonRpcResult<InitializeResult> {
+        log::info!("Initializing rumdl Language Server");
+
+        // Parse client capabilities and configuration
+        if let Some(options) = params.initialization_options
+            && let Ok(config) = serde_json::from_value::<RumdlLspConfig>(options)
+        {
+            *self.config.write().await = config;
+        }
+
+        // Detect if client supports pull diagnostics (textDocument/diagnostic)
+        // When the client supports pull, we avoid pushing to prevent duplicate diagnostics
+        let supports_pull = params
+            .capabilities
+            .text_document
+            .as_ref()
+            .and_then(|td| td.diagnostic.as_ref())
+            .is_some();
+
+        if supports_pull {
+            log::info!("Client supports pull diagnostics - disabling push to avoid duplicates");
+            *self.client_supports_pull_diagnostics.write().await = true;
+        } else {
+            log::info!("Client does not support pull diagnostics - using push model");
+        }
+
+        // Detect hierarchical document symbol support; without it the client expects
+        // the legacy flat `SymbolInformation[]` form.
+        let supports_hierarchical_symbols = params
+            .capabilities
+            .text_document
+            .as_ref()
+            .and_then(|td| td.document_symbol.as_ref())
+            .and_then(|ds| ds.hierarchical_document_symbol_support)
+            .unwrap_or(false);
+        *self.client_supports_hierarchical_symbols.write().await = supports_hierarchical_symbols;
+
+        // Extract and store workspace roots
+        let mut roots = Vec::new();
+        if let Some(workspace_folders) = params.workspace_folders {
+            for folder in workspace_folders {
+                if let Ok(path) = folder.uri.to_file_path() {
+                    let path = super::resolve_workspace_root(&path);
+                    log::info!("Workspace root: {}", path.display());
+                    roots.push(path);
+                }
+            }
+        } else if let Some(root_uri) = params.root_uri
+            && let Ok(path) = root_uri.to_file_path()
+        {
+            let path = super::resolve_workspace_root(&path);
+            log::info!("Workspace root: {}", path.display());
+            roots.push(path);
+        }
+        *self.workspace_roots.write().await = roots;
+
+        // Load rumdl configuration with auto-discovery (fallback/default)
+        self.load_configuration(false).await;
+
+        let (enable_link_navigation, enable_link_completions, enable_symbols) = {
+            let config = self.config.read().await;
+            (
+                config.enable_link_navigation,
+                config.enable_link_completions,
+                config.enable_symbols,
+            )
+        };
+
+        Ok(InitializeResult {
+            capabilities: ServerCapabilities {
+                text_document_sync: Some(TextDocumentSyncCapability::Options(TextDocumentSyncOptions {
+                    open_close: Some(true),
+                    change: Some(TextDocumentSyncKind::FULL),
+                    will_save: Some(false),
+                    will_save_wait_until: Some(true),
+                    save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
+                        include_text: Some(false),
+                    })),
+                })),
+                code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
+                    code_action_kinds: Some(vec![
+                        CodeActionKind::QUICKFIX,
+                        CodeActionKind::SOURCE_FIX_ALL,
+                        CodeActionKind::new("source.fixAll.rumdl"),
+                    ]),
+                    work_done_progress_options: WorkDoneProgressOptions::default(),
+                    resolve_provider: None,
+                })),
+                document_formatting_provider: Some(OneOf::Left(true)),
+                document_range_formatting_provider: Some(OneOf::Left(true)),
+                document_symbol_provider: enable_symbols.then_some(OneOf::Left(true)),
+                workspace_symbol_provider: enable_symbols.then_some(OneOf::Left(true)),
+                diagnostic_provider: Some(DiagnosticServerCapabilities::Options(DiagnosticOptions {
+                    identifier: Some("rumdl".to_string()),
+                    inter_file_dependencies: true,
+                    workspace_diagnostics: false,
+                    work_done_progress_options: WorkDoneProgressOptions::default(),
+                })),
+                // Completion always stays available for fenced code-block language
+                // labels (backtick trigger). The link-target triggers (`(` `#` `/`
+                // `.` `-`) are only registered when link completions are enabled, so
+                // a client with its own link-completion source (e.g. a PKM-focused
+                // LSP) is not invoked on those characters when the feature is off.
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(if enable_link_completions {
+                        vec![
+                            "`".to_string(),
+                            "(".to_string(),
+                            "#".to_string(),
+                            "/".to_string(),
+                            ".".to_string(),
+                            "-".to_string(),
+                        ]
+                    } else {
+                        vec!["`".to_string()]
+                    }),
+                    resolve_provider: Some(false),
+                    work_done_progress_options: WorkDoneProgressOptions::default(),
+                    all_commit_characters: None,
+                    completion_item: None,
+                }),
+                definition_provider: enable_link_navigation.then_some(OneOf::Left(true)),
+                references_provider: enable_link_navigation.then_some(OneOf::Left(true)),
+                hover_provider: enable_link_navigation.then_some(HoverProviderCapability::Simple(true)),
+                rename_provider: enable_link_navigation.then_some(OneOf::Right(RenameOptions {
+                    prepare_provider: Some(true),
+                    work_done_progress_options: WorkDoneProgressOptions::default(),
+                })),
+                workspace: Some(WorkspaceServerCapabilities {
+                    workspace_folders: Some(WorkspaceFoldersServerCapabilities {
+                        supported: Some(true),
+                        change_notifications: Some(OneOf::Left(true)),
+                    }),
+                    file_operations: None,
+                }),
+                ..Default::default()
+            },
+            server_info: Some(ServerInfo {
+                name: "rumdl".to_string(),
+                version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            }),
+        })
+    }
+
+    async fn initialized(&self, _: InitializedParams) {
+        let version = env!("CARGO_PKG_VERSION");
+
+        // Get binary path and build time
+        let (binary_path, build_time) = std::env::current_exe().ok().map_or_else(
+            || ("unknown".to_string(), "unknown".to_string()),
+            |path| {
+                let path_str = path.to_str().unwrap_or("unknown").to_string();
+                let build_time = std::fs::metadata(&path)
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok())
+                    .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                    .and_then(|duration| {
+                        let secs = duration.as_secs();
+                        chrono::DateTime::from_timestamp(secs as i64, 0)
+                            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                    })
+                    .unwrap_or_else(|| "unknown".to_string());
+                (path_str, build_time)
+            },
+        );
+
+        let working_dir = std::env::current_dir()
+            .ok()
+            .and_then(|p| p.to_str().map(std::string::ToString::to_string))
+            .unwrap_or_else(|| "unknown".to_string());
+
+        log::info!("rumdl Language Server v{version} initialized (built: {build_time}, binary: {binary_path})");
+        log::info!("Working directory: {working_dir}");
+
+        self.client
+            .log_message(MessageType::INFO, format!("rumdl v{version} Language Server started"))
+            .await;
+
+        // Trigger initial workspace indexing for cross-file analysis
+        if !self.queue_index_update(IndexUpdate::FullRescan).await {
+            log::warn!("Failed to trigger initial workspace indexing");
+        } else {
+            log::info!("Triggered initial workspace indexing for cross-file analysis");
+        }
+
+        // Register file watchers for markdown files and config files
+        let markdown_patterns = [
+            "**/*.md",
+            "**/*.markdown",
+            "**/*.mdx",
+            "**/*.mkd",
+            "**/*.mkdn",
+            "**/*.mdown",
+            "**/*.mdwn",
+            "**/*.qmd",
+            "**/*.rmd",
+        ];
+        // `.editorconfig` is subscribed to unconditionally: a project can opt in
+        // after the client registered these, and the handler decides whether an
+        // event counts.
+        let config_patterns = [
+            "**/.rumdl.toml",
+            "**/rumdl.toml",
+            "**/pyproject.toml",
+            "**/.markdownlint.json",
+            "**/.markdownlint-cli2.yaml",
+            "**/.markdownlint-cli2.jsonc",
+            "**/.editorconfig",
+        ];
+        let watchers: Vec<_> = markdown_patterns
+            .iter()
+            .chain(config_patterns.iter())
+            .map(|pattern| FileSystemWatcher {
+                glob_pattern: GlobPattern::String((*pattern).to_string()),
+                kind: Some(WatchKind::all()),
+            })
+            .collect();
+
+        let registration = Registration {
+            id: "markdown-watcher".to_string(),
+            method: "workspace/didChangeWatchedFiles".to_string(),
+            register_options: Some(
+                serde_json::to_value(DidChangeWatchedFilesRegistrationOptions { watchers }).unwrap(),
+            ),
+        };
+
+        if self.client.register_capability(vec![registration]).await.is_err() {
+            log::debug!("Client does not support file watching capability");
+        }
+    }
+
+    async fn completion(&self, params: CompletionParams) -> JsonRpcResult<Option<CompletionResponse>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+
+        // Get document content
+        let Some(text) = self.get_document_content(&uri).await else {
+            return Ok(None);
+        };
+
+        // Code fence language completion (backtick trigger)
+        if let Some((start_col, current_text)) = Self::detect_code_fence_language_position(&text, position) {
+            log::debug!(
+                "Code fence completion triggered at {}:{}, current text: '{}'",
+                position.line,
+                position.character,
+                current_text
+            );
+            let items = self
+                .get_language_completions(&uri, &current_text, start_col, position)
+                .await;
+            if !items.is_empty() {
+                return Ok(Some(CompletionResponse::Array(items)));
+            }
+        }
+
+        // Link target completion: file paths and heading anchors
+        if self.config.read().await.enable_link_completions {
+            // For trigger characters that fire on many non-link contexts (`.`, `-`),
+            // skip the full parse when there is no `](` on the current line before
+            // the cursor.  This avoids needless work on list items and contractions.
+            let trigger = params.context.as_ref().and_then(|c| c.trigger_character.as_deref());
+            let skip_link_check = matches!(trigger, Some("." | "-")) && {
+                let line_num = position.line as usize;
+                // Scan the whole line — no byte-slicing at a UTF-16 offset needed.
+                // A line without `](` anywhere cannot contain a link target.
+                !text.lines().nth(line_num).is_some_and(|line| line.contains("]("))
+            };
+
+            if !skip_link_check && let Some(link_info) = Self::detect_link_target_position(&text, position) {
+                if let Some((partial_anchor, anchor_start_col)) = link_info.anchor {
+                    log::debug!(
+                        "Anchor completion triggered at {}:{}, file: '{}', partial: '{}'",
+                        position.line,
+                        position.character,
+                        link_info.file_path,
+                        partial_anchor
+                    );
+                    let items = self
+                        .get_anchor_completions(&uri, &link_info.file_path, &partial_anchor, anchor_start_col, position)
+                        .await;
+                    if !items.is_empty() {
+                        return Ok(Some(CompletionResponse::Array(items)));
+                    }
+                } else {
+                    log::debug!(
+                        "File path completion triggered at {}:{}, partial: '{}'",
+                        position.line,
+                        position.character,
+                        link_info.file_path
+                    );
+                    let list = self
+                        .get_file_completions(&uri, &link_info.file_path, link_info.path_start_col, position)
+                        .await;
+                    if !list.items.is_empty() {
+                        return Ok(Some(CompletionResponse::List(list)));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn did_change_workspace_folders(&self, params: DidChangeWorkspaceFoldersParams) {
+        // Update workspace roots
+        let mut roots = self.workspace_roots.write().await;
+
+        // Resolved the same way `initialize` resolves a root, so a folder added
+        // or removed later is comparable with the ones already recorded.
+        // Remove deleted workspace folders
+        for removed in &params.event.removed {
+            if let Ok(path) = removed.uri.to_file_path() {
+                let path = super::resolve_workspace_root(&path);
+                roots.retain(|r| r != &path);
+                log::info!("Removed workspace root: {}", path.display());
+            }
+        }
+
+        // Add new workspace folders
+        for added in &params.event.added {
+            if let Ok(path) = added.uri.to_file_path()
+                && let path = super::resolve_workspace_root(&path)
+                && !roots.contains(&path)
+            {
+                log::info!("Added workspace root: {}", path.display());
+                roots.push(path);
+            }
+        }
+        drop(roots);
+
+        // Clear config cache as workspace structure changed
+        self.config_cache.write().await.clear();
+
+        // Reload fallback configuration
+        self.reload_configuration().await;
+
+        // Trigger full workspace rescan for cross-file index
+        if !self.queue_index_update(IndexUpdate::FullRescan).await {
+            log::warn!("Failed to trigger workspace rescan after folder change");
+        }
+    }
+
+    async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
+        log::debug!("Configuration changed: {:?}", params.settings);
+
+        // Parse settings from the notification
+        // Neovim sends: { "rumdl": { "MD013": {...}, ... } }
+        // VSCode might send the full RumdlLspConfig or similar structure
+        let settings_value = params.settings;
+
+        // Try to extract "rumdl" key from settings (Neovim style)
+        let rumdl_settings = if let serde_json::Value::Object(ref obj) = settings_value {
+            obj.get("rumdl").cloned().unwrap_or(settings_value.clone())
+        } else {
+            settings_value
+        };
+
+        // A settings payload that carries `linkCompletionContentRoots` is a full
+        // RumdlLspConfig even when the list is empty, so clearing it back to the
+        // workspace-root default applies instead of being treated as unknown.
+        let has_content_roots_key = matches!(
+            &rumdl_settings,
+            serde_json::Value::Object(obj) if obj.contains_key("linkCompletionContentRoots")
+        );
+
+        // `enableSymbols` is detected by key presence (not just a non-default value)
+        // so that a bare payload applies symmetrically: both `{"enableSymbols": false}`
+        // and a later `{"enableSymbols": true}` re-enable take effect, rather than the
+        // re-enable deserializing to the default and being dropped as an unknown key.
+        let has_symbols_key = matches!(
+            &rumdl_settings,
+            serde_json::Value::Object(obj) if obj.contains_key("enableSymbols")
+        );
+
+        // Track if we successfully applied any configuration
+        let mut config_applied = false;
+        let mut warnings: Vec<String> = Vec::new();
+
+        // Try to parse as LspRuleSettings first (Neovim style with "disable", "enable", rule keys)
+        // We check this first because RumdlLspConfig with #[serde(default)] will accept any JSON
+        // and just ignore unknown fields, which would lose the Neovim-style settings
+        if let Ok(rule_settings) = serde_json::from_value::<LspRuleSettings>(rumdl_settings.clone())
+            && (rule_settings.disable.is_some()
+                || rule_settings.enable.is_some()
+                || rule_settings.line_length.is_some()
+                || (!rule_settings.rules.is_empty() && rule_settings.rules.keys().all(|k| is_valid_rule_name(k))))
+        {
+            // Validate rule names in disable/enable lists
+            if let Some(ref disable) = rule_settings.disable {
+                for rule in disable {
+                    if !is_valid_rule_name(rule) {
+                        warnings.push(format!("Unknown rule in disable list: {rule}"));
+                    }
+                }
+            }
+            if let Some(ref enable) = rule_settings.enable {
+                for rule in enable {
+                    if !is_valid_rule_name(rule) {
+                        warnings.push(format!("Unknown rule in enable list: {rule}"));
+                    }
+                }
+            }
+            // Validate rule-specific settings
+            for rule_name in rule_settings.rules.keys() {
+                if !is_valid_rule_name(rule_name) {
+                    warnings.push(format!("Unknown rule in settings: {rule_name}"));
+                }
+            }
+
+            log::info!("Applied rule settings from configuration (Neovim style)");
+            let mut config = self.config.write().await;
+            config.settings = Some(rule_settings);
+            drop(config);
+            config_applied = true;
+        } else if let Ok(full_config) = serde_json::from_value::<RumdlLspConfig>(rumdl_settings.clone())
+            && (full_config.config_path.is_some()
+                || full_config.enable_rules.is_some()
+                || full_config.disable_rules.is_some()
+                || full_config.settings.is_some()
+                || !full_config.enable_linting
+                || full_config.enable_auto_fix
+                || !full_config.enable_link_completions
+                || !full_config.enable_link_navigation
+                || has_symbols_key
+                || has_content_roots_key)
+        {
+            // Validate rule names
+            if let Some(ref rules) = full_config.enable_rules {
+                for rule in rules {
+                    if !is_valid_rule_name(rule) {
+                        warnings.push(format!("Unknown rule in enableRules: {rule}"));
+                    }
+                }
+            }
+            if let Some(ref rules) = full_config.disable_rules {
+                for rule in rules {
+                    if !is_valid_rule_name(rule) {
+                        warnings.push(format!("Unknown rule in disableRules: {rule}"));
+                    }
+                }
+            }
+
+            // Merge only the keys the client sent onto the current config (see
+            // `merge_lsp_config`), so a partial payload never clobbers previously-set
+            // fields. The write lock is held across the merge so the read-modify-write
+            // is atomic; the merge is synchronous and `.await`-free, so it cannot
+            // deadlock or stall the executor. `full_config` was already validated above
+            // and is no longer needed here (a merge failure leaves the config unchanged
+            // rather than falling back to a clobbering whole-struct replace).
+            {
+                let mut config = self.config.write().await;
+                if let Some(merged) = merge_lsp_config(&config, &rumdl_settings) {
+                    *config = merged;
+                    drop(config);
+                    log::info!("Merged LSP configuration from client settings");
+                    config_applied = true;
+                } else {
+                    drop(config);
+                    warnings.push("Could not merge LSP configuration update; keeping current settings".to_string());
+                }
+            }
+        } else if let serde_json::Value::Object(obj) = rumdl_settings {
+            // Otherwise, treat as per-rule settings with manual parsing
+            // Format: { "MD013": { "lineLength": 80 }, "disable": ["MD009"] }
+            let mut config = self.config.write().await;
+
+            // Manual parsing for Neovim format
+            let mut rules = std::collections::HashMap::new();
+            let mut disable = Vec::new();
+            let mut enable = Vec::new();
+            let mut line_length = None;
+
+            for (key, value) in obj {
+                match key.as_str() {
+                    "disable" => match serde_json::from_value::<Vec<String>>(value.clone()) {
+                        Ok(d) => {
+                            if d.len() > MAX_RULE_LIST_SIZE {
+                                warnings.push(format!(
+                                    "Too many rules in 'disable' ({} > {}), truncating",
+                                    d.len(),
+                                    MAX_RULE_LIST_SIZE
+                                ));
+                            }
+                            for rule in d.iter().take(MAX_RULE_LIST_SIZE) {
+                                if !is_valid_rule_name(rule) {
+                                    warnings.push(format!("Unknown rule in disable: {rule}"));
+                                }
+                            }
+                            disable = d.into_iter().take(MAX_RULE_LIST_SIZE).collect();
+                        }
+                        Err(_) => {
+                            warnings.push(format!(
+                                "Invalid 'disable' value: expected array of strings, got {value}"
+                            ));
+                        }
+                    },
+                    "enable" => match serde_json::from_value::<Vec<String>>(value.clone()) {
+                        Ok(e) => {
+                            if e.len() > MAX_RULE_LIST_SIZE {
+                                warnings.push(format!(
+                                    "Too many rules in 'enable' ({} > {}), truncating",
+                                    e.len(),
+                                    MAX_RULE_LIST_SIZE
+                                ));
+                            }
+                            for rule in e.iter().take(MAX_RULE_LIST_SIZE) {
+                                if !is_valid_rule_name(rule) {
+                                    warnings.push(format!("Unknown rule in enable: {rule}"));
+                                }
+                            }
+                            enable = e.into_iter().take(MAX_RULE_LIST_SIZE).collect();
+                        }
+                        Err(_) => {
+                            warnings.push(format!(
+                                "Invalid 'enable' value: expected array of strings, got {value}"
+                            ));
+                        }
+                    },
+                    "lineLength" | "line_length" | "line-length" => {
+                        if let Some(l) = value.as_u64() {
+                            match usize::try_from(l) {
+                                Ok(len) if len <= MAX_LINE_LENGTH => line_length = Some(len),
+                                Ok(len) => warnings.push(format!(
+                                    "Invalid 'lineLength' value: {len} exceeds maximum ({MAX_LINE_LENGTH})"
+                                )),
+                                Err(_) => warnings.push(format!("Invalid 'lineLength' value: {l} is too large")),
+                            }
+                        } else {
+                            warnings.push(format!("Invalid 'lineLength' value: expected number, got {value}"));
+                        }
+                    }
+                    // Rule-specific settings (e.g., "MD013": { "lineLength": 80 })
+                    _ if key.starts_with("MD") || key.starts_with("md") => {
+                        let normalized = key.to_uppercase();
+                        if !is_valid_rule_name(&normalized) {
+                            warnings.push(format!("Unknown rule: {key}"));
+                        }
+                        rules.insert(normalized, value);
+                    }
+                    _ => {
+                        // Unknown key - warn and ignore
+                        warnings.push(format!("Unknown configuration key: {key}"));
+                    }
+                }
+            }
+
+            let settings = LspRuleSettings {
+                line_length,
+                disable: if disable.is_empty() { None } else { Some(disable) },
+                enable: if enable.is_empty() { None } else { Some(enable) },
+                rules,
+            };
+
+            log::info!("Applied Neovim-style rule settings (manual parse)");
+            config.settings = Some(settings);
+            drop(config);
+            config_applied = true;
+        } else {
+            log::warn!("Could not parse configuration settings: {rumdl_settings:?}");
+        }
+
+        // Log warnings for invalid configuration
+        for warning in &warnings {
+            log::warn!("{warning}");
+        }
+
+        // Notify client of configuration warnings via window/logMessage
+        if !warnings.is_empty() {
+            let message = if warnings.len() == 1 {
+                format!("rumdl: {}", warnings[0])
+            } else {
+                format!("rumdl configuration warnings:\n{}", warnings.join("\n"))
+            };
+            self.client.log_message(MessageType::WARNING, message).await;
+        }
+
+        if !config_applied {
+            log::debug!("No configuration changes applied");
+        }
+
+        // Clear config cache to pick up new settings
+        self.config_cache.write().await.clear();
+
+        // Reload the global rumdl config so a runtime change to `configPath`
+        // (handled by the parser branches above) takes effect on the next
+        // resolve. Without this, `resolve_config_for_file` would keep returning
+        // the previously-loaded `rumdl_config`, silently ignoring the new path.
+        // Skip the client notification: the diagnostics refresh below already
+        // surfaces the result, and notifying here can stall when a test or
+        // misbehaving client isn't draining the LSP message channel.
+        if config_applied {
+            self.load_configuration(false).await;
+
+            // Rebuild the workspace index under the reloaded config: a new
+            // configPath can change exclude patterns or respect_gitignore,
+            // which the scan reads from the shared config.
+            if !self.queue_index_update(IndexUpdate::FullRescan).await {
+                log::warn!("Failed to request workspace rescan after configuration change");
+            }
+        }
+
+        // Collect all open documents first (to avoid holding lock during async
+        // operations). Files cached from disk to answer a request are not open:
+        // publishing for one puts diagnostics on screen for a document the
+        // editor never opened, and no `didClose` will ever clear them.
+        let doc_list: Vec<_> = {
+            let documents = self.documents.read().await;
+            documents
+                .iter()
+                .filter(|(_, entry)| !entry.from_disk)
+                .map(|(uri, entry)| (uri.clone(), entry.content.clone()))
+                .collect()
+        };
+
+        // Refresh diagnostics for all open documents concurrently. Collecting the
+        // handles is what starts every task: a lazy iterator would spawn each one
+        // only as the loop below awaits it, running them one at a time.
+        let tasks: Vec<_> = doc_list
+            .into_iter()
+            .map(|(uri, text)| {
+                let server = self.clone();
+                tokio::spawn(async move {
+                    server.update_diagnostics(uri, text, true).await;
+                })
+            })
+            .collect();
+
+        // Wait for all diagnostics to complete
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
+
+    async fn shutdown(&self) -> JsonRpcResult<()> {
+        log::info!("Shutting down rumdl Language Server");
+
+        // Signal the index worker to shut down
+        self.queue_index_update(IndexUpdate::Shutdown).await;
+
+        Ok(())
+    }
+
+    async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        let uri = params.text_document.uri;
+        let text = params.text_document.text;
+        let version = params.text_document.version;
+
+        let entry = DocumentEntry {
+            content: text.clone(),
+            version: Some(version),
+            from_disk: false,
+        };
+        self.documents.write().await.insert(uri.clone(), entry);
+
+        // Make the document reachable by the spelling navigation resolves it to.
+        let resolved = super::resolve_uri_spelling(&uri);
+        if resolved != uri {
+            let mut aliases = self.document_aliases.write().await;
+            let spellings = aliases.entry(resolved).or_default();
+            if !spellings.contains(&uri) {
+                spellings.push(uri.clone());
+            }
+        }
+
+        // Send update to index worker for cross-file analysis
+        if let Some(path) = super::resolve_uri(&uri) {
+            self.queue_index_update(IndexUpdate::FileChanged {
+                path,
+                content: text.clone(),
+            })
+            .await;
+        }
+
+        self.update_diagnostics(uri, text, true).await;
+    }
+
+    async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        let uri = params.text_document.uri;
+        let version = params.text_document.version;
+
+        if let Some(change) = params.content_changes.into_iter().next() {
+            let text = change.text;
+
+            let entry = DocumentEntry {
+                content: text.clone(),
+                version: Some(version),
+                from_disk: false,
+            };
+            self.documents.write().await.insert(uri.clone(), entry);
+
+            // Send update to index worker for cross-file analysis
+            if let Some(path) = super::resolve_uri(&uri) {
+                self.queue_index_update(IndexUpdate::FileChanged {
+                    path,
+                    content: text.clone(),
+                })
+                .await;
+            }
+
+            self.update_diagnostics(uri, text, false).await;
+        }
+    }
+
+    async fn will_save_wait_until(&self, params: WillSaveTextDocumentParams) -> JsonRpcResult<Option<Vec<TextEdit>>> {
+        // Only apply fixes on manual saves (Cmd+S / Ctrl+S), not on autosave
+        // This respects VSCode's editor.formatOnSave: "explicit" setting
+        if params.reason != TextDocumentSaveReason::MANUAL {
+            return Ok(None);
+        }
+
+        let config_guard = self.config.read().await;
+        let enable_auto_fix = config_guard.enable_auto_fix;
+        drop(config_guard);
+
+        if !enable_auto_fix {
+            return Ok(None);
+        }
+
+        // Get the current document content
+        let Some(text) = self.get_document_content(&params.text_document.uri).await else {
+            return Ok(None);
+        };
+
+        // Apply all fixes
+        match self.apply_all_fixes(&params.text_document.uri, &text).await {
+            Ok(Some(fixed_text)) => {
+                // Return a single edit that replaces the entire document
+                Ok(Some(vec![TextEdit {
+                    range: Range {
+                        start: Position { line: 0, character: 0 },
+                        end: self.get_end_position(&text),
+                    },
+                    new_text: fixed_text,
+                }]))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => {
+                log::error!("Failed to generate fixes in will_save_wait_until: {e}");
+                Ok(None)
+            }
+        }
+    }
+
+    async fn did_save(&self, params: DidSaveTextDocumentParams) {
+        // Re-lint the document after save
+        // Note: Auto-fixing is now handled by will_save_wait_until which runs before the save
+        if let Some(entry) = self.documents.read().await.get(&params.text_document.uri) {
+            self.update_diagnostics(params.text_document.uri, entry.content.clone(), true)
+                .await;
+        }
+    }
+
+    async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        // Remove document from storage
+        self.documents.write().await.remove(&params.text_document.uri);
+        // Drop only this spelling. Another one naming the same file can still be
+        // open, and it stays reachable under the resolved URI.
+        let resolved = super::resolve_uri_spelling(&params.text_document.uri);
+        if resolved != params.text_document.uri {
+            let mut aliases = self.document_aliases.write().await;
+            if let Some(spellings) = aliases.get_mut(&resolved) {
+                spellings.retain(|u| u != &params.text_document.uri);
+                if spellings.is_empty() {
+                    aliases.remove(&resolved);
+                }
+            }
+        }
+
+        // Always clear diagnostics on close to ensure cleanup
+        // (Ruff does this unconditionally as a defensive measure)
+        self.client
+            .publish_diagnostics(params.text_document.uri, Vec::new(), None)
+            .await;
+    }
+
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        // Check if any of the changed files are config files
+        const CONFIG_FILES: &[&str] = &[
+            ".rumdl.toml",
+            "rumdl.toml",
+            "pyproject.toml",
+            ".markdownlint.json",
+            ".markdownlint-cli2.jsonc",
+            ".markdownlint-cli2.yaml",
+            ".markdownlint-cli2.yml",
+        ];
+
+        let mut config_changed = false;
+        // An `.editorconfig` supplies settings only while a config opts into
+        // reading it, so it is a config file here only in a workspace that did.
+        let reads_editorconfig = self.reads_editorconfig().await;
+
+        for change in &params.changes {
+            // Resolved like every other path the server records, so a watch event
+            // is comparable with the workspace roots and with the index keys the
+            // scan produced. A deleted file still resolves: only its directory is.
+            if let Some(path) = super::resolve_uri(&change.uri) {
+                let file_name = path.file_name().and_then(|f| f.to_str());
+
+                // Handle config file changes
+                if let Some(name) = file_name
+                    && (CONFIG_FILES.contains(&name) || (reads_editorconfig && name == ".editorconfig"))
+                    && !config_changed
+                {
+                    log::info!("Config file changed: {}, invalidating config cache", path.display());
+
+                    // Clear the entire config cache when any config file changes.
+                    // Fallback entries (no config_file) become stale when a new config file
+                    // is created, and directory-scoped entries may resolve differently after edits.
+                    let mut cache = self.config_cache.write().await;
+                    cache.clear();
+
+                    // Also reload the global fallback configuration
+                    drop(cache);
+                    self.reload_configuration().await;
+                    config_changed = true;
+                }
+
+                // Handle markdown file changes for workspace index
+                if let Some(ext) = path.extension()
+                    && is_markdown_extension(ext)
+                {
+                    match change.typ {
+                        FileChangeType::CREATED | FileChangeType::CHANGED => {
+                            // The filesystem does not speak for a document an editor
+                            // holds: what is on disk is the last save, and opening a
+                            // document indexes it whatever discovery says. Re-queue
+                            // the buffer rather than skipping the event, so a file
+                            // deleted and recreated underneath the editor (a branch
+                            // switch) keeps the version the user is looking at. The
+                            // lookup goes through the spelling the server identifies
+                            // documents by, because a watch event words the path the
+                            // way the filesystem does and not the way the editor did.
+                            if let Some(content) = self
+                                .get_open_document_content(&super::resolve_uri_spelling(&change.uri))
+                                .await
+                            {
+                                self.queue_index_update(IndexUpdate::FileChanged {
+                                    path: path.clone(),
+                                    content,
+                                })
+                                .await;
+                                continue;
+                            }
+                            // Skip files the full scan would ignore (e.g. generated
+                            // output) so filesystem-watch events don't reintroduce
+                            // them.
+                            let roots = self.workspace_roots.read().await.clone();
+                            let (options, includes, excludes) = {
+                                let config = self.rumdl_config.read().await;
+                                (
+                                    crate::lsp::index_worker::index_walk_options(&config),
+                                    config.global.include.clone(),
+                                    ExcludeMatchers::new(&config.global.exclude),
+                                )
+                            };
+                            if crate::lsp::index_worker::path_is_ignored_for_index(
+                                &roots, &path, &options, &includes, &excludes,
+                            ) {
+                                // A file that was indexed before an ignore rule began
+                                // matching it (e.g. just added to .gitignore) must be
+                                // evicted so completions and navigation stop surfacing
+                                // it. The message is a no-op when it was never indexed.
+                                self.queue_index_update(IndexUpdate::FileRemoved { path: path.clone() })
+                                    .await;
+                                continue;
+                            }
+                            // Read file content and update index
+                            if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                                self.queue_index_update(IndexUpdate::FileChanged {
+                                    path: path.clone(),
+                                    content,
+                                })
+                                .await;
+                            }
+                        }
+                        FileChangeType::DELETED => {
+                            self.queue_index_update(IndexUpdate::FileRemoved { path: path.clone() })
+                                .await;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Re-lint all open documents if config changed
+        if config_changed {
+            // Rebuild the workspace index: discovery-relevant settings
+            // (exclude patterns, respect_gitignore) may have changed, and the
+            // scan reads them from the shared config.
+            if !self.queue_index_update(IndexUpdate::FullRescan).await {
+                log::warn!("Failed to request workspace rescan after config change");
+            }
+
+            let docs_to_update: Vec<(Url, String)> = {
+                let docs = self.documents.read().await;
+                docs.iter()
+                    .filter(|(_, entry)| !entry.from_disk)
+                    .map(|(uri, entry)| (uri.clone(), entry.content.clone()))
+                    .collect()
+            };
+
+            for (uri, text) in docs_to_update {
+                self.update_diagnostics(uri, text, true).await;
+            }
+        }
+    }
+
+    async fn code_action(&self, params: CodeActionParams) -> JsonRpcResult<Option<CodeActionResponse>> {
+        let uri = params.text_document.uri;
+        let range = params.range;
+        let requested_kinds = params.context.only;
+
+        if let Some(text) = self.get_document_content(&uri).await {
+            match self.get_code_actions(&uri, &text, range).await {
+                Ok(actions) => {
+                    // Filter actions by requested kinds (if specified and non-empty)
+                    // LSP spec: "If provided with no kinds, all supported kinds are returned"
+                    // LSP code action kinds are hierarchical: source.fixAll.rumdl matches source.fixAll
+                    let filtered_actions = if let Some(ref kinds) = requested_kinds
+                        && !kinds.is_empty()
+                    {
+                        actions
+                            .into_iter()
+                            .filter(|action| {
+                                action.kind.as_ref().is_some_and(|action_kind| {
+                                    let action_kind_str = action_kind.as_str();
+                                    kinds.iter().any(|requested| {
+                                        let requested_str = requested.as_str();
+                                        // Match if action kind starts with requested kind
+                                        // e.g., "source.fixAll.rumdl" matches "source.fixAll"
+                                        action_kind_str.starts_with(requested_str)
+                                    })
+                                })
+                            })
+                            .collect()
+                    } else {
+                        actions
+                    };
+
+                    let response: Vec<CodeActionOrCommand> = filtered_actions
+                        .into_iter()
+                        .map(CodeActionOrCommand::CodeAction)
+                        .collect();
+                    Ok(Some(response))
+                }
+                Err(e) => {
+                    log::error!("Failed to get code actions: {e}");
+                    Ok(None)
+                }
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn range_formatting(&self, params: DocumentRangeFormattingParams) -> JsonRpcResult<Option<Vec<TextEdit>>> {
+        // For markdown linting, we format the entire document because:
+        // 1. Many markdown rules have document-wide implications (e.g., heading hierarchy, list consistency)
+        // 2. Fixes often need surrounding context to be applied correctly
+        // 3. This approach is common among linters (ESLint, rustfmt, etc. do similar)
+        log::debug!(
+            "Range formatting requested for {:?}, formatting entire document due to rule interdependencies",
+            params.range
+        );
+
+        let formatting_params = DocumentFormattingParams {
+            text_document: params.text_document,
+            options: params.options,
+            work_done_progress_params: params.work_done_progress_params,
+        };
+
+        self.formatting(formatting_params).await
+    }
+
+    async fn formatting(&self, params: DocumentFormattingParams) -> JsonRpcResult<Option<Vec<TextEdit>>> {
+        let uri = params.text_document.uri;
+        let options = params.options;
+
+        log::debug!("Formatting request for: {uri}");
+        log::debug!(
+            "FormattingOptions: insert_final_newline={:?}, trim_final_newlines={:?}, trim_trailing_whitespace={:?}",
+            options.insert_final_newline,
+            options.trim_final_newlines,
+            options.trim_trailing_whitespace
+        );
+
+        if let Some(text) = self.get_document_content(&uri).await {
+            // Phase 1: Apply lint rule fixes, iterating to a fixpoint through the
+            // same `FixCoordinator` engine as `rumdl check --fix` and the editor's
+            // fix-all action. A single fix pass can leave cascading fixes
+            // unapplied — e.g. MD030 widening a list marker, which then requires
+            // MD007 to re-indent the nested content and its continuation lines —
+            // which forced "Format Document" to be run several times to converge
+            // (rvben/rumdl-vscode#145). `apply_all_fixes` also handles config
+            // resolution, rule filtering, LSP overrides and excludes for the URI.
+            let mut result = match self.apply_all_fixes(&uri, &text).await {
+                Ok(Some(fixed)) => fixed,
+                Ok(None) => text.clone(),
+                Err(e) => {
+                    log::error!("Failed to apply fixes during formatting: {e}");
+                    text.clone()
+                }
+            };
+
+            // Phase 2: Apply FormattingOptions (standard LSP behavior)
+            // This ensures we respect editor preferences even if lint rules don't catch everything
+            result = Self::apply_formatting_options(result, &options);
+
+            // Return edit if content changed
+            if result != text {
+                log::debug!("Returning formatting edits");
+                let end_position = self.get_end_position(&text);
+                let edit = TextEdit {
+                    range: Range {
+                        start: Position { line: 0, character: 0 },
+                        end: end_position,
+                    },
+                    new_text: result,
+                };
+                return Ok(Some(vec![edit]));
+            }
+
+            Ok(Some(Vec::new()))
+        } else {
+            log::warn!("Document not found: {uri}");
+            Ok(None)
+        }
+    }
+
+    async fn goto_definition(&self, params: GotoDefinitionParams) -> JsonRpcResult<Option<GotoDefinitionResponse>> {
+        if !self.config.read().await.enable_link_navigation {
+            return Ok(None);
+        }
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+
+        log::debug!("Go-to-definition at {uri} {}:{}", position.line, position.character);
+
+        Ok(self.handle_goto_definition(&uri, position).await)
+    }
+
+    async fn references(&self, params: ReferenceParams) -> JsonRpcResult<Option<Vec<Location>>> {
+        if !self.config.read().await.enable_link_navigation {
+            return Ok(None);
+        }
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+
+        log::debug!("Find references at {uri} {}:{}", position.line, position.character);
+
+        Ok(self.handle_references(&uri, position).await)
+    }
+
+    async fn hover(&self, params: HoverParams) -> JsonRpcResult<Option<Hover>> {
+        if !self.config.read().await.enable_link_navigation {
+            return Ok(None);
+        }
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+
+        log::debug!("Hover at {uri} {}:{}", position.line, position.character);
+
+        Ok(self.handle_hover(&uri, position).await)
+    }
+
+    async fn prepare_rename(&self, params: TextDocumentPositionParams) -> JsonRpcResult<Option<PrepareRenameResponse>> {
+        if !self.config.read().await.enable_link_navigation {
+            return Ok(None);
+        }
+        let uri = params.text_document.uri;
+        let position = params.position;
+
+        log::debug!("Prepare rename at {uri} {}:{}", position.line, position.character);
+
+        Ok(self.handle_prepare_rename(&uri, position).await)
+    }
+
+    async fn rename(&self, params: RenameParams) -> JsonRpcResult<Option<WorkspaceEdit>> {
+        if !self.config.read().await.enable_link_navigation {
+            return Ok(None);
+        }
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let new_name = params.new_name;
+
+        log::debug!("Rename at {uri} {}:{} → {new_name}", position.line, position.character);
+
+        Ok(self.handle_rename(&uri, position, &new_name).await)
+    }
+
+    async fn diagnostic(&self, params: DocumentDiagnosticParams) -> JsonRpcResult<DocumentDiagnosticReportResult> {
+        let uri = params.text_document.uri;
+
+        if let Some(text) = self.get_open_document_content(&uri).await {
+            match self.lint_document(&uri, &text, true).await {
+                Ok(diagnostics) => Ok(DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(
+                    RelatedFullDocumentDiagnosticReport {
+                        related_documents: None,
+                        full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                            result_id: None,
+                            items: diagnostics,
+                        },
+                    },
+                ))),
+                Err(e) => {
+                    log::error!("Failed to get diagnostics: {e}");
+                    Ok(DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(
+                        RelatedFullDocumentDiagnosticReport {
+                            related_documents: None,
+                            full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                                result_id: None,
+                                items: Vec::new(),
+                            },
+                        },
+                    )))
+                }
+            }
+        } else {
+            Ok(DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(
+                RelatedFullDocumentDiagnosticReport {
+                    related_documents: None,
+                    full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                        result_id: None,
+                        items: Vec::new(),
+                    },
+                },
+            )))
+        }
+    }
+
+    async fn document_symbol(&self, params: DocumentSymbolParams) -> JsonRpcResult<Option<DocumentSymbolResponse>> {
+        if !self.config.read().await.enable_symbols {
+            return Ok(None);
+        }
+
+        let uri = params.text_document.uri;
+        let Some(text) = self.get_document_content(&uri).await else {
+            return Ok(None);
+        };
+
+        let flavor = self.resolve_flavor_for_uri(&uri).await;
+        let ctx = crate::lint_context::LintContext::new(&text, flavor, None);
+
+        if *self.client_supports_hierarchical_symbols.read().await {
+            let symbols = super::symbols::document_symbols(&ctx);
+            Ok((!symbols.is_empty()).then_some(DocumentSymbolResponse::Nested(symbols)))
+        } else {
+            let symbols = super::symbols::document_symbols_flat(&ctx, &uri);
+            Ok((!symbols.is_empty()).then_some(DocumentSymbolResponse::Flat(symbols)))
+        }
+    }
+
+    async fn symbol(&self, params: WorkspaceSymbolParams) -> JsonRpcResult<Option<Vec<SymbolInformation>>> {
+        if !self.config.read().await.enable_symbols {
+            return Ok(None);
+        }
+
+        let query = params.query.to_lowercase();
+        let index = self.workspace_index.read().await;
+        let symbols = super::symbols::workspace_symbols(&index, &query);
+        Ok(if symbols.is_empty() { None } else { Some(symbols) })
+    }
+}
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;

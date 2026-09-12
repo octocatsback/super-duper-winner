@@ -1,0 +1,982 @@
+pub mod code_fence_utils;
+pub mod emphasis_style;
+pub mod front_matter_utils;
+pub mod heading_utils;
+pub mod strong_style;
+
+mod md001_heading_increment;
+mod md003_heading_style;
+pub mod md004_unordered_list_style;
+mod md005_list_indent;
+pub mod md007_ul_indent;
+mod md009_trailing_spaces;
+pub mod md010_no_hard_tabs;
+mod md011_no_reversed_links;
+pub mod md013_line_length;
+mod md014_commands_show_output;
+mod md024_no_duplicate_heading;
+mod md025_single_title;
+mod md026_no_trailing_punctuation;
+mod md027_multiple_spaces_blockquote;
+mod md028_no_blanks_blockquote;
+mod md029_ordered_list_prefix;
+pub mod md030_list_marker_space;
+mod md031_blanks_around_fences;
+mod md032_blanks_around_lists;
+mod md033_no_inline_html;
+mod md034_no_bare_urls;
+mod md035_hr_style;
+pub mod md036_no_emphasis_only_first;
+mod md037_spaces_around_emphasis;
+mod md038_no_space_in_code;
+mod md039_no_space_in_links;
+pub mod md040_fenced_code_language;
+mod md041_first_line_heading;
+mod md042_no_empty_links;
+mod md043_required_headings;
+mod md044_proper_names;
+mod md045_no_alt_text;
+mod md046_code_block_style;
+mod md047_single_trailing_newline;
+mod md048_code_fence_style;
+mod md049_emphasis_style;
+mod md050_strong_style;
+pub mod md051_link_fragments;
+mod md052_reference_links_images;
+mod md053_link_image_reference_definitions;
+mod md054_link_image_style;
+mod md055_table_pipe_style;
+mod md056_table_column_count;
+mod md058_blanks_around_tables;
+mod md059_link_text;
+mod md060_table_format;
+mod md061_forbidden_terms;
+mod md062_link_destination_whitespace;
+mod md063_heading_capitalization;
+mod md064_no_multiple_consecutive_spaces;
+mod md065_blanks_around_horizontal_rules;
+mod md066_footnote_validation;
+mod md067_footnote_definition_order;
+mod md068_empty_footnote_definition;
+mod md069_no_duplicate_list_markers;
+mod md070_nested_code_fence;
+mod md071_blank_line_after_frontmatter;
+mod md072_frontmatter_key_sort;
+mod md073_toc_validation;
+mod md074_mkdocs_nav;
+mod md075_orphaned_table_rows;
+mod md076_list_item_spacing;
+mod md077_list_continuation_indent;
+mod md078_missing_chunk_labels;
+mod md079_chunk_label_spaces;
+mod md080_heading_anchor_collision;
+mod md081_no_excessive_emphasis;
+mod md082_no_empty_sections;
+mod md083_mojibake;
+mod md084_invisible_characters;
+mod md085_paragraph_continuation_indent;
+mod md086_no_unclosed_comments;
+mod md087_unused_disable_comment;
+mod md088_quotes_dashes;
+mod md089_cjk_spacing;
+mod md091_no_markdown_in_html;
+
+pub use code_fence_utils::CodeFenceStyle;
+pub use md001_heading_increment::MD001HeadingIncrement;
+pub use md003_heading_style::MD003HeadingStyle;
+pub use md004_unordered_list_style::MD004UnorderedListStyle;
+pub use md004_unordered_list_style::UnorderedListStyle;
+pub use md005_list_indent::MD005ListIndent;
+pub use md007_ul_indent::MD007ULIndent;
+pub use md009_trailing_spaces::MD009TrailingSpaces;
+pub use md010_no_hard_tabs::{MD010Config, MD010NoHardTabs};
+pub use md011_no_reversed_links::MD011NoReversedLinks;
+pub use md013_line_length::MD013Config;
+pub use md013_line_length::MD013LineLength;
+pub use md014_commands_show_output::MD014CommandsShowOutput;
+pub use md024_no_duplicate_heading::MD024NoDuplicateHeading;
+pub use md025_single_title::MD025SingleTitle;
+pub use md026_no_trailing_punctuation::MD026NoTrailingPunctuation;
+pub use md027_multiple_spaces_blockquote::MD027MultipleSpacesBlockquote;
+pub use md028_no_blanks_blockquote::MD028NoBlanksBlockquote;
+pub use md029_ordered_list_prefix::{ListStyle, MD029OrderedListPrefix};
+pub use md030_list_marker_space::MD030ListMarkerSpace;
+pub use md031_blanks_around_fences::MD031BlanksAroundFences;
+pub use md032_blanks_around_lists::MD032BlanksAroundLists;
+pub use md033_no_inline_html::MD033NoInlineHtml;
+pub use md034_no_bare_urls::MD034NoBareUrls;
+pub use md035_hr_style::MD035HRStyle;
+pub use md036_no_emphasis_only_first::MD036NoEmphasisAsHeading;
+pub use md037_spaces_around_emphasis::MD037NoSpaceInEmphasis;
+pub use md038_no_space_in_code::MD038NoSpaceInCode;
+pub use md039_no_space_in_links::MD039NoSpaceInLinks;
+pub use md040_fenced_code_language::MD040FencedCodeLanguage;
+pub use md041_first_line_heading::MD041FirstLineHeading;
+pub use md042_no_empty_links::MD042NoEmptyLinks;
+pub use md043_required_headings::MD043RequiredHeadings;
+pub use md044_proper_names::MD044ProperNames;
+pub use md045_no_alt_text::MD045NoAltText;
+pub use md046_code_block_style::{CodeBlockStyle, MD046CodeBlockStyle};
+pub use md047_single_trailing_newline::MD047SingleTrailingNewline;
+pub use md048_code_fence_style::MD048CodeFenceStyle;
+pub use md049_emphasis_style::MD049EmphasisStyle;
+pub use md050_strong_style::MD050StrongStyle;
+pub use md051_link_fragments::MD051LinkFragments;
+pub use md052_reference_links_images::MD052ReferenceLinkImages;
+pub use md053_link_image_reference_definitions::MD053LinkImageReferenceDefinitions;
+pub use md054_link_image_style::MD054LinkImageStyle;
+pub use md055_table_pipe_style::MD055TablePipeStyle;
+pub use md056_table_column_count::MD056TableColumnCount;
+pub use md058_blanks_around_tables::MD058BlanksAroundTables;
+pub use md059_link_text::MD059LinkText;
+pub use md060_table_format::ColumnAlign;
+pub use md060_table_format::MD060Config;
+pub use md060_table_format::MD060TableFormat;
+pub use md061_forbidden_terms::MD061ForbiddenTerms;
+pub use md062_link_destination_whitespace::MD062LinkDestinationWhitespace;
+pub use md063_heading_capitalization::MD063HeadingCapitalization;
+pub use md064_no_multiple_consecutive_spaces::MD064NoMultipleConsecutiveSpaces;
+pub use md065_blanks_around_horizontal_rules::MD065BlanksAroundHorizontalRules;
+pub use md066_footnote_validation::MD066FootnoteValidation;
+pub use md067_footnote_definition_order::MD067FootnoteDefinitionOrder;
+pub use md068_empty_footnote_definition::MD068EmptyFootnoteDefinition;
+pub use md069_no_duplicate_list_markers::MD069NoDuplicateListMarkers;
+pub use md070_nested_code_fence::MD070NestedCodeFence;
+pub use md071_blank_line_after_frontmatter::MD071BlankLineAfterFrontmatter;
+pub use md072_frontmatter_key_sort::MD072FrontmatterKeySort;
+pub use md073_toc_validation::MD073TocValidation;
+pub use md074_mkdocs_nav::MD074MkDocsNav;
+pub use md075_orphaned_table_rows::MD075OrphanedTableRows;
+pub use md076_list_item_spacing::{ListItemSpacingStyle, MD076ListItemSpacing};
+pub use md077_list_continuation_indent::{ContinuationStyle, MD077ListContinuationIndent};
+pub use md078_missing_chunk_labels::MD078MissingChunkLabels;
+pub use md079_chunk_label_spaces::MD079ChunkLabelSpaces;
+pub use md080_heading_anchor_collision::MD080HeadingAnchorCollision;
+pub use md081_no_excessive_emphasis::MD081NoExcessiveEmphasis;
+pub use md082_no_empty_sections::MD082NoEmptySections;
+pub use md083_mojibake::MD083DetectMojibake;
+pub use md084_invisible_characters::MD084InvisibleCharacters;
+pub use md085_paragraph_continuation_indent::MD085ParagraphContinuationIndent;
+pub use md086_no_unclosed_comments::MD086NoUnclosedComments;
+pub use md087_unused_disable_comment::MD087UnusedDisableComment;
+pub use md088_quotes_dashes::MD088QuotesDashes;
+pub use md089_cjk_spacing::MD089CjkSpacing;
+pub use md091_no_markdown_in_html::MD091NoMarkdownInHtml;
+
+mod md012_no_multiple_blanks;
+pub use md012_no_multiple_blanks::MD012NoMultipleBlanks;
+
+mod md018_no_missing_space_atx;
+pub use md018_no_missing_space_atx::MD018NoMissingSpaceAtx;
+
+mod md019_no_multiple_space_atx;
+pub use md019_no_multiple_space_atx::MD019NoMultipleSpaceAtx;
+
+mod md020_no_missing_space_closed_atx;
+mod md021_no_multiple_space_closed_atx;
+pub use md020_no_missing_space_closed_atx::MD020NoMissingSpaceClosedAtx;
+pub use md021_no_multiple_space_closed_atx::MD021NoMultipleSpaceClosedAtx;
+
+pub(crate) mod md022_blanks_around_headings;
+pub use md022_blanks_around_headings::MD022BlanksAroundHeadings;
+
+mod md023_heading_start_left;
+pub use md023_heading_start_left::MD023HeadingStartLeft;
+
+mod md057_existing_relative_links;
+
+pub use md057_existing_relative_links::{AbsoluteLinksOption, MD057Config, MD057ExistingRelativeLinks};
+
+use crate::rule::Rule;
+
+/// Type alias for rule constructor functions
+type RuleCtor = fn(&crate::config::Config) -> Box<dyn Rule>;
+
+/// Entry in the rule registry, with metadata about the rule
+struct RuleEntry {
+    name: &'static str,
+    /// Readable name used in diagnostics, generated directives, and help.
+    primary_alias: &'static str,
+    ctor: RuleCtor,
+    /// Whether this rule requires explicit opt-in via extend-enable or enable=["ALL"]
+    opt_in: bool,
+}
+
+/// Registry of all available rules with their constructor functions
+/// This enables automatic inline config support - the engine can recreate
+/// any rule with a merged config without per-rule changes.
+///
+/// Rules marked `opt_in: true` are excluded from the default rule set and must
+/// be explicitly enabled via `extend-enable` or `enable = ["ALL"]`.
+const RULES: &[RuleEntry] = &[
+    RuleEntry {
+        name: "MD001",
+        primary_alias: "heading-increment",
+        ctor: MD001HeadingIncrement::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD003",
+        primary_alias: "heading-style",
+        ctor: MD003HeadingStyle::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD004",
+        primary_alias: "ul-style",
+        ctor: MD004UnorderedListStyle::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD005",
+        primary_alias: "list-indent",
+        ctor: MD005ListIndent::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD007",
+        primary_alias: "ul-indent",
+        ctor: MD007ULIndent::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD009",
+        primary_alias: "no-trailing-spaces",
+        ctor: MD009TrailingSpaces::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD010",
+        primary_alias: "no-hard-tabs",
+        ctor: MD010NoHardTabs::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD011",
+        primary_alias: "no-reversed-links",
+        ctor: MD011NoReversedLinks::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD012",
+        primary_alias: "no-multiple-blanks",
+        ctor: MD012NoMultipleBlanks::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD013",
+        primary_alias: "line-length",
+        ctor: MD013LineLength::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD014",
+        primary_alias: "commands-show-output",
+        ctor: MD014CommandsShowOutput::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD018",
+        primary_alias: "no-missing-space-atx",
+        ctor: MD018NoMissingSpaceAtx::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD019",
+        primary_alias: "no-multiple-space-atx",
+        ctor: MD019NoMultipleSpaceAtx::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD020",
+        primary_alias: "no-missing-space-closed-atx",
+        ctor: MD020NoMissingSpaceClosedAtx::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD021",
+        primary_alias: "no-multiple-space-closed-atx",
+        ctor: MD021NoMultipleSpaceClosedAtx::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD022",
+        primary_alias: "blanks-around-headings",
+        ctor: MD022BlanksAroundHeadings::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD023",
+        primary_alias: "heading-start-left",
+        ctor: MD023HeadingStartLeft::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD024",
+        primary_alias: "no-duplicate-heading",
+        ctor: MD024NoDuplicateHeading::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD025",
+        primary_alias: "single-title",
+        ctor: MD025SingleTitle::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD026",
+        primary_alias: "no-trailing-punctuation",
+        ctor: MD026NoTrailingPunctuation::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD027",
+        primary_alias: "no-multiple-space-blockquote",
+        ctor: MD027MultipleSpacesBlockquote::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD028",
+        primary_alias: "no-blanks-blockquote",
+        ctor: MD028NoBlanksBlockquote::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD029",
+        primary_alias: "ol-prefix",
+        ctor: MD029OrderedListPrefix::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD030",
+        primary_alias: "list-marker-space",
+        ctor: MD030ListMarkerSpace::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD031",
+        primary_alias: "blanks-around-fences",
+        ctor: MD031BlanksAroundFences::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD032",
+        primary_alias: "blanks-around-lists",
+        ctor: MD032BlanksAroundLists::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD033",
+        primary_alias: "no-inline-html",
+        ctor: MD033NoInlineHtml::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD034",
+        primary_alias: "no-bare-urls",
+        ctor: MD034NoBareUrls::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD035",
+        primary_alias: "hr-style",
+        ctor: MD035HRStyle::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD036",
+        primary_alias: "no-emphasis-as-heading",
+        ctor: MD036NoEmphasisAsHeading::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD037",
+        primary_alias: "no-space-in-emphasis",
+        ctor: MD037NoSpaceInEmphasis::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD038",
+        primary_alias: "no-space-in-code",
+        ctor: MD038NoSpaceInCode::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD039",
+        primary_alias: "no-space-in-links",
+        ctor: MD039NoSpaceInLinks::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD040",
+        primary_alias: "fenced-code-language",
+        ctor: MD040FencedCodeLanguage::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD041",
+        primary_alias: "first-line-heading",
+        ctor: MD041FirstLineHeading::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD042",
+        primary_alias: "no-empty-links",
+        ctor: MD042NoEmptyLinks::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD043",
+        primary_alias: "required-headings",
+        ctor: MD043RequiredHeadings::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD044",
+        primary_alias: "proper-names",
+        ctor: MD044ProperNames::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD045",
+        primary_alias: "no-alt-text",
+        ctor: MD045NoAltText::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD046",
+        primary_alias: "code-block-style",
+        ctor: MD046CodeBlockStyle::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD047",
+        primary_alias: "single-trailing-newline",
+        ctor: MD047SingleTrailingNewline::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD048",
+        primary_alias: "code-fence-style",
+        ctor: MD048CodeFenceStyle::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD049",
+        primary_alias: "emphasis-style",
+        ctor: MD049EmphasisStyle::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD050",
+        primary_alias: "strong-style",
+        ctor: MD050StrongStyle::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD051",
+        primary_alias: "link-fragments",
+        ctor: MD051LinkFragments::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD052",
+        primary_alias: "reference-links-images",
+        ctor: MD052ReferenceLinkImages::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD053",
+        primary_alias: "link-image-reference-definitions",
+        ctor: MD053LinkImageReferenceDefinitions::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD054",
+        primary_alias: "link-image-style",
+        ctor: MD054LinkImageStyle::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD055",
+        primary_alias: "table-pipe-style",
+        ctor: MD055TablePipeStyle::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD056",
+        primary_alias: "table-column-count",
+        ctor: MD056TableColumnCount::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD057",
+        primary_alias: "existing-relative-links",
+        ctor: MD057ExistingRelativeLinks::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD058",
+        primary_alias: "blanks-around-tables",
+        ctor: MD058BlanksAroundTables::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD059",
+        primary_alias: "descriptive-link-text",
+        ctor: MD059LinkText::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD060",
+        primary_alias: "table-format",
+        ctor: MD060TableFormat::from_config,
+        opt_in: true,
+    },
+    RuleEntry {
+        name: "MD061",
+        primary_alias: "forbidden-terms",
+        ctor: MD061ForbiddenTerms::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD062",
+        primary_alias: "link-destination-whitespace",
+        ctor: MD062LinkDestinationWhitespace::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD063",
+        primary_alias: "heading-capitalization",
+        ctor: MD063HeadingCapitalization::from_config,
+        opt_in: true,
+    },
+    RuleEntry {
+        name: "MD064",
+        primary_alias: "no-multiple-consecutive-spaces",
+        ctor: MD064NoMultipleConsecutiveSpaces::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD065",
+        primary_alias: "blanks-around-horizontal-rules",
+        ctor: MD065BlanksAroundHorizontalRules::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD066",
+        primary_alias: "footnote-validation",
+        ctor: MD066FootnoteValidation::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD067",
+        primary_alias: "footnote-definition-order",
+        ctor: MD067FootnoteDefinitionOrder::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD068",
+        primary_alias: "empty-footnote-definition",
+        ctor: MD068EmptyFootnoteDefinition::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD069",
+        primary_alias: "no-duplicate-list-markers",
+        ctor: MD069NoDuplicateListMarkers::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD070",
+        primary_alias: "nested-code-fence",
+        ctor: MD070NestedCodeFence::from_config,
+        opt_in: true,
+    },
+    RuleEntry {
+        name: "MD071",
+        primary_alias: "blank-line-after-frontmatter",
+        ctor: MD071BlankLineAfterFrontmatter::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD072",
+        primary_alias: "frontmatter-key-sort",
+        ctor: MD072FrontmatterKeySort::from_config,
+        opt_in: true,
+    },
+    RuleEntry {
+        name: "MD073",
+        primary_alias: "toc-validation",
+        ctor: MD073TocValidation::from_config,
+        opt_in: true,
+    },
+    RuleEntry {
+        name: "MD074",
+        primary_alias: "mkdocs-nav",
+        ctor: MD074MkDocsNav::from_config,
+        opt_in: true,
+    },
+    RuleEntry {
+        name: "MD075",
+        primary_alias: "orphaned-table-rows",
+        ctor: MD075OrphanedTableRows::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD076",
+        primary_alias: "list-item-spacing",
+        ctor: MD076ListItemSpacing::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD077",
+        primary_alias: "list-continuation-indent",
+        ctor: MD077ListContinuationIndent::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD078",
+        primary_alias: "missing-chunk-labels",
+        ctor: MD078MissingChunkLabels::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD079",
+        primary_alias: "chunk-label-spaces",
+        ctor: MD079ChunkLabelSpaces::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD080",
+        primary_alias: "heading-anchor-collision",
+        ctor: MD080HeadingAnchorCollision::from_config,
+        opt_in: true,
+    },
+    RuleEntry {
+        name: "MD081",
+        primary_alias: "no-excessive-emphasis",
+        ctor: MD081NoExcessiveEmphasis::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD082",
+        primary_alias: "no-empty-sections",
+        ctor: MD082NoEmptySections::from_config,
+        opt_in: true,
+    },
+    RuleEntry {
+        name: "MD083",
+        primary_alias: "mojibake",
+        ctor: MD083DetectMojibake::from_config,
+        opt_in: true,
+    },
+    RuleEntry {
+        name: "MD084",
+        primary_alias: "invisible-characters",
+        ctor: MD084InvisibleCharacters::from_config,
+        opt_in: true,
+    },
+    RuleEntry {
+        name: "MD085",
+        primary_alias: "paragraph-continuation-indent",
+        ctor: MD085ParagraphContinuationIndent::from_config,
+        opt_in: true,
+    },
+    RuleEntry {
+        name: "MD086",
+        primary_alias: "no-unclosed-comments",
+        ctor: MD086NoUnclosedComments::from_config,
+        opt_in: false,
+    },
+    RuleEntry {
+        name: "MD087",
+        primary_alias: "unused-disable-comment",
+        ctor: MD087UnusedDisableComment::from_config,
+        opt_in: true,
+    },
+    RuleEntry {
+        name: "MD088",
+        primary_alias: "quotes-dashes",
+        ctor: crate::rules::md088_quotes_dashes::MD088QuotesDashes::from_config,
+        opt_in: true,
+    },
+    RuleEntry {
+        name: "MD089",
+        primary_alias: "cjk-spacing",
+        ctor: crate::rules::md089_cjk_spacing::MD089CjkSpacing::from_config,
+        opt_in: true,
+    },
+    RuleEntry {
+        name: "MD091",
+        primary_alias: "no-markdown-in-html",
+        ctor: MD091NoMarkdownInHtml::from_config,
+        opt_in: true,
+    },
+];
+
+/// Returns all rule instances (including opt-in) for config validation and CLI
+pub fn all_rules(config: &crate::config::Config) -> Vec<Box<dyn Rule>> {
+    RULES.iter().map(|entry| (entry.ctor)(config)).collect()
+}
+
+/// Returns the set of rule names that require explicit opt-in
+pub fn opt_in_rules() -> HashSet<&'static str> {
+    RULES
+        .iter()
+        .filter(|entry| entry.opt_in)
+        .map(|entry| entry.name)
+        .collect()
+}
+
+/// The readable alias owned by a canonical rule entry.
+pub(crate) fn primary_alias(name: &str) -> Option<&'static str> {
+    RULES
+        .binary_search_by_key(&name, |entry| entry.name)
+        .ok()
+        .map(|index| RULES[index].primary_alias)
+}
+
+pub(crate) fn rule_identity(index: usize) -> Option<(&'static str, &'static str)> {
+    RULES.get(index).map(|entry| (entry.name, entry.primary_alias))
+}
+
+/// Creates a single rule by name with the given config
+///
+/// This enables automatic inline config support - the engine can recreate
+/// any rule with a merged config without per-rule changes.
+///
+/// Returns None if the rule name is not found.
+pub fn create_rule_by_name(name: &str, config: &crate::config::Config) -> Option<Box<dyn Rule>> {
+    RULES
+        .iter()
+        .find(|entry| entry.name == name)
+        .map(|entry| (entry.ctor)(config))
+}
+
+// Filter rules based on config (moved from main.rs)
+// Note: This needs access to GlobalConfig from the config module.
+use crate::config::GlobalConfig;
+use std::collections::HashSet;
+
+/// Check whether the enable list contains the "all" keyword (case-insensitive).
+fn contains_all_keyword(list: &[String]) -> bool {
+    list.iter().any(|s| s.eq_ignore_ascii_case("all"))
+}
+
+/// Build a canonical-form `HashSet` from a rule-name list.
+///
+/// Rewrites every entry through `resolve_rule_name` so aliases
+/// (`"no-inline-html"`) match the same set as canonical IDs (`"MD033"`).
+/// The `"all"` keyword is preserved (case-folded to lowercase) so the
+/// special-case branches in `filter_rules` continue to work.
+fn canonical_rule_set(list: &[String]) -> HashSet<String> {
+    list.iter()
+        .map(|s| {
+            if s.eq_ignore_ascii_case("all") {
+                "all".to_string()
+            } else {
+                crate::config::resolve_rule_name(s)
+            }
+        })
+        .collect()
+}
+
+/// Filter `rules` according to `global_config.{enable,disable,extend_enable,extend_disable}`.
+///
+/// Rule-name entries may be either canonical IDs (`"MD033"`) or aliases
+/// (`"no-inline-html"`); both forms match identically. Canonical IDs are
+/// the norm — every `Config` produced through a mutation boundary
+/// (`From<SourcedConfig> for Config`, LSP `apply_lsp_settings_*`, WASM
+/// `to_config_with_warnings`) is canonicalised by
+/// `Config::canonicalize_rule_lists`. The defensive canonicalisation here
+/// keeps `filter_rules` correct for programmatic callers that build a
+/// `GlobalConfig` without going through those boundaries.
+pub fn filter_rules(rules: &[Box<dyn Rule>], global_config: &GlobalConfig) -> Vec<Box<dyn Rule>> {
+    let mut enabled_rules: Vec<Box<dyn Rule>> = Vec::new();
+    let disabled_rules: HashSet<String> = canonical_rule_set(&global_config.disable);
+    let opt_in_set = opt_in_rules();
+    let extend_enable_set: HashSet<String> = canonical_rule_set(&global_config.extend_enable);
+    let extend_disable_set: HashSet<String> = canonical_rule_set(&global_config.extend_disable);
+
+    let extend_enable_all = contains_all_keyword(&global_config.extend_enable);
+    let extend_disable_all = contains_all_keyword(&global_config.extend_disable);
+
+    // Helper: should this rule be removed by any disable source?
+    let is_disabled = |name: &str| -> bool {
+        disabled_rules.contains(name) || extend_disable_all || extend_disable_set.contains(name)
+    };
+
+    // Handle 'disable: ["all"]': nothing survives except the rules `enable`
+    // lists (enable: ["ALL"] cancels the keyword outright). extend-enable adds
+    // to a base set that the keyword has emptied, so it adds nothing, while
+    // extend-disable still removes from the surviving list because disabling
+    // always wins over enabling.
+    if disabled_rules.contains("all") {
+        let enable_all = contains_all_keyword(&global_config.enable);
+        let enabled_set: HashSet<String> = canonical_rule_set(&global_config.enable);
+        for rule in rules {
+            let name = rule.name();
+            let enabled = enable_all || enabled_set.contains(name);
+            if enabled && !extend_disable_all && !extend_disable_set.contains(name) {
+                enabled_rules.push(dyn_clone::clone_box(&**rule));
+            }
+        }
+        return enabled_rules;
+    }
+
+    // If 'enable' is specified, only use those rules
+    if !global_config.enable.is_empty() || global_config.enable_is_explicit {
+        if contains_all_keyword(&global_config.enable) || extend_enable_all {
+            // enable: ["ALL"] or extend-enable: ["ALL"] → all rules including opt-in
+            for rule in rules {
+                if !is_disabled(rule.name()) {
+                    enabled_rules.push(dyn_clone::clone_box(&**rule));
+                }
+            }
+        } else {
+            // Merge enable set with extend-enable
+            let mut enabled_set: HashSet<String> = canonical_rule_set(&global_config.enable);
+            for name in &extend_enable_set {
+                enabled_set.insert(name.clone());
+            }
+            for rule in rules {
+                if enabled_set.contains(rule.name()) && !is_disabled(rule.name()) {
+                    enabled_rules.push(dyn_clone::clone_box(&**rule));
+                }
+            }
+        }
+    } else if extend_enable_all {
+        // No explicit enable, but extend-enable: ["ALL"] → all rules including opt-in
+        for rule in rules {
+            if !is_disabled(rule.name()) {
+                enabled_rules.push(dyn_clone::clone_box(&**rule));
+            }
+        }
+    } else {
+        // No explicit enable: use all non-opt-in rules + extend-enable, minus disable
+        for rule in rules {
+            let is_opt_in = opt_in_set.contains(rule.name());
+            let explicitly_extended = extend_enable_set.contains(rule.name());
+            if (!is_opt_in || explicitly_extended) && !is_disabled(rule.name()) {
+                enabled_rules.push(dyn_clone::clone_box(&**rule));
+            }
+        }
+    }
+
+    enabled_rules
+}
+
+/// Return `rules` with every rule excluded for `path` by `[per-file-ignores]`
+/// removed.
+///
+/// This is the lint/check-side counterpart to the fix coordinator's internal
+/// per-file-ignore handling: callers that lint a specific file run their rule
+/// set through this so diagnostics never report a rule the file has excluded,
+/// mirroring what the coordinator guarantees on the fix side. Returns a clone
+/// of `rules` unchanged when the file excludes nothing.
+pub fn filter_rules_for_file(
+    rules: &[Box<dyn Rule>],
+    config: &crate::config::Config,
+    path: &std::path::Path,
+) -> Vec<Box<dyn Rule>> {
+    let ignored = config.get_ignored_rules_for_file(path);
+    if ignored.is_empty() {
+        return rules.to_vec();
+    }
+    rules
+        .iter()
+        .filter(|rule| !ignored.contains(rule.name()))
+        .map(|r| dyn_clone::clone_box(&**r))
+        .collect()
+}
+
+#[cfg(test)]
+mod filter_rules_alias_tests {
+    use super::*;
+    use crate::config::Config;
+
+    /// `filter_rules` must accept aliases in `disable` even when the caller
+    /// builds a `GlobalConfig` directly (bypassing the canonicalisation
+    /// boundary in `From<SourcedConfig> for Config`). This is the public-API
+    /// guarantee that programmatic library callers depend on.
+    #[test]
+    fn alias_in_disable_filters_canonical_rule() {
+        let config = Config::default();
+        let rules = all_rules(&config);
+        let global = GlobalConfig {
+            disable: vec!["no-inline-html".to_string()],
+            ..Default::default()
+        };
+
+        let filtered = filter_rules(&rules, &global);
+        assert!(
+            !filtered.iter().any(|r| r.name() == "MD033"),
+            "filter_rules must drop MD033 when its alias `no-inline-html` is in disable, \
+             even on a hand-built GlobalConfig. Got: {:?}",
+            filtered.iter().map(|r| r.name()).collect::<Vec<_>>(),
+        );
+    }
+
+    /// Same guarantee for `extend_disable`.
+    #[test]
+    fn alias_in_extend_disable_filters_canonical_rule() {
+        let config = Config::default();
+        let rules = all_rules(&config);
+        let global = GlobalConfig {
+            extend_disable: vec!["line-length".to_string()],
+            ..Default::default()
+        };
+
+        let filtered = filter_rules(&rules, &global);
+        assert!(
+            !filtered.iter().any(|r| r.name() == "MD013"),
+            "filter_rules must drop MD013 when alias `line-length` is in extend_disable. Got: {:?}",
+            filtered.iter().map(|r| r.name()).collect::<Vec<_>>(),
+        );
+    }
+
+    /// `enable` aliases must select the canonical rule.
+    #[test]
+    fn alias_in_enable_selects_canonical_rule() {
+        let config = Config::default();
+        let rules = all_rules(&config);
+        let global = GlobalConfig {
+            enable: vec!["no-inline-html".to_string()],
+            ..Default::default()
+        };
+
+        let filtered = filter_rules(&rules, &global);
+        let names: Vec<&str> = filtered.iter().map(|r| r.name()).collect();
+        assert_eq!(
+            names,
+            vec!["MD033"],
+            "filter_rules must select only MD033 when alias `no-inline-html` is the sole enable. \
+             Got: {names:?}",
+        );
+    }
+
+    /// The canonical-IDs invariant is preserved: a config that is already
+    /// canonical produces the same filter result as one that uses aliases.
+    #[test]
+    fn alias_and_canonical_produce_identical_filter_result() {
+        let config = Config::default();
+        let rules = all_rules(&config);
+
+        let alias_global = GlobalConfig {
+            disable: vec!["no-inline-html".to_string(), "line-length".to_string()],
+            ..Default::default()
+        };
+        let canonical_global = GlobalConfig {
+            disable: vec!["MD033".to_string(), "MD013".to_string()],
+            ..Default::default()
+        };
+
+        let alias_names: Vec<&str> = filter_rules(&rules, &alias_global).iter().map(|r| r.name()).collect();
+        let canonical_names: Vec<&str> = filter_rules(&rules, &canonical_global)
+            .iter()
+            .map(|r| r.name())
+            .collect();
+        assert_eq!(alias_names, canonical_names);
+    }
+}

@@ -1,0 +1,873 @@
+//! GitHub.com official anchor generation with security hardening
+//!
+//! This module implements the exact anchor generation algorithm used by GitHub.com,
+//! verified through comprehensive testing with GitHub Gists, with comprehensive
+//! security hardening against injection attacks and DoS vectors.
+//!
+//! Algorithm verified against GitHub.com (not third-party packages):
+//! 1. Input validation and size limits (max 10KB)
+//! 2. Unicode normalization (NFC) to prevent homograph attacks
+//! 3. Dangerous Unicode filtering (RTL override, zero-width, control chars)
+//! 4. Lowercase conversion
+//! 5. HTML comment, markdown formatting (*, `, []) and HTML tag removal with ReDoS-safe patterns
+//! 6. Multi-character pattern replacement (-->, <->, ==>, ->)
+//! 7. Em/en dash removal and special symbol replacement (& → --, © → --)
+//! 8. Character processing: letters, digits, underscores and hyphens are kept, each space
+//!    becomes a hyphen, and every other symbol (emoji included) is deleted, so the spaces
+//!    around an emoji stay
+//! 9. No leading/trailing trimming (unlike kramdown)
+//!
+//! Security measures implemented:
+//! - Input size limits to prevent memory exhaustion
+//! - Unicode normalization to prevent homograph attacks
+//! - Bidirectional text injection prevention
+//! - Zero-width character stripping
+//! - Control character filtering
+//! - ReDoS-resistant regex patterns with complexity limits
+
+use regex::Regex;
+use std::sync::LazyLock;
+use unicode_normalization::UnicodeNormalization;
+
+use super::common::{
+    DANGEROUS_UNICODE_PATTERN, MAX_INPUT_LENGTH, UnicodeLetterMode, ZERO_WIDTH_PATTERN, is_safe_unicode_letter,
+};
+
+// ReDoS-resistant patterns with atomic grouping and possessive quantifiers where possible
+// Limited repetition depth to prevent catastrophic backtracking
+// Match both asterisk and underscore emphasis (with proper nesting handling)
+static EMPHASIS_ASTERISK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\*{1,3}([^*]+?)\*{1,3}").unwrap());
+// Match emphasis underscores - only when they wrap text, not in snake_case
+// This pattern matches _text_ or __text__ but not test_with_underscores
+static EMPHASIS_UNDERSCORE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b_{1,2}([^_\s][^_]*?)_{1,2}\b").unwrap());
+// Match both single-backtick and double-backtick code spans.
+// Double-backtick spans (``code``) are tried first so they aren't consumed as two single spans.
+static CODE_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"``([^`]{0,500})``|`([^`]{0,500})`").unwrap());
+// Match image and link patterns
+// Using simple approach: match the brackets and parentheses, extract only the bracket content
+static IMAGE_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"!\[([^\]]*)\]\([^)]*\)").unwrap());
+static LINK_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[([^\[\]]*(?:\[[^\[\]]*\][^\[\]]*)*)\](?:\([^)]*\)|\[[^\]]*\])").unwrap());
+
+// Ampersand and copyright with whitespace patterns
+static AMPERSAND_WITH_SPACES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+&\s+").unwrap());
+static COPYRIGHT_WITH_SPACES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+©\s+").unwrap());
+
+// HTML/JSX tag stripping - GitHub removes entire HTML tags from heading anchors
+// Matches opening tags (<div>, <Component />), closing tags (</div>), and self-closing tags
+// Requires first char after < to be a letter or / (to avoid matching arrow patterns like <->)
+// Uses case-insensitive flag since this is applied after lowercasing
+static HTML_TAG_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)</?[a-z][^>]*>").unwrap());
+
+// HTML comment stripping - GitHub renders `<!-- ... -->` invisibly and never includes
+// its content in anchor IDs. Stripped before arrow-pattern processing so a comment's
+// trailing `-->` is never misinterpreted as an arrow.
+// Non-greedy and newline-free: headings are single-line, and `.` excludes `\n` by default.
+static HTML_COMMENT_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<!--.*?-->").unwrap());
+
+/// Generate GitHub.com style anchor fragment from heading text with security hardening
+///
+/// This implementation matches GitHub.com's exact behavior, verified through
+/// comprehensive testing with GitHub Gists, while providing robust security
+/// against various injection and DoS attacks.
+///
+/// # Security Features
+/// - Input size limits (max 10KB) to prevent memory exhaustion
+/// - Unicode normalization (NFC) to prevent homograph attacks
+/// - Bidirectional text injection filtering
+/// - Zero-width character removal
+/// - Control character filtering
+/// - ReDoS-resistant regex patterns
+///
+/// # Examples
+/// ```
+/// use rumdl_lib::utils::anchor_styles::github;
+///
+/// assert_eq!(github::heading_to_fragment("Hello World"), "hello-world");
+/// assert_eq!(github::heading_to_fragment("cbrown --> sbrown: --unsafe-paths"), "cbrown----sbrown---unsafe-paths");
+/// assert_eq!(github::heading_to_fragment("test_with_underscores"), "test_with_underscores");
+/// ```
+pub fn heading_to_fragment(heading: &str) -> String {
+    // Security Step 1: Input validation and size limits
+    if heading.is_empty() {
+        return String::new();
+    }
+
+    if heading.len() > MAX_INPUT_LENGTH {
+        // Truncate oversized input to prevent memory exhaustion
+        // Use char_indices to ensure we don't split in the middle of a UTF-8 character
+        let mut truncated_len = 0;
+        for (byte_index, _) in heading.char_indices() {
+            if byte_index >= MAX_INPUT_LENGTH {
+                truncated_len = byte_index;
+                break;
+            }
+            truncated_len = byte_index + 1; // Include the current character
+        }
+        if truncated_len == 0 {
+            truncated_len = MAX_INPUT_LENGTH.min(heading.len());
+        }
+        let truncated = &heading[..truncated_len];
+        return heading_to_fragment_internal(truncated);
+    }
+
+    heading_to_fragment_internal(heading)
+}
+
+/// Internal implementation with security hardening
+fn heading_to_fragment_internal(heading: &str) -> String {
+    // Security Step 2: Unicode normalization to prevent homograph attacks
+    // NFC normalization ensures canonical representation
+    let normalized: String = heading.nfc().collect();
+
+    // Security Step 3: Filter dangerous Unicode characters
+    let sanitized = sanitize_unicode(&normalized);
+
+    // Step 4: Convert to lowercase
+    let mut text = sanitized.to_lowercase();
+
+    // Step 5a: Strip HTML comments before any other processing.
+    // Comments are invisible on GitHub and must not contribute to the anchor.
+    // Stripping before arrow handling prevents `-->` inside a comment from
+    // being misread as an arrow pattern.
+    if text.contains("<!--") {
+        text = HTML_COMMENT_PATTERN.replace_all(&text, "").to_string();
+    }
+
+    // Step 5b: Remove markdown formatting and HTML tags while preserving inner text
+    if text.contains('*') || text.contains('_') || text.contains('`') || text.contains('[') {
+        // Extract code span content FIRST and protect it from emphasis processing.
+        // Code spans take precedence over emphasis in Markdown parsing, so
+        // `__init__` should preserve underscores (literal code content),
+        // while __init__ without backticks should strip them (emphasis).
+        let mut code_extracts: Vec<String> = Vec::new();
+        text = CODE_PATTERN
+            .replace_all(&text, |caps: &regex::Captures| {
+                let idx = code_extracts.len();
+                // Group 1 is the double-backtick match, group 2 is the single-backtick match
+                let content = caps.get(1).or_else(|| caps.get(2)).map_or("", |m| m.as_str());
+                code_extracts.push(content.to_string());
+                format!("\x00CODE{idx}\x00")
+            })
+            .to_string();
+
+        // Process emphasis iteratively to handle nesting (e.g., **_text_**)
+        // Bounded to 3 iterations to prevent infinite loops on malformed input
+        for _ in 0..3 {
+            let prev = text.clone();
+            text = EMPHASIS_ASTERISK.replace_all(&text, "$1").to_string();
+            text = EMPHASIS_UNDERSCORE.replace_all(&text, "$1").to_string();
+            if text == prev {
+                break;
+            }
+        }
+
+        // Strip HTML/JSX tags BEFORE restoring code spans
+        // Code spans are still protected as placeholders, so their angle brackets are safe
+        text = HTML_TAG_PATTERN.replace_all(&text, "").to_string();
+
+        // Restore code span content after HTML tag stripping
+        // Angle brackets from code spans (e.g., `import <FILE>`) are preserved as plain text
+        for (idx, content) in code_extracts.into_iter().enumerate() {
+            text = text.replace(&format!("\x00CODE{idx}\x00"), &content);
+        }
+
+        text = IMAGE_PATTERN.replace_all(&text, "$1").to_string();
+        text = LINK_PATTERN.replace_all(&text, "$1").to_string();
+    } else if text.contains('<') {
+        // Strip HTML/JSX tags even when no markdown formatting is present
+        text = HTML_TAG_PATTERN.replace_all(&text, "").to_string();
+    }
+
+    // Step 6: Multi-character arrow patterns (order matters!)
+    // GitHub.com converts these patterns to specific hyphen sequences
+    // Verified against GitHub.com actual behavior (issue #82)
+    // Pattern: arrow itself becomes N hyphens, each adjacent space adds 1 more
+    // Must handle patterns with most spaces first to avoid partial replacements
+
+    // --> patterns (arrow = 2 hyphens base)
+    text = text.replace(" --> ", "----"); // 2 + 1 + 1 = 4 hyphens
+    text = text.replace(" -->", "---"); // 2 + 1 = 3 hyphens
+    text = text.replace("--> ", "---"); // 2 + 1 = 3 hyphens
+    text = text.replace("-->", "--"); // 2 hyphens
+
+    // <-> patterns (assuming similar pattern, needs verification)
+    text = text.replace(" <-> ", "---"); // estimated: 1 + 1 + 1 = 3 hyphens
+    text = text.replace(" <->", "--"); // estimated: 1 + 1 = 2 hyphens
+    text = text.replace("<-> ", "--"); // estimated: 1 + 1 = 2 hyphens
+    text = text.replace("<->", "-"); // estimated: 1 hyphen
+
+    // ==> patterns (assuming similar pattern, needs verification)
+    text = text.replace(" ==> ", "--"); // estimated pattern
+    text = text.replace(" ==>", "-"); // estimated pattern
+    text = text.replace("==> ", "-"); // estimated pattern
+    text = text.replace("==>", ""); // estimated: might be removed entirely
+
+    // -> patterns (arrow = 1 hyphen base)
+    text = text.replace(" -> ", "---"); // 1 + 1 + 1 = 3 hyphens
+    text = text.replace(" ->", "--"); // 1 + 1 = 2 hyphens
+    text = text.replace("-> ", "--"); // 1 + 1 = 2 hyphens
+    text = text.replace("->", "-"); // 1 hyphen
+
+    // Step 7a: Remove em-dashes and en-dashes entirely before symbol replacement
+    text = text.replace(['–', '—'], "");
+
+    // Step 7b: Special symbol replacements
+    // Handle ampersand based on position and surrounding spaces
+    // GitHub's behavior:
+    // - "& text" at start → "--text"
+    // - "text &" at end → "text-"
+    // - "text & text" in middle → "text--text"
+    // - "&text" (no space) → "text"
+
+    // First handle ampersand at start with space
+    if text.starts_with("& ") {
+        text = text.replacen("& ", "--", 1);
+    }
+    // Then handle ampersand at end with space
+    else if text.ends_with(" &") {
+        text = text[..text.len() - 2].to_string() + "-";
+    }
+    // Then handle ampersand with spaces on both sides
+    else {
+        text = AMPERSAND_WITH_SPACES.replace_all(&text, "--").to_string();
+    }
+
+    // Handle copyright similarly
+    text = COPYRIGHT_WITH_SPACES.replace_all(&text, "--").to_string();
+
+    // Remove ampersand and copyright without spaces
+    text = text.replace('&', "");
+    text = text.replace("©", "");
+
+    // Remaining angle brackets (from code span content) are handled during
+    // character-by-character processing below - '<' and '>' are simply removed
+    // while their content is preserved as regular text
+
+    // Step 8: Character-by-character processing
+    let mut result = String::with_capacity(text.len()); // Pre-allocate for efficiency
+
+    for c in text.chars() {
+        let code = c as u32;
+        if c.is_ascii_alphabetic() || c.is_ascii_digit() || c == '_' || c == '-' {
+            // Preserve letters, numbers, underscores, and hyphens
+            result.push(c);
+        } else if code == 0x20E3 {
+            // Preserve combining keycap for keycap sequences
+            // Note: FE0F should only be preserved as part of a keycap, not standalone
+            result.push(c);
+        } else if code == 0xFE0F {
+            // Only preserve variation selector if it's preceded by a keycap base
+            if let Some(prev) = result.chars().last()
+                && is_keycap_base(prev)
+            {
+                result.push(c);
+            }
+            // Otherwise filter it out
+        } else if c.is_alphabetic() && is_safe_unicode_letter(c, UnicodeLetterMode::GitHub) {
+            // Preserve Unicode letters (like é, ñ, etc.) but only safe ones
+            result.push(c);
+        } else if c.is_numeric() {
+            // Preserve all numeric characters (digits from any script)
+            result.push(c);
+        } else if c.is_whitespace() {
+            // Convert each whitespace character to a hyphen
+            // GitHub preserves multiple spaces as multiple hyphens
+            result.push('-');
+        }
+        // Everything else, ASCII punctuation and Unicode symbols including emoji,
+        // is deleted with no replacement: GitHub's filter keeps `[\p{Word}\- ]`
+        // and drops the rest before turning spaces into hyphens, so the spaces
+        // around an emoji stay and become its hyphens.
+    }
+
+    // Step 9: GitHub does NOT trim leading/trailing hyphens, even those from symbol removal
+    // "---leading" → "---leading"
+    // "© 2024" → "-2024"
+    // "trailing---" → "trailing---"
+
+    result
+}
+
+/// Sanitize Unicode input by removing dangerous character categories
+/// Filters out bidirectional text injection, zero-width chars, and control chars
+fn sanitize_unicode(input: &str) -> String {
+    // Remove zero-width characters that can be used for injection attacks
+    let no_zero_width = ZERO_WIDTH_PATTERN.replace_all(input, "");
+
+    // Remove dangerous RTL override and bidirectional control characters
+    let no_bidi_attack = DANGEROUS_UNICODE_PATTERN.replace_all(&no_zero_width, "");
+
+    // Filter out control characters (except basic whitespace)
+    let mut sanitized = String::with_capacity(no_bidi_attack.len());
+    for c in no_bidi_attack.chars() {
+        if !c.is_control() || c.is_whitespace() {
+            sanitized.push(c);
+        }
+        // Skip control characters entirely for security
+    }
+
+    sanitized
+}
+
+/// Check if character can be the base of a keycap sequence
+fn is_keycap_base(c: char) -> bool {
+    let code = c as u32;
+    // Digits 0-9, *, #, and some letters used in keycap sequences
+    (0x0030..=0x0039).contains(&code) ||  // ASCII digits 0-9
+    code == 0x002A ||                     // Asterisk *
+    code == 0x0023 // Number sign #
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_github_basic_cases() {
+        assert_eq!(heading_to_fragment("Hello World"), "hello-world");
+        assert_eq!(heading_to_fragment("Test Case"), "test-case");
+        assert_eq!(heading_to_fragment(""), "");
+    }
+
+    #[test]
+    fn test_github_underscores() {
+        // GitHub preserves underscores in snake_case but removes emphasis markdown
+        assert_eq!(heading_to_fragment("test_with_underscores"), "test_with_underscores");
+        assert_eq!(heading_to_fragment("Update login_type"), "update-login_type");
+        assert_eq!(heading_to_fragment("__dunder__"), "dunder"); // Emphasis removed
+        assert_eq!(heading_to_fragment("_emphasized_"), "emphasized"); // Single underscore emphasis
+        assert_eq!(heading_to_fragment("__double__ underscore"), "double-underscore");
+    }
+
+    #[test]
+    fn test_github_arrows_issue_39() {
+        // These are the specific cases from issue #39 that were failing
+        assert_eq!(
+            heading_to_fragment("cbrown --> sbrown: --unsafe-paths"),
+            "cbrown----sbrown---unsafe-paths"
+        );
+        assert_eq!(heading_to_fragment("cbrown -> sbrown"), "cbrown---sbrown");
+        assert_eq!(
+            heading_to_fragment("Arrow Test <-> bidirectional"),
+            "arrow-test---bidirectional"
+        );
+        assert_eq!(heading_to_fragment("Double Arrow ==> Test"), "double-arrow--test");
+    }
+
+    #[test]
+    fn test_github_hyphens() {
+        // GitHub preserves consecutive hyphens (no consolidation)
+        assert_eq!(heading_to_fragment("Double--Hyphen"), "double--hyphen");
+        assert_eq!(heading_to_fragment("Triple---Dash"), "triple---dash");
+        assert_eq!(
+            heading_to_fragment("Test---with---multiple---hyphens"),
+            "test---with---multiple---hyphens"
+        );
+    }
+
+    #[test]
+    fn test_github_special_symbols() {
+        assert_eq!(heading_to_fragment("Testing & Coverage"), "testing--coverage");
+        assert_eq!(heading_to_fragment("Copyright © 2024"), "copyright--2024");
+        assert_eq!(
+            heading_to_fragment("API::Response > Error--Handling"),
+            "apiresponse--error--handling"
+        );
+    }
+
+    #[test]
+    fn test_github_unicode() {
+        // GitHub preserves Unicode letters
+        assert_eq!(heading_to_fragment("Café René"), "café-rené");
+        assert_eq!(heading_to_fragment("naïve résumé"), "naïve-résumé");
+        assert_eq!(heading_to_fragment("über uns"), "über-uns");
+    }
+
+    #[test]
+    fn test_github_emojis() {
+        // GitHub deletes an emoji and keeps the spaces around it, so each space becomes a hyphen
+        assert_eq!(heading_to_fragment("Emoji 🎉 Party"), "emoji--party");
+        assert_eq!(heading_to_fragment("Test 🚀 Rocket"), "test--rocket");
+    }
+
+    #[test]
+    fn test_github_markdown_removal() {
+        assert_eq!(heading_to_fragment("*emphasized* text"), "emphasized-text");
+        assert_eq!(heading_to_fragment("`code` in heading"), "code-in-heading");
+        assert_eq!(heading_to_fragment("[link text](url)"), "link-text");
+        assert_eq!(heading_to_fragment("[ref link][]"), "ref-link");
+    }
+
+    #[test]
+    fn test_github_html_jsx_tag_stripping() {
+        // Issue #510: GitHub strips HTML/JSX tags from headings when generating anchors
+
+        // Self-closing JSX tag
+        assert_eq!(heading_to_fragment("retentionPolicy<Component />"), "retentionpolicy");
+
+        // JSX with attributes
+        assert_eq!(
+            heading_to_fragment("retentionPolicy<HeaderTag type=\"danger\" text=\"required\" />"),
+            "retentionpolicy"
+        );
+
+        // HTML span with content (tags stripped, inner text preserved)
+        assert_eq!(heading_to_fragment("Test <span>extra</span>"), "test-extra");
+
+        // Multiple HTML tags
+        assert_eq!(
+            heading_to_fragment("A <b>bold</b> and <i>italic</i>"),
+            "a-bold-and-italic"
+        );
+
+        // Mixed code spans and JSX (code span content preserved, JSX stripped)
+        assert_eq!(heading_to_fragment("`code`<Tag />"), "code");
+
+        // Single-letter type parameter (GitHub strips these too)
+        assert_eq!(heading_to_fragment("Generic<T>"), "generic");
+
+        // Self-closing HTML tag
+        assert_eq!(heading_to_fragment("Text<br />More"), "textmore");
+
+        // Nested HTML
+        assert_eq!(
+            heading_to_fragment("Test <div><span>nested</span></div>"),
+            "test-nested"
+        );
+
+        // Arrow patterns should NOT be affected by HTML tag stripping
+        assert_eq!(
+            heading_to_fragment("Arrow Test <-> bidirectional"),
+            "arrow-test---bidirectional"
+        );
+    }
+
+    #[test]
+    fn test_github_html_comment_stripping() {
+        // Verified against GitHub.com gist rendering: HTML comments `<!-- ... -->`
+        // are invisible in rendered output and stripped from anchors. The surrounding
+        // whitespace is preserved and becomes hyphens via the normal pipeline.
+
+        // Trailing comment — space before comment survives as a trailing hyphen
+        assert_eq!(heading_to_fragment("Hello <!-- world -->"), "hello-");
+
+        // Comment in the middle — two flanking spaces become two hyphens
+        assert_eq!(heading_to_fragment("A <!-- c --> B"), "a--b");
+
+        // Leading comment — space after comment becomes a leading hyphen
+        assert_eq!(heading_to_fragment("<!-- hidden --> Title"), "-title");
+
+        // Comment abutting text with no spaces — nothing survives the comment
+        assert_eq!(heading_to_fragment("Title<!-- no space -->"), "title");
+
+        // Multiple adjacent comments — both fully stripped
+        assert_eq!(heading_to_fragment("Hello<!-- x --><!-- y -->"), "hello");
+
+        // Empty comment (`<!-- -->`) is still a full comment, gets stripped
+        assert_eq!(heading_to_fragment("Hello <!-- --> World"), "hello--world");
+        assert_eq!(heading_to_fragment("Arrow <!-- --> Test"), "arrow--test");
+
+        // Comment content never leaks into the anchor, even when it contains
+        // text that would otherwise form arrow sequences
+        assert_eq!(heading_to_fragment("Has <!-- arrow --> inside"), "has--inside");
+
+        // Only the comment is stripped — a real `-->` outside the comment still
+        // goes through the arrow-replacement pipeline
+        assert_eq!(
+            heading_to_fragment("Has <!-- --> and --> outside"),
+            "has--and----outside"
+        );
+
+        // Unclosed comments are left as literal text (GitHub treats them as text too)
+        assert_eq!(heading_to_fragment("Unclosed <!-- comment"), "unclosed----comment");
+    }
+
+    #[test]
+    fn test_github_leading_trailing() {
+        // GitHub does NOT trim leading/trailing hyphens (unlike kramdown)
+        assert_eq!(heading_to_fragment("---leading"), "---leading");
+        assert_eq!(heading_to_fragment("trailing---"), "trailing---");
+        assert_eq!(heading_to_fragment("---both---"), "---both---");
+    }
+
+    #[test]
+    fn test_github_numbers() {
+        assert_eq!(heading_to_fragment("Step 1: Getting Started"), "step-1-getting-started");
+        assert_eq!(heading_to_fragment("Version 2.1.0"), "version-210");
+        assert_eq!(heading_to_fragment("123 Numbers"), "123-numbers");
+    }
+
+    #[test]
+    fn test_github_comprehensive_verified() {
+        // These test cases were verified against actual GitHub Gist behavior
+        let test_cases = [
+            ("GitHub Anchor Generation Test", "github-anchor-generation-test"),
+            (
+                "Test Case 1: cbrown --> sbrown: --unsafe-paths",
+                "test-case-1-cbrown----sbrown---unsafe-paths",
+            ),
+            ("Test Case 2: PHP $_REQUEST", "test-case-2-php-_request"),
+            ("Test Case 3: Update login_type", "test-case-3-update-login_type"),
+            (
+                "Test Case 4: Test with: colons > and arrows",
+                "test-case-4-test-with-colons--and-arrows",
+            ),
+            (
+                "Test Case 5: Test---with---multiple---hyphens",
+                "test-case-5-test---with---multiple---hyphens",
+            ),
+            ("Test Case 6: Simple test case", "test-case-6-simple-test-case"),
+            (
+                "Test Case 7: API::Response > Error--Handling",
+                "test-case-7-apiresponse--error--handling",
+            ),
+        ];
+
+        for (input, expected) in test_cases {
+            let actual = heading_to_fragment(input);
+            assert_eq!(
+                actual, expected,
+                "GitHub verified test failed for input: '{input}'\nExpected: '{expected}'\nActual: '{actual}'"
+            );
+        }
+    }
+
+    // Security Tests
+
+    #[test]
+    fn test_security_input_size_limits() {
+        // Test input size limits to prevent memory exhaustion
+        let large_input = "a".repeat(20000); // 20KB input
+        let result = heading_to_fragment(&large_input);
+
+        // Should be truncated to MAX_INPUT_LENGTH
+        assert!(result.len() <= MAX_INPUT_LENGTH);
+
+        // Empty input should return empty
+        assert_eq!(heading_to_fragment(""), "");
+    }
+
+    #[test]
+    fn test_security_unicode_normalization() {
+        // Test Unicode normalization prevents homograph attacks
+
+        // Different Unicode representations of "café"
+        let normal_cafe = "café"; // NFC normalized
+        let decomposed_cafe = "cafe\u{0301}"; // NFD decomposed (e + combining acute)
+
+        let result1 = heading_to_fragment(normal_cafe);
+        let result2 = heading_to_fragment(decomposed_cafe);
+
+        // Both should normalize to the same result
+        assert_eq!(result1, result2);
+        assert_eq!(result1, "café");
+    }
+
+    #[test]
+    fn test_security_bidi_injection_prevention() {
+        // Test bidirectional text injection attack prevention
+
+        // RTL override attack attempt
+        let rtl_attack = "Hello\u{202E}dlroW\u{202D}";
+        let result = heading_to_fragment(rtl_attack);
+        assert_eq!(result, "hellodlrow"); // RTL overrides should be removed
+
+        // RLO/LRO attack
+        let rlo_attack = "user\u{202E}@bank.com";
+        let result = heading_to_fragment(rlo_attack);
+        assert!(!result.contains('\u{202E}')); // Should not contain RTL override
+
+        // Isolate attacks
+        let isolate_attack = "test\u{2066}hidden\u{2069}text";
+        let result = heading_to_fragment(isolate_attack);
+        assert_eq!(result, "testhiddentext"); // Isolate chars should be removed
+    }
+
+    #[test]
+    fn test_security_zero_width_character_removal() {
+        // Test zero-width character injection prevention
+
+        let zero_width_attack = "hel\u{200B}lo\u{200C}wor\u{200D}ld\u{FEFF}";
+        let result = heading_to_fragment(zero_width_attack);
+        assert_eq!(result, "helloworld"); // All zero-width chars should be removed
+
+        // Test various zero-width characters
+        let zwj_attack = "test\u{200D}text"; // Zero Width Joiner
+        let result = heading_to_fragment(zwj_attack);
+        assert_eq!(result, "testtext");
+
+        let bom_attack = "test\u{FEFF}text"; // Byte Order Mark
+        let result = heading_to_fragment(bom_attack);
+        assert_eq!(result, "testtext");
+    }
+
+    #[test]
+    fn test_security_control_character_filtering() {
+        // Test control character filtering
+
+        let control_chars = "test\x01\x02\x03\x1F text";
+        let result = heading_to_fragment(control_chars);
+        assert_eq!(result, "test-text"); // Control chars removed, space becomes hyphen
+
+        // Preserve normal whitespace
+        let normal_whitespace = "test\n\t text";
+        let result = heading_to_fragment(normal_whitespace);
+        assert_eq!(result, "test---text"); // Multiple whitespace becomes hyphens (\n, \t, space)
+    }
+
+    #[test]
+    fn test_github_emoji_sequences() {
+        // A multi-codepoint emoji goes through the character pass one codepoint
+        // at a time: GitHub keeps a keycap sequence (digit, FE0F, U+20E3) and
+        // deletes every other emoji, leaving the spaces around it as hyphens.
+
+        // Regional indicator pairs (country flags) are deleted, the spaces stay
+        let flag_test = "Hello 🇺🇸 World 🇬🇧 Test";
+        let result = heading_to_fragment(flag_test);
+        assert_eq!(result, "hello--world--test");
+
+        // Keycap sequences are kept whole
+        let keycap_test = "Step 1️⃣ and 2️⃣ complete";
+        let result = heading_to_fragment(keycap_test);
+        assert_eq!(result, "step-1️⃣-and-2️⃣-complete");
+
+        // A ZWJ family sequence is deleted whole: sanitize_unicode strips the
+        // joiners and the character pass drops each component, so the two
+        // spaces are all that remain. GitHub.com keeps the joiners in its id
+        // (test-\u{200d}\u{200d}\u{200d}-family); rumdl strips U+200D by policy.
+        let complex_emoji = "Test 👨‍👩‍👧‍👦 family";
+        let result = heading_to_fragment(complex_emoji);
+        assert_eq!(result, "test--family");
+
+        // Symbols outside the emoji blocks are deleted the same way
+        let mixed_symbols = "Math ∑ ∆ 🧮 symbols";
+        let result = heading_to_fragment(mixed_symbols);
+        assert_eq!(result, "math----symbols");
+    }
+
+    #[test]
+    fn test_security_redos_resistance() {
+        // Test ReDoS resistance with pathological inputs
+
+        // Nested patterns that could cause exponential backtracking
+        let nested_emphasis = "*".repeat(50) + "text" + "*".repeat(50).as_str();
+        let result = heading_to_fragment(&nested_emphasis);
+        // Should not hang and should produce reasonable output
+        assert!(result.len() < 200); // Bounded output
+
+        // Deeply nested code blocks
+        let nested_code = "`".repeat(100) + "code" + "`".repeat(100).as_str();
+        let result = heading_to_fragment(&nested_code);
+        assert!(result.len() < 300); // Bounded output
+
+        // Pathological link patterns
+        let nested_links = "[".repeat(50) + "text" + "]".repeat(50).as_str();
+        let result = heading_to_fragment(&nested_links);
+        assert!(result.len() < 200); // Bounded output
+    }
+
+    #[test]
+    fn test_security_dangerous_unicode_blocks() {
+        // Test filtering of dangerous Unicode blocks
+
+        // Private Use Area characters (potential malicious content)
+        let pua_test = "test\u{E000}\u{F8FF}text";
+        let result = heading_to_fragment(pua_test);
+        assert_eq!(result, "testtext"); // PUA chars should be filtered
+
+        // Variation selectors (can change appearance)
+        let variation_test = "test\u{FE00}\u{FE0F}text";
+        let result = heading_to_fragment(variation_test);
+        assert_eq!(result, "testtext"); // Variation selectors should be filtered
+    }
+
+    #[test]
+    fn test_security_normal_behavior_preserved() {
+        // Ensure security measures don't break normal functionality
+
+        // Normal Unicode letters should still work
+        let unicode_letters = "Café René naïve über";
+        let result = heading_to_fragment(unicode_letters);
+        assert_eq!(result, "café-rené-naïve-über");
+
+        // Normal ASCII should still work
+        let ascii_test = "Hello World 123";
+        let result = heading_to_fragment(ascii_test);
+        assert_eq!(result, "hello-world-123");
+
+        // GitHub-specific behavior should be preserved
+        let github_specific = "cbrown --> sbrown: --unsafe-paths";
+        let result = heading_to_fragment(github_specific);
+        assert_eq!(result, "cbrown----sbrown---unsafe-paths");
+    }
+
+    #[test]
+    fn test_github_arrow_patterns_issue_82() {
+        // Test cases for issue #82 - verified against GitHub.com actual behavior
+        // Pattern: arrow itself becomes N hyphens, each adjacent space adds 1 more
+
+        // Single arrow (->) patterns
+        assert_eq!(heading_to_fragment("WAL->L0 Compaction"), "wal-l0-compaction");
+        assert_eq!(heading_to_fragment("foo->bar->baz"), "foo-bar-baz");
+        assert_eq!(heading_to_fragment("a->b"), "a-b");
+        assert_eq!(heading_to_fragment("a ->b"), "a--b");
+        assert_eq!(heading_to_fragment("a-> b"), "a--b");
+        assert_eq!(heading_to_fragment("a -> b"), "a---b");
+
+        // Double arrow (-->) patterns
+        assert_eq!(heading_to_fragment("a-->b"), "a--b");
+        assert_eq!(heading_to_fragment("a -->b"), "a---b");
+        assert_eq!(heading_to_fragment("a--> b"), "a---b");
+        assert_eq!(heading_to_fragment("a --> b"), "a----b");
+
+        // Mixed patterns
+        assert_eq!(heading_to_fragment("cbrown -> sbrown"), "cbrown---sbrown");
+        assert_eq!(
+            heading_to_fragment("cbrown --> sbrown: --unsafe-paths"),
+            "cbrown----sbrown---unsafe-paths"
+        );
+    }
+
+    #[test]
+    fn test_security_performance_edge_cases() {
+        // Test performance with edge cases that could cause issues
+
+        // Long repetitive patterns
+        let repetitive = "ab".repeat(1000);
+        let start = std::time::Instant::now();
+        let result = heading_to_fragment(&repetitive);
+        let duration = start.elapsed();
+
+        // Should complete quickly (under 100ms for this size)
+        assert!(duration.as_millis() < 100);
+        assert!(!result.is_empty());
+
+        // Mixed ASCII and Unicode
+        let mixed = ("a".to_string() + "ñ").repeat(500);
+        let start = std::time::Instant::now();
+        let result = heading_to_fragment(&mixed);
+        let duration = start.elapsed();
+
+        assert!(duration.as_millis() < 100);
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_github_section_sign_is_stripped() {
+        // `§` is a symbol like any other to GitHub's filter: deleted, with the
+        // spaces around it kept. Expected values are the ids GitHub.com
+        // rendered for these headings in a gist, 2026-09-05.
+        assert_eq!(heading_to_fragment("A §1 B"), "a-1-b");
+        assert_eq!(
+            heading_to_fragment("9. Worked Examples — the ridl §13 Contracts"),
+            "9-worked-examples--the-ridl-13-contracts"
+        );
+        assert_eq!(heading_to_fragment("§ 1"), "-1");
+        assert_eq!(heading_to_fragment("A §"), "a-");
+        assert_eq!(heading_to_fragment("A§B"), "ab");
+        assert_eq!(heading_to_fragment("A § B"), "a--b");
+        assert_eq!(heading_to_fragment("See §§ 3–4"), "see--34");
+        assert_eq!(heading_to_fragment("A §1 B 🚀"), "a-1-b-");
+        assert_eq!(heading_to_fragment("A §🚀 B"), "a--b");
+        assert_eq!(heading_to_fragment("A 🚀§ B"), "a--b");
+    }
+
+    #[test]
+    fn test_github_emoji_keeps_the_spaces_around_it() {
+        // GitHub deletes an emoji and keeps the spaces around it, so the hyphen
+        // count is the space count, whatever sits next to the emoji. Expected
+        // values are the ids GitHub.com rendered for these headings in a gist,
+        // 2026-09-05.
+        assert_eq!(heading_to_fragment("A🚀 B"), "a-b");
+        assert_eq!(heading_to_fragment("A 🚀B"), "a-b");
+        assert_eq!(heading_to_fragment("A🚀B"), "ab");
+        // Punctuation next to an emoji is deleted the same way, in any heading
+        assert_eq!(heading_to_fragment("A °🚀 B"), "a--b");
+        assert_eq!(heading_to_fragment("Notes… 🚀 done"), "notes--done");
+        assert_eq!(heading_to_fragment("Notes… done"), "notes-done");
+        // A variation selector after a deleted emoji is kept when the character
+        // before it is a keycap base, here the digit, which is what GitHub emits
+        assert_eq!(heading_to_fragment("Top 3☀\u{fe0f} days"), "top-3\u{fe0f}-days");
+        // An emoji between spaces, next to another emoji, or at either end
+        assert_eq!(heading_to_fragment("A 🚀 B"), "a--b");
+        assert_eq!(heading_to_fragment("A 🚀 🎉 B"), "a---b");
+        assert_eq!(heading_to_fragment("A 🚀🎉 B"), "a--b");
+        assert_eq!(heading_to_fragment("🚀 Title"), "-title");
+        assert_eq!(heading_to_fragment("Title 🚀"), "title-");
+    }
+
+    #[test]
+    fn test_code_span_preserves_underscores_in_slug() {
+        // Verified against GitHub.com via Gist: code span content is preserved literally
+        assert_eq!(heading_to_fragment("`__hello__`"), "__hello__");
+        assert_eq!(heading_to_fragment("`__init__`"), "__init__");
+        assert_eq!(heading_to_fragment("`_single_`"), "_single_");
+    }
+
+    #[test]
+    fn test_emphasis_underscores_removed_from_slug() {
+        // Verified against GitHub.com via Gist: bare emphasis underscores are stripped
+        assert_eq!(heading_to_fragment("__hello__"), "hello");
+        assert_eq!(heading_to_fragment("_hello_"), "hello");
+    }
+
+    #[test]
+    fn test_mixed_code_and_emphasis_in_heading() {
+        // Verified against GitHub.com via Gist: code spans preserve content,
+        // emphasis outside code spans is stripped
+        assert_eq!(
+            heading_to_fragment("`__init__` method for __MyClass__"),
+            "__init__-method-for-myclass"
+        );
+    }
+
+    #[test]
+    fn test_multiple_code_spans_in_heading() {
+        // Multiple code spans each preserve their underscore content independently
+        assert_eq!(heading_to_fragment("`__a__` and `__b__`"), "__a__-and-__b__");
+        assert_eq!(heading_to_fragment("`__init__` and `__del__`"), "__init__-and-__del__");
+        // Three code spans
+        assert_eq!(heading_to_fragment("`__a__` `__b__` `__c__`"), "__a__-__b__-__c__");
+    }
+
+    #[test]
+    fn test_adjacent_code_spans_in_heading() {
+        // Adjacent code spans with no space between them
+        assert_eq!(heading_to_fragment("`__a__``__b__`"), "__a____b__");
+        assert_eq!(heading_to_fragment("`_x_``_y_`"), "_x__y_");
+    }
+
+    #[test]
+    fn test_double_backtick_code_span_preserves_content() {
+        // Double-backtick code spans should also preserve their content as-is,
+        // just like single-backtick code spans.
+        assert_eq!(heading_to_fragment("``__init__``"), "__init__");
+        assert_eq!(heading_to_fragment("``__hello__``"), "__hello__");
+        assert_eq!(heading_to_fragment("``_single_``"), "_single_");
+    }
+
+    #[test]
+    fn test_double_backtick_code_span_with_surrounding_text() {
+        // Double-backtick code span mixed with regular text and emphasis
+        assert_eq!(
+            heading_to_fragment("``__init__`` method for __MyClass__"),
+            "__init__-method-for-myclass"
+        );
+    }
+
+    #[test]
+    fn test_double_backtick_code_span_containing_single_backtick() {
+        // A key use case for double-backtick spans: they can contain a literal backtick
+        assert_eq!(heading_to_fragment("``code`here``"), "codehere");
+    }
+
+    #[test]
+    fn test_code_span_with_parentheses() {
+        // Parentheses and commas inside code spans are stripped by the character filter;
+        // spaces become hyphens
+        assert_eq!(heading_to_fragment("`__init__(self, name)`"), "__init__self-name");
+        assert_eq!(heading_to_fragment("`foo(bar)`"), "foobar");
+        assert_eq!(heading_to_fragment("`func(a, b, c)`"), "funca-b-c");
+    }
+}

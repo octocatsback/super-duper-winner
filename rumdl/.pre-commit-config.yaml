@@ -1,0 +1,174 @@
+# Pre-commit hooks for rumdl (using prek - https://prek.j178.dev)
+# Install with:
+#   prek install                          # Installs all hook stages
+# Run manually:
+#   prek run --all-files                         # Run commit hooks
+#   prek run --hook-stage pre-push --all-files   # Run push hooks
+
+fail_fast: true
+
+repos:
+  # Secret detection
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.0
+    hooks:
+      - id: gitleaks
+
+  # Shell script linting
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.10.0.1
+    hooks:
+      - id: shellcheck
+
+  # Conventional Commits validation
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v3.6.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]
+        args: [] # Optional: add --strict for stricter validation
+
+  # Rule names in a commit scope reach CHANGELOG.md verbatim, so they must be
+  # uppercase: fix(MD077), not fix(md077). Non-rule scopes stay lowercase.
+  - repo: local
+    hooks:
+      - id: commit-scope-case
+        name: uppercase rule names in commit scope
+        entry: scripts/check-commit-scope.sh
+        language: script
+        stages: [commit-msg]
+        always_run: true
+
+  # Rust formatting and linting
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: mise exec -- cargo fmt --all --
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-lock-check
+        name: check Cargo.lock is up-to-date
+        entry: mise exec -- sh -c 'cargo metadata --locked --format-version 1 --no-deps >/dev/null'
+        language: system
+        files: ^Cargo\.(toml|lock)$
+        pass_filenames: false
+        stages: [pre-commit]
+
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.7
+    hooks:
+      - id: actionlint
+
+  # General file quality checks (prek built-in Rust implementations)
+  - repo: builtin
+    hooks:
+      - id: trailing-whitespace
+        exclude: \.md$|tests/inline_config_test\.rs$|tests/output_format_integration_tests\.rs$|tests/lsp_editor_integration_tests\.rs$|tests/utils_markdown_edge_cases\.rs$
+      - id: end-of-file-fixer
+        exclude: \.md$|rumdl\.schema\.json$
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: mixed-line-ending
+        args: [--fix=lf]
+
+  # YAML linting
+  - repo: https://github.com/owenlamont/ryl-pre-commit
+    rev: v0.4.0
+    hooks:
+      - id: ryl
+
+  # Markdown linting using rumdl itself (cargo run)
+  - repo: local
+    hooks:
+      - id: rumdl
+        name: rumdl check
+        entry: mise exec -- cargo run --quiet -- check
+        language: system
+        files: \.md$
+        exclude: ^(test_tmp|benchmark/test-data|docs/temp|__tests__|CHANGELOG\.md|tests/regressions/idempotency)
+        pass_filenames: true
+        require_serial: true
+
+  # Link checking
+  - repo: local
+    hooks:
+      - id: check-links
+        name: check links
+        entry: make check-links
+        language: system
+        files: \.md$
+        pass_filenames: false
+        stages: [pre-push]
+
+  # Pre-push hooks for comprehensive validation
+  - repo: local
+    hooks:
+      - id: cargo-test-full
+        name: cargo test (full suite)
+        entry: mise exec -- make test-push
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: cargo-lint-full
+        name: cargo clippy (all targets)
+        entry: mise exec -- make lint
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: cargo-doc-check
+        name: cargo doc (check)
+        entry: mise exec -- cargo doc --no-deps --all-features
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: cargo-lock-check-push
+        name: verify Cargo.lock is committed and up-to-date
+        entry: mise exec -- sh -c 'cargo metadata --locked --format-version 1 --no-deps >/dev/null'
+        language: system
+        files: ^Cargo\.(toml|lock)$
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: complexity-check
+        name: check for O(n²) regressions
+        entry: mise exec -- make test-complexity
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: schema-check
+        name: check JSON schema is up-to-date
+        entry: mise exec -- make check-schema
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: rule-docs-check
+        name: check rule-count docs in sync with registry
+        entry: mise exec -- make check-rule-docs
+        language: system
+        files: \.(rs|md)$
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: code-block-tools-check
+        name: check built-in tools docs in sync with registry
+        entry: mise exec -- make check-code-block-tools
+        language: system
+        files: \.(rs|md)$
+        pass_filenames: false
+        stages: [pre-push]
