@@ -1,0 +1,71 @@
+[project]
+branch = "main"
+
+[changelog]
+unconventional = "exclude"
+
+[verify]
+tap = "rvben/homebrew-rumdl"
+
+[[version_files]]
+glob = "README.md"
+search = "rev: v{prev}"
+replace = "rev: v{version}"
+
+[[version_files]]
+glob = "README.md"
+search = "mise use rumdl@{prev}"
+replace = "mise use rumdl@{version}"
+
+[[version_files]]
+glob = "docs/global-settings.md"
+search = "rev: v{prev}"
+replace = "rev: v{version}"
+
+[[version_files]]
+glob = "docs/usage/pre-commit.md"
+search = "rev: v{prev}"
+replace = "rev: v{version}"
+
+[[version_files]]
+glob = "docs/getting-started/quickstart.md"
+search = "rev: v{prev}"
+replace = "rev: v{version}"
+
+[[version_files]]
+glob = "docs/mdformat-comparison.md"
+search = "rev: v{prev}"
+replace = "rev: v{version}"
+
+[[version_files]]
+glob = "docs/usage/ci-cd.md"
+search = 'version: "{prev}"'
+replace = 'version: "{version}"'
+
+[[version_files]]
+glob = "npm/cli-*/package.json"
+field = "version"
+
+[[version_files]]
+glob = "npm/rumdl/package.json"
+field = "version"
+
+[[version_files]]
+glob = "npm/rumdl/package.json"
+field = "optionalDependencies.*"
+
+[[artifacts]]
+command = "cargo run --release --bin rumdl -- rule -o json"
+output = "rules.json"
+
+[[artifacts]]
+command = "cargo run --release --bin rumdl -- schema generate"
+files = ["rumdl.schema.json"]
+
+[hooks]
+pre-bump = "python3 scripts/check-versions.py"
+post-push = "gh api repos/rvben/rumdl-pre-commit/dispatches -f event_type=pypi_release"
+
+[checks]
+lint = false
+tests = false

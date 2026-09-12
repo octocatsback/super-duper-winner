@@ -1,0 +1,15 @@
+[submodule "tryhackme"]
+	path = tryhackme
+	url = https://github.com/octocatsback/tryhackme.git
+	branch = main
+	shallow = true
+[submodule "docs"]
+	path = docs
+	url = https://github.com/octocatsback/docs.git
+	branch = main
+	shallow = true
+[submodule "node"]
+	path = node
+	url = https://github.com/octocatsback/node.git
+	branch = main
+	shallow = true

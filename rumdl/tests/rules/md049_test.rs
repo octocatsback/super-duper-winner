@@ -1,0 +1,518 @@
+use rumdl_lib::MD049EmphasisStyle;
+use rumdl_lib::rule::Rule;
+use rumdl_lib::rules::emphasis_style::EmphasisStyle;
+
+#[test]
+fn test_consistent_asterisks() {
+    let rule = MD049EmphasisStyle::new(EmphasisStyle::Asterisk);
+    let content = "# Test\n\nThis is *emphasized* and this is also *emphasized*";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert!(result.is_empty());
+}
+
+#[test]
+fn test_consistent_underscores() {
+    let rule = MD049EmphasisStyle::new(EmphasisStyle::Underscore);
+    let content = "# Test\n\nThis is _emphasized_ and this is also _emphasized_";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert!(result.is_empty());
+}
+
+#[test]
+fn test_mixed_emphasis_prefer_asterisks() {
+    let rule = MD049EmphasisStyle::new(EmphasisStyle::Asterisk);
+    let content = "# Mixed emphasis\n\nThis is *asterisk* and this is _underscore_";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert_eq!(result.len(), 1);
+
+    let fixed = rule.fix(&ctx).unwrap();
+    // Use contains for more flexible assertion
+    assert!(fixed.contains("This is *asterisk* and this is *underscore*"));
+}
+
+#[test]
+fn test_mixed_emphasis_prefer_underscores() {
+    let rule = MD049EmphasisStyle::new(EmphasisStyle::Underscore);
+    let content = "# Mixed emphasis\n\nThis is *asterisk* and this is _underscore_";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert_eq!(result.len(), 1);
+
+    let fixed = rule.fix(&ctx).unwrap();
+    // Use contains for more flexible assertion
+    assert!(fixed.contains("This is _asterisk_ and this is _underscore_"));
+}
+
+#[test]
+fn test_consistent_style_first_asterisk() {
+    let rule = MD049EmphasisStyle::new(EmphasisStyle::Consistent);
+    let content = "# Mixed emphasis\n\nThis is *asterisk* and this is _underscore_";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert_eq!(result.len(), 1);
+
+    let fixed = rule.fix(&ctx).unwrap();
+    // Use contains for more flexible assertion
+    assert!(fixed.contains("This is *asterisk* and this is *underscore*"));
+}
+
+#[test]
+fn test_consistent_style_first_underscore() {
+    let rule = MD049EmphasisStyle::new(EmphasisStyle::Consistent);
+    // One underscore and one asterisk - tie prefers asterisk
+    let content = "# Mixed emphasis\n\nThis is _underscore_ and this is *asterisk*";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert_eq!(result.len(), 1);
+
+    let fixed = rule.fix(&ctx).unwrap();
+    // Tie-breaker prefers asterisk (matches CommonMark recommendation)
+    assert!(fixed.contains("This is *underscore* and this is *asterisk*"));
+}
+
+#[test]
+fn test_empty_content() {
+    let rule = MD049EmphasisStyle::new(EmphasisStyle::Consistent);
+    let content = "";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert!(result.is_empty());
+}
+
+#[test]
+fn test_no_emphasis() {
+    let rule = MD049EmphasisStyle::new(EmphasisStyle::Consistent);
+    let content = "# Just a heading\n\nSome regular text\n\n> A blockquote";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert!(result.is_empty());
+}
+
+#[test]
+fn test_ignore_strong_emphasis() {
+    let rule = MD049EmphasisStyle::new(EmphasisStyle::Asterisk);
+    let content = "# Test\n\nThis is *emphasis* and this is **strong**";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert!(result.is_empty());
+}
+
+#[test]
+fn test_urls_with_underscores() {
+    let rule = MD049EmphasisStyle::new(EmphasisStyle::Asterisk);
+
+    // Test URL with underscores
+    let content = "Here is a [link](https://example.com/page_with_underscores)";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert!(
+        result.is_empty(),
+        "URLs with underscores should not be flagged as emphasis"
+    );
+    let fixed = rule.fix(&ctx).unwrap();
+    assert_eq!(fixed, content, "URLs with underscores should not be modified");
+
+    // Test complex content with URLs and real emphasis
+    let content = "Check out this _emphasis_ and visit [our site](https://example.com/docs/user_guide/page_name)";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert_eq!(result.len(), 1, "Only the real emphasis should be detected");
+    let fixed = rule.fix(&ctx).unwrap();
+    // Use contains for more flexible assertion
+    assert!(
+        fixed.contains("Check out this *emphasis* and visit [our site]"),
+        "Only the real emphasis should be changed"
+    );
+
+    // Test with multiple URLs and emphasis
+    let content = "Visit these links:\n- [Link 1](https://example.com/some_path)\n- [Link 2](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)\nAnd remember to _check_ the documentation.";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert_eq!(result.len(), 1, "Only the real emphasis should be detected");
+    let fixed = rule.fix(&ctx).unwrap();
+    assert!(
+        fixed.contains("https://example.com/some_path"),
+        "URL should remain unchanged"
+    );
+    assert!(
+        fixed.contains("https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html"),
+        "Complex URL should remain unchanged"
+    );
+    assert!(fixed.contains("*check*"), "Emphasis should be converted to asterisks");
+}
+
+#[test]
+fn test_inline_code_with_underscores() {
+    let rule = MD049EmphasisStyle::new(EmphasisStyle::Asterisk);
+
+    // Test inline code with underscores
+    let content = "Use the `function_name()` in your code and _emphasize_ important parts.";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert_eq!(result.len(), 1, "Should detect one emphasis to fix");
+
+    let fixed = rule.fix(&ctx).unwrap();
+    assert!(
+        fixed.contains("`function_name()`"),
+        "Inline code should not be modified"
+    );
+    assert!(
+        fixed.contains("*emphasize*"),
+        "Emphasis should be converted to asterisks"
+    );
+}
+
+#[test]
+fn test_multiple_backticks() {
+    let rule = MD049EmphasisStyle::new(EmphasisStyle::Asterisk);
+
+    // Test double backticks
+    let content = "Use ``code with `backtick` inside`` and _emphasis_.";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert_eq!(result.len(), 1, "Should detect one emphasis to fix");
+
+    let fixed = rule.fix(&ctx).unwrap();
+    assert!(
+        fixed.contains("``code with `backtick` inside``"),
+        "Double backtick code should not be modified"
+    );
+    assert!(
+        fixed.contains("*emphasis*"),
+        "Emphasis should be converted to asterisks"
+    );
+
+    // Test triple backticks
+    let content = "Use ```code with `backticks` and ``more`` inside``` and _emphasis_.";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert_eq!(result.len(), 1, "Should detect one emphasis to fix");
+
+    let fixed = rule.fix(&ctx).unwrap();
+    assert!(
+        fixed.contains("```code with `backticks` and ``more`` inside```"),
+        "Triple backtick code should not be modified"
+    );
+    assert!(
+        fixed.contains("*emphasis*"),
+        "Emphasis should be converted to asterisks"
+    );
+}
+
+#[test]
+fn test_code_blocks() {
+    let rule = MD049EmphasisStyle::new(EmphasisStyle::Asterisk);
+
+    // Test code blocks with emphasis-like content
+    let content = "Before _emphasis_\n```\nSome _code_ here\n```\nAfter _emphasis_";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert_eq!(result.len(), 2, "Should detect two emphasis to fix");
+
+    let fixed = rule.fix(&ctx).unwrap();
+    assert!(
+        fixed.contains("Before *emphasis*"),
+        "Emphasis before code block should be fixed"
+    );
+    assert!(
+        fixed.contains("Some _code_ here"),
+        "Content in code block should not be modified"
+    );
+    assert!(
+        fixed.contains("After *emphasis*"),
+        "Emphasis after code block should be fixed"
+    );
+
+    // Test with tildes
+    let content = "Before _emphasis_\n~~~\nSome _code_ here\n~~~\nAfter _emphasis_";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert_eq!(result.len(), 2, "Should detect two emphasis to fix");
+
+    let fixed = rule.fix(&ctx).unwrap();
+    assert!(
+        fixed.contains("Before *emphasis*"),
+        "Emphasis before code block should be fixed"
+    );
+    assert!(
+        fixed.contains("Some _code_ here"),
+        "Content in code block should not be modified"
+    );
+    assert!(
+        fixed.contains("After *emphasis*"),
+        "Emphasis after code block should be fixed"
+    );
+}
+
+#[test]
+fn test_environment_variables() {
+    let rule = MD049EmphasisStyle::new(EmphasisStyle::Asterisk);
+
+    // Test environment variables in backticks
+    let content = "Set `GITLAB_URL` and `CI_PROJECT_ID` variables and _note_ the values.";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert_eq!(result.len(), 1, "Should detect one emphasis to fix");
+
+    let fixed = rule.fix(&ctx).unwrap();
+    assert!(
+        fixed.contains("`GITLAB_URL`"),
+        "Environment variable should not be modified"
+    );
+    assert!(
+        fixed.contains("`CI_PROJECT_ID`"),
+        "Environment variable should not be modified"
+    );
+    assert!(fixed.contains("*note*"), "Emphasis should be converted to asterisks");
+}
+
+#[test]
+fn test_nested_code_and_emphasis() {
+    let rule = MD049EmphasisStyle::new(EmphasisStyle::Asterisk);
+
+    // Test complex nesting
+    let content =
+        "1. First step with _emphasis_\n   ```bash\n   echo \"some _code_\"\n   ```\n2. Second step with _emphasis_";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert_eq!(result.len(), 2, "Should detect two emphasis to fix");
+
+    let fixed = rule.fix(&ctx).unwrap();
+    assert!(
+        fixed.contains("First step with *emphasis*"),
+        "First emphasis should be fixed"
+    );
+    assert!(
+        fixed.contains("echo \"some _code_\""),
+        "Code block content should not be modified"
+    );
+    assert!(
+        fixed.contains("Second step with *emphasis*"),
+        "Second emphasis should be fixed"
+    );
+
+    // Test with indented code and emphasis
+    let content = "1. First step with _emphasis_\n    ```\n    some _code_\n    ```\n   And _more_ text";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert_eq!(result.len(), 2, "Should detect two emphasis to fix");
+
+    let fixed = rule.fix(&ctx).unwrap();
+    assert!(
+        fixed.contains("First step with *emphasis*"),
+        "First emphasis should be fixed"
+    );
+    assert!(
+        fixed.contains("some _code_"),
+        "Code block content should not be modified"
+    );
+    assert!(fixed.contains("And *more* text"), "Second emphasis should be fixed");
+}
+
+#[test]
+fn test_self_contained_display_math_line_is_not_emphasis() {
+    // A line whose only non-whitespace content is a `$$...$$` display-math
+    // span carries LaTeX, not Markdown emphasis. MD049 consults the
+    // line-level math map (skip_math_blocks), so this whole line must be
+    // flagged as math and its `_x_`/`_y_` must not be mis-linted.
+    let rule = MD049EmphasisStyle::new(EmphasisStyle::Asterisk);
+    let content = "All emphasis uses asterisks: *a* *b* *c*.\n\n$$ _x_ + _y_ $$\n";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert!(
+        result.is_empty(),
+        "underscores inside a self-contained $$...$$ line are LaTeX, not emphasis: {result:?}"
+    );
+}
+
+#[test]
+fn test_display_math_span_with_trailing_prose_still_lints_prose() {
+    // When real prose follows the span on the same line the line stays
+    // lintable, so emphasis in that prose is still flagged.
+    let rule = MD049EmphasisStyle::new(EmphasisStyle::Asterisk);
+    let content = "use stars: *a* *b*. $$x$$ then _y_ here\n";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert_eq!(result.len(), 1, "trailing-prose `_y_` must still be linted: {result:?}");
+}
+
+#[test]
+fn test_second_inline_dollar_span_stays_lintable() {
+    // `$$x$$ $$ _y_ $$`: per the byte model only a line-start `$$` opens a
+    // span, so the first `$$x$$` is math but the second `$$ _y_ $$` is
+    // mid-line and NOT math. The line must stay lintable so `_y_` is caught.
+    let rule = MD049EmphasisStyle::new(EmphasisStyle::Asterisk);
+    let content = "stars: *a* *b*.\n\n$$x$$ $$ _y_ $$\n";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert_eq!(
+        result.len(),
+        1,
+        "`_y_` in a non-line-start `$$` span must still be linted: {result:?}"
+    );
+    assert_eq!(result[0].line, 3);
+}
+
+#[test]
+fn test_odd_double_dollar_line_does_not_swallow_following_prose() {
+    // `$$x$$ costs $$` has three `$$`: the first opens and the second closes
+    // a span; the trailing `$$` is mid-line and per the byte model opens no
+    // multi-line block. The following `_next_` line must stay lintable.
+    let rule = MD049EmphasisStyle::new(EmphasisStyle::Asterisk);
+    let content = "lead *a* *b*.\n\n$$x$$ costs $$\n_next_ prose\n";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert_eq!(
+        result.len(),
+        1,
+        "`_next_` after an odd-`$$` line must still be linted: {result:?}"
+    );
+    assert_eq!(result[0].line, 4);
+}
+
+#[test]
+fn test_unmatched_dollar_opener_does_not_swallow_rest_of_document() {
+    // A line-start `$$` with no closing `$$` anywhere is a literal, exactly
+    // as `math_block_ranges` drops an unmatched opener. It must NOT mark the
+    // rest of the document as math, or emphasis after it is silently missed.
+    let rule = MD049EmphasisStyle::new(EmphasisStyle::Asterisk);
+    let content = "lead *a* *b*.\n\n$$ unclosed display math\n\nThen _bad_ here\nand _more_ too\n";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    let lines: Vec<usize> = result.iter().map(|w| w.line).collect();
+    assert_eq!(
+        result.len(),
+        2,
+        "emphasis after an unmatched `$$` opener must still be linted: {result:?}"
+    );
+    assert!(
+        lines.contains(&5) && lines.contains(&6),
+        "lines 5 and 6 flagged: {lines:?}"
+    );
+}
+
+#[test]
+fn test_genuine_multiline_block_still_suppresses_interior() {
+    // The unmatched-opener guard must not regress real blocks: a `$$`...`$$`
+    // pair still suppresses its interior while prose after it stays lintable.
+    let rule = MD049EmphasisStyle::new(EmphasisStyle::Asterisk);
+    let content = "lead *a* *b*.\n\n$$\n_interior_ = x\n$$\n\nAfter _bad_ here\n";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert_eq!(
+        result.len(),
+        1,
+        "interior `_interior_` is math; only the trailing `_bad_` is linted: {result:?}"
+    );
+    assert_eq!(result[0].line, 7);
+}
+
+#[test]
+fn test_fenced_code_dollars_do_not_mask_emphasis() {
+    // A `$$` inside a fenced code block must not open a math span that
+    // swallows real prose up to a later `$$`. The byte-level math filter
+    // must be as code-block aware as the line-level math map.
+    let rule = MD049EmphasisStyle::new(EmphasisStyle::Asterisk);
+    let content = "set style *a* *b*.\n\n```\n$$\n```\n\nThen _bad_ here\n\n$$\nx = y\n$$\n";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert_eq!(
+        result.len(),
+        1,
+        "`_bad_` between a fenced `$$` and a real `$$` must still be linted: {result:?}"
+    );
+    assert_eq!(result[0].line, 7);
+}
+
+#[test]
+fn test_inline_code_dollars_do_not_synthesize_math_span() {
+    // Dollar signs inside inline code spans are literals, not math
+    // delimiters. They must not pair into a `$...$` span that swallows the
+    // real emphasis between them.
+    let rule = MD049EmphasisStyle::new(EmphasisStyle::Asterisk);
+    let content = "set style *a* *b*.\n\nUse `$` and _bad_ then `$` here\n";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert_eq!(
+        result.len(),
+        1,
+        "`_bad_` between two inline-code `$` must still be linted: {result:?}"
+    );
+    assert_eq!(result[0].line, 3);
+}
+
+#[test]
+fn test_list_marker_not_paired_with_stray_asterisk() {
+    // A `*` list marker (always followed by a space) must not pair with a later
+    // stray `*` to form a fake emphasis span. CommonMark treats neither asterisk
+    // here as emphasis.
+    let rule = MD049EmphasisStyle::new(EmphasisStyle::Underscore);
+    let content = "* consolidate bullet points like \"* Added logging for observability.\"\n";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert!(
+        result.is_empty(),
+        "list marker `*` must not be flagged as emphasis: {result:?}"
+    );
+}
+
+#[test]
+fn test_whitespace_flanked_asterisks_are_not_emphasis() {
+    // Two `*` each flanked by whitespace are not emphasis per CommonMark,
+    // regardless of any list marker. `foo * bar * baz` has no emphasis.
+    let rule = MD049EmphasisStyle::new(EmphasisStyle::Underscore);
+    let content = "# H\n\nfoo * bar * baz\n";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert!(
+        result.is_empty(),
+        "whitespace-flanked `*` must not be flagged as emphasis: {result:?}"
+    );
+}
+
+#[test]
+fn test_whitespace_flanked_underscores_are_not_emphasis() {
+    // The flanking guard is marker-agnostic: `_ bar _` is not emphasis either.
+    let rule = MD049EmphasisStyle::new(EmphasisStyle::Asterisk);
+    let content = "# H\n\nfoo _ bar _ baz\n";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert!(
+        result.is_empty(),
+        "whitespace-flanked `_` must not be flagged as emphasis: {result:?}"
+    );
+}
+
+#[test]
+fn test_emphasis_with_literal_marker_inside_still_flagged() {
+    // CommonMark parses `*foo * bar*` as emphasis containing a literal `*`.
+    // MD049 (underscore style) must still flag and fix the outer asterisks,
+    // not silently miss them.
+    let rule = MD049EmphasisStyle::new(EmphasisStyle::Underscore);
+    let content = "# H\n\n*foo * bar*\n";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert_eq!(
+        result.len(),
+        1,
+        "emphasis with an interior literal `*` must still be flagged: {result:?}"
+    );
+    let fixed = rule.fix(&ctx).unwrap();
+    assert_eq!(fixed, "# H\n\n_foo * bar_\n");
+}
+
+#[test]
+fn test_genuine_emphasis_on_list_item_still_flagged() {
+    // Guard against over-correction: a real `*emphasis*` span on a `*` list
+    // item must still be flagged (and fixed) under underscore style.
+    let rule = MD049EmphasisStyle::new(EmphasisStyle::Underscore);
+    let content = "* item with *real emphasis* in it\n";
+    let ctx = rumdl_lib::lint_context::LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert_eq!(result.len(), 1, "genuine emphasis must still be flagged: {result:?}");
+    let fixed = rule.fix(&ctx).unwrap();
+    assert_eq!(fixed, "* item with _real emphasis_ in it\n");
+}

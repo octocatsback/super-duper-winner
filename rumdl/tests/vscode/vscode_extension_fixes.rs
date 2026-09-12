@@ -1,0 +1,608 @@
+//! VS Code Extension Fix Tests
+//!
+//! These tests simulate how the VS Code extension applies fixes by applying
+//! the fix replacement text to the warning range (not the fix range).
+//! This helps catch bugs where warning ranges and fix ranges are mismatched.
+
+use rumdl_lib::lint_context::LintContext;
+use rumdl_lib::rule::Rule;
+use rumdl_lib::rules::CodeBlockStyle;
+use rumdl_lib::rules::code_fence_utils::CodeFenceStyle;
+use rumdl_lib::rules::strong_style::StrongStyle;
+use rumdl_lib::rules::*;
+
+/// Simulates how VS Code extension applies a fix by:
+/// 1. Getting the warning range from the rule
+/// 2. Applying the fix replacement text to that warning range only
+/// 3. Returning the result
+fn simulate_vscode_fix(content: &str, rule: &dyn Rule) -> Result<String, String> {
+    let ctx = LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let warnings = rule.check(&ctx).map_err(|e| format!("Check failed: {e:?}"))?;
+
+    if warnings.is_empty() {
+        return Ok(content.to_string());
+    }
+
+    // Take the first warning
+    let warning = &warnings[0];
+    let fix = warning.fix.as_ref().ok_or("No fix available")?;
+
+    // Get warning range
+    let warning_start_line = warning.line;
+    let warning_start_col = warning.column;
+    let warning_end_line = warning.end_line;
+    let warning_end_col = warning.end_column;
+
+    // Convert to byte positions using the same logic as the warning
+    let lines: Vec<&str> = content.lines().collect();
+
+    if warning_start_line == 0 || warning_start_line > lines.len() {
+        return Err("Invalid warning line number".to_string());
+    }
+
+    // For single-line replacements (most common case)
+    if warning_start_line == warning_end_line {
+        let line = lines[warning_start_line - 1]; // Convert to 0-indexed
+
+        // Convert 1-indexed columns to 0-indexed byte positions
+        // Note: end_column is exclusive (points after the last character)
+        let start_byte = warning_start_col.saturating_sub(1);
+        let end_byte = warning_end_col.saturating_sub(1);
+
+        if start_byte > line.len() || end_byte > line.len() {
+            return Err("Invalid warning column range".to_string());
+        }
+
+        // Apply the replacement to the warning range
+        let before = &line[..start_byte];
+        let after = &line[end_byte..];
+        let new_line = format!("{}{}{}", before, fix.replacement, after);
+
+        // Reconstruct the full content
+        let mut result_lines: Vec<String> = lines.iter().map(std::string::ToString::to_string).collect();
+        result_lines[warning_start_line - 1] = new_line;
+
+        Ok(result_lines.join("\n") + if content.ends_with('\n') { "\n" } else { "" })
+    } else {
+        if warning_end_line > lines.len() {
+            return Err("Invalid warning end line number".to_string());
+        }
+
+        let start_line_content = lines[warning_start_line - 1];
+        let end_line_content = lines[warning_end_line - 1];
+
+        let start_byte = warning_start_col.saturating_sub(1);
+        let end_byte = warning_end_col.saturating_sub(1);
+
+        if start_byte > start_line_content.len() || end_byte > end_line_content.len() {
+            return Err("Invalid warning column range for multiline fix".to_string());
+        }
+
+        let before = &start_line_content[..start_byte];
+        let after = &end_line_content[end_byte..];
+        let new_line = format!("{}{}{}", before, fix.replacement, after);
+
+        let mut result_lines: Vec<String> = lines.iter().map(std::string::ToString::to_string).collect();
+        result_lines.splice((warning_start_line - 1)..warning_end_line, std::iter::once(new_line));
+
+        Ok(result_lines.join("\n") + if content.ends_with('\n') { "\n" } else { "" })
+    }
+}
+
+/// Helper function to create test cases for each rule
+fn create_test_case_for_rule(rule_name: &str) -> Option<(&'static str, Box<dyn Rule>)> {
+    match rule_name {
+        "MD001" => Some((
+            "# H1\n### H3 (should be H2)",
+            Box::new(MD001HeadingIncrement::default()),
+        )),
+        "MD003" => Some(("# ATX\nSetext\n======", Box::new(MD003HeadingStyle::default()))),
+        "MD004" => Some((
+            "* Item 1\n- Item 2",
+            Box::new(MD004UnorderedListStyle::new(UnorderedListStyle::Consistent)),
+        )),
+        "MD005" => Some((
+            "* Item 1\n   * Item with 3 spaces (should be 2)",
+            Box::new(MD005ListIndent::default()),
+        )),
+        "MD007" => Some(("- Item 1\n   - Wrong indent", Box::new(MD007ULIndent::default()))),
+        "MD009" => Some(("Line with trailing spaces   ", Box::new(MD009TrailingSpaces::default()))),
+        "MD010" => Some(("Line with\ttab", Box::new(MD010NoHardTabs::default()))),
+        "MD011" => Some(("(http://example.com)[Example]", Box::new(MD011NoReversedLinks))),
+        "MD012" => Some((
+            "Content\n\n\n\nToo many blanks",
+            Box::new(MD012NoMultipleBlanks::default()),
+        )),
+        "MD013" => Some((
+            "This is a very long line that exceeds the maximum line length limit and should trigger MD013",
+            Box::new(MD013LineLength::default()),
+        )),
+        "MD014" => Some(("```bash\n$ command\n```", Box::new(MD014CommandsShowOutput::default()))),
+        "MD018" => Some(("#Missing space", Box::new(MD018NoMissingSpaceAtx::new()))),
+        "MD019" => Some(("##  Multiple spaces", Box::new(MD019NoMultipleSpaceAtx::new()))),
+        "MD020" => Some(("##No space in closed##", Box::new(MD020NoMissingSpaceClosedAtx))),
+        "MD021" => Some(("##  Multiple  spaces  ##", Box::new(MD021NoMultipleSpaceClosedAtx))),
+        "MD022" => Some((
+            "Text\n# Heading\nMore text",
+            Box::new(MD022BlanksAroundHeadings::default()),
+        )),
+        "MD023" => Some(("  # Indented heading", Box::new(MD023HeadingStartLeft))),
+        "MD024" => Some(("# Duplicate\n# Duplicate", Box::new(MD024NoDuplicateHeading::default()))),
+        "MD025" => Some(("# First\n# Second H1", Box::new(MD025SingleTitle::default()))),
+        "MD026" => Some(("# Heading!", Box::new(MD026NoTrailingPunctuation::default()))),
+        "MD027" => Some((
+            ">  Multiple spaces in blockquote",
+            Box::new(MD027MultipleSpacesBlockquote::default()),
+        )),
+        "MD028" => Some((
+            "> Quote\n>\n> More quote",
+            Box::new(MD028NoBlanksBlockquote::with_fix(true)),
+        )),
+        "MD029" => Some((
+            "1. First\n3. Third",
+            Box::new(MD029OrderedListPrefix::new(ListStyle::Ordered)),
+        )),
+        "MD030" => Some((
+            "1.  Multiple spaces after marker",
+            Box::new(MD030ListMarkerSpace::new(1, 1, 1, 1)),
+        )),
+        "MD031" => Some((
+            "Text\n```\ncode\n```\nText",
+            Box::new(MD031BlanksAroundFences::default()),
+        )),
+        "MD032" => Some(("Text\n* List item\nText", Box::new(MD032BlanksAroundLists::default()))),
+        "MD033" => Some(("Text with <div>HTML</div>", Box::new(MD033NoInlineHtml::default()))),
+        "MD034" => Some(("Visit https://example.com", Box::new(MD034NoBareUrls))),
+        "MD035" => Some(("Text\n***\nText", Box::new(MD035HRStyle::default()))),
+        "MD036" => Some((
+            "**Bold text as heading**",
+            Box::new(MD036NoEmphasisAsHeading::new("!?.,:;".to_string())),
+        )),
+        "MD037" => Some(("Text with * spaces around * emphasis", Box::new(MD037NoSpaceInEmphasis))),
+        "MD038" => Some(("`code `", Box::new(MD038NoSpaceInCode::default()))),
+        "MD039" => Some(("[link text ]( url )", Box::new(MD039NoSpaceInLinks))),
+        "MD040" => Some((
+            "```\ncode without language\n```",
+            Box::new(MD040FencedCodeLanguage::default()),
+        )),
+        "MD041" => Some(("Not a heading", Box::new(MD041FirstLineHeading::default()))),
+        "MD042" => Some(("[]()", Box::new(MD042NoEmptyLinks::new()))),
+        "MD043" => Some((
+            "# Wrong heading",
+            Box::new(MD043RequiredHeadings::new(vec!["Introduction".to_string()])),
+        )),
+        "MD044" => Some((
+            "javascript instead of JavaScript",
+            Box::new(MD044ProperNames::new(vec!["JavaScript".to_string()], false)),
+        )),
+        "MD045" => Some(("![](image.png)", Box::new(MD045NoAltText::new()))),
+        "MD046" => Some((
+            "    indented code",
+            Box::new(MD046CodeBlockStyle::new(CodeBlockStyle::Fenced)),
+        )),
+        "MD047" => Some(("File without trailing newline", Box::new(MD047SingleTrailingNewline))),
+        "MD048" => Some((
+            "~~~\ncode\n~~~",
+            Box::new(MD048CodeFenceStyle::new(CodeFenceStyle::Tilde)),
+        )),
+        "MD049" => Some(("Text _emphasis_ text", Box::new(MD049EmphasisStyle::default()))),
+        "MD050" => Some((
+            "Text __strong__ text",
+            Box::new(MD050StrongStyle::new(StrongStyle::Underscore)),
+        )),
+        "MD051" => Some(("[link](#nonexistent)", Box::new(MD051LinkFragments::new()))),
+        "MD052" => Some(("[ref link][ref]", Box::new(MD052ReferenceLinkImages::new()))),
+        "MD053" => Some((
+            "[ref]: https://example.com",
+            Box::new(MD053LinkImageReferenceDefinitions::default()),
+        )),
+        "MD054" => Some(("![image](url)", Box::new(MD054LinkImageStyle::default()))),
+        "MD055" => Some(("|col1|col2|\n|--|--|\n|a|b|", Box::new(MD055TablePipeStyle::default()))),
+        "MD056" => Some(("|col1|col2|\n|--|--|\n|a|", Box::new(MD056TableColumnCount))),
+        "MD057" => Some(("[link](missing.md)", Box::new(MD057ExistingRelativeLinks::default()))),
+        "MD058" => Some(("Text\n|table|\nText", Box::new(MD058BlanksAroundTables::default()))),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Keep existing specific tests that we know work
+    #[test]
+    fn test_md030_vscode_fix_no_duplication() {
+        let rule = MD030ListMarkerSpace::new(1, 1, 1, 1);
+        let content = "1.  Supporting a new storage platform for MLflow artifacts";
+
+        let result = simulate_vscode_fix(content, &rule).unwrap();
+
+        // Should fix to single space, not duplicate the marker
+        assert_eq!(result, "1. Supporting a new storage platform for MLflow artifacts");
+        assert!(!result.contains("1. 1."), "Should not contain duplicated list marker");
+    }
+
+    #[test]
+    fn test_md019_vscode_fix_no_duplication() {
+        let rule = MD019NoMultipleSpaceAtx::new();
+        let content = "##  Multiple Spaces Heading";
+
+        let result = simulate_vscode_fix(content, &rule).unwrap();
+
+        // Should fix to single space, not duplicate the hashes
+        assert_eq!(result, "## Multiple Spaces Heading");
+        assert!(!result.contains("## ##"), "Should not contain duplicated hashes");
+    }
+
+    #[test]
+    fn test_md023_vscode_fix_no_duplication() {
+        let rule = MD023HeadingStartLeft;
+        let content = "  # Indented Heading";
+
+        let result = simulate_vscode_fix(content, &rule).unwrap();
+
+        // Should remove indentation, not duplicate the heading
+        assert_eq!(result, "# Indented Heading");
+        assert!(
+            !result.contains("# # "),
+            "Should not contain duplicated heading markers"
+        );
+    }
+
+    #[test]
+    fn test_md030_multiple_spaces() {
+        let rule = MD030ListMarkerSpace::new(1, 1, 1, 1);
+        let content = "*   Item with three spaces";
+
+        let result = simulate_vscode_fix(content, &rule).unwrap();
+
+        assert_eq!(result, "* Item with three spaces");
+        assert!(!result.contains("* *"), "Should not contain duplicated asterisks");
+    }
+
+    #[test]
+    fn test_md019_various_heading_levels() {
+        let rule = MD019NoMultipleSpaceAtx::new();
+
+        // Test different heading levels
+        let test_cases = vec![
+            ("#  H1", "# H1"),
+            ("##   H2", "## H2"),
+            ("###    H3", "### H3"),
+            ("######      H6", "###### H6"),
+        ];
+
+        for (input, expected) in test_cases {
+            let result = simulate_vscode_fix(input, &rule).unwrap();
+            assert_eq!(result, expected, "Failed for input: {input}");
+
+            // Ensure no duplication of hash symbols
+            let hash_count = input.chars().take_while(|&c| c == '#').count();
+            let result_hash_count = result.chars().take_while(|&c| c == '#').count();
+            assert_eq!(
+                hash_count, result_hash_count,
+                "Hash count should remain the same for: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_md023_various_indentations() {
+        let rule = MD023HeadingStartLeft;
+
+        // Note: 4+ spaces create code blocks per CommonMark, so test with max 3 spaces
+        // Tab before heading is handled by MD010, not MD023 (per markdownlint-cli)
+        let test_cases = vec![("  # H1", "# H1"), ("   ## H2", "## H2")];
+
+        for (input, expected) in test_cases {
+            let result = simulate_vscode_fix(input, &rule).unwrap();
+            assert_eq!(result, expected, "Failed for input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn test_md005_vscode_fix_no_duplication() {
+        let rule = MD005ListIndent::default();
+        let content = "* Item 1\n   * Item with 3 spaces (should be 2)\n* Item 3";
+
+        let result = simulate_vscode_fix(content, &rule);
+
+        // If MD005 has a fix, it should not duplicate content
+        if let Ok(fixed) = result {
+            assert!(!fixed.contains("* *"), "Should not contain duplicated list markers");
+            assert!(!fixed.contains("   * *"), "Should not contain duplicated content");
+            // The fix should correct the indentation to 2 spaces
+            assert!(
+                fixed.contains("  * Item with 3 spaces"),
+                "Should fix indentation to 2 spaces"
+            );
+        } else {
+            panic!("Expected MD005 to provide a fix");
+        }
+    }
+
+    #[test]
+    fn test_md027_vscode_fix_no_duplication() {
+        let rule = MD027MultipleSpacesBlockquote::default();
+        let content = ">  Multiple spaces in blockquote";
+
+        let result = simulate_vscode_fix(content, &rule);
+
+        // If MD027 has a fix, it should not duplicate content
+        if let Ok(fixed) = result {
+            assert!(
+                !fixed.contains("> >"),
+                "Should not contain duplicated blockquote markers"
+            );
+            assert!(!fixed.contains(">>"), "Should not contain merged blockquote markers");
+            // The fix should correct to single space
+            assert!(
+                fixed.contains("> Multiple spaces"),
+                "Should fix to single space after marker"
+            );
+        } else {
+            panic!("Expected MD027 to provide a fix");
+        }
+    }
+
+    #[test]
+    fn test_md032_vscode_fix_no_duplication() {
+        let rule = MD032BlanksAroundLists::default();
+        let content = "Text\n* List item\nMore text";
+
+        let result = simulate_vscode_fix(content, &rule);
+
+        // If MD032 has a fix, it should not duplicate content
+        if let Ok(fixed) = result {
+            // Check that no lines are duplicated
+            let lines: Vec<&str> = fixed.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                for (j, other_line) in lines.iter().enumerate() {
+                    if i != j && !line.trim().is_empty() && line == other_line {
+                        panic!("Found duplicated line: {line:?}");
+                    }
+                }
+            }
+        }
+        // If no fix is available, that's also acceptable for this test
+    }
+
+    #[test]
+    fn test_md007_vscode_fix_no_duplication() {
+        let rule = MD007ULIndent::default();
+        let content = "- Item 1\n   - Wrong indent";
+
+        let result = simulate_vscode_fix(content, &rule);
+
+        // If MD007 has a fix, it should not duplicate content
+        if let Ok(fixed) = result {
+            assert!(!fixed.contains("- -"), "Should not contain duplicated list markers");
+            assert!(!fixed.contains("   - -"), "Should not contain duplicated content");
+            // The fix should correct the indentation
+            assert!(fixed.contains("  - Wrong indent"), "Should fix indentation to 2 spaces");
+        } else {
+            panic!("Expected MD007 to provide a fix");
+        }
+    }
+
+    #[test]
+    fn test_md046_vscode_fix_no_duplication() {
+        let rule = MD046CodeBlockStyle::new(CodeBlockStyle::Fenced);
+        let content = "    indented code"; // Indented code that should trigger MD046
+
+        let result = simulate_vscode_fix(content, &rule);
+
+        // If MD046 has a fix, it should not duplicate content
+        if let Ok(fixed) = result {
+            assert!(
+                !fixed.contains("    indented"),
+                "Should not contain original indented code"
+            );
+            assert!(fixed.contains("```"), "Should contain fenced code block marker");
+            assert!(fixed.contains("indented code"), "Should contain the code content");
+        }
+        // If no fix is available, that's also acceptable for this test
+    }
+
+    // Comprehensive test for all rules
+    #[test]
+    fn test_all_rules_vscode_fix_no_duplication() {
+        let rules_to_test = vec![
+            "MD001", "MD003", "MD004", "MD005", "MD007", "MD009", "MD010", "MD011", "MD012", "MD013", "MD014", "MD018",
+            "MD019", "MD020", "MD021", "MD022", "MD023", "MD024", "MD025", "MD026", "MD027", "MD028", "MD029", "MD030",
+            "MD031", "MD032", "MD033", "MD034", "MD035", "MD036", "MD037", "MD038", "MD039", "MD040", "MD041", "MD042",
+            "MD043", "MD044", "MD045", "MD046", "MD047", "MD048", "MD049", "MD050", "MD051", "MD052", "MD053", "MD054",
+            "MD055", "MD056", "MD057", "MD058",
+        ];
+
+        let mut tested_rules = 0;
+        let mut rules_with_fixes = 0;
+        let mut passed_tests = 0;
+
+        for rule_name in rules_to_test {
+            if let Some((test_content, rule)) = create_test_case_for_rule(rule_name) {
+                tested_rules += 1;
+
+                match simulate_vscode_fix(test_content, rule.as_ref()) {
+                    Ok(fixed_content) => {
+                        rules_with_fixes += 1;
+
+                        // Generic checks that apply to all rules
+                        let original_non_whitespace: String =
+                            test_content.chars().filter(|c| !c.is_whitespace()).collect();
+                        let fixed_non_whitespace: String =
+                            fixed_content.chars().filter(|c| !c.is_whitespace()).collect();
+
+                        // Check for obvious content duplication patterns (the actual bugs we're looking for)
+                        let has_obvious_duplication = fixed_content.contains("# # ")
+                            || fixed_content.contains("## ## ")
+                            || fixed_content.contains("### ### ")
+                            || fixed_content.contains("* *")
+                            || fixed_content.contains("- -")
+                            || fixed_content.contains("+ +")
+                            || fixed_content.contains("> >")
+                            || fixed_content.contains("1. 1.")
+                            || fixed_content.contains("2. 2.");
+
+                        // For rules that provide complete replacements (like MD042), check for actual duplication patterns
+                        // rather than just size increase
+                        let has_size_based_duplication =
+                            if rule_name == "MD042" || rule_name == "MD043" || rule_name == "MD044" {
+                                // These rules legitimately provide complete replacements, so skip size-based check
+                                false
+                            } else {
+                                // For other rules, a 3x size increase likely indicates duplication
+                                fixed_non_whitespace.len() > original_non_whitespace.len() * 3
+                            };
+
+                        if has_obvious_duplication || has_size_based_duplication {
+                            panic!(
+                                "Rule {rule_name} has content duplication in VS Code extension fix!\nOriginal: {test_content:?}\nFixed: {fixed_content:?}"
+                            );
+                        }
+
+                        passed_tests += 1;
+                        println!("✓ {rule_name}: Fix applied successfully");
+                    }
+                    Err(e) => {
+                        // No fix available or fix failed - this is acceptable
+                        println!("- {rule_name}: No fix available ({e})");
+                    }
+                }
+            } else {
+                println!("⚠ {rule_name}: No test case defined");
+            }
+        }
+
+        println!("\n=== Test Summary ===");
+        println!("Rules tested: {tested_rules}");
+        println!("Rules with fixes: {rules_with_fixes}");
+        println!("Tests passed: {passed_tests}");
+
+        // We expect at least some rules to have fixes and all of them to pass the duplication test
+        assert!(rules_with_fixes > 0, "Expected at least some rules to have fixes");
+        assert_eq!(
+            passed_tests, rules_with_fixes,
+            "All rules with fixes should pass the duplication test"
+        );
+    }
+
+    #[test]
+    fn test_simulate_vscode_fix_multiline_splice_is_correct() {
+        use rumdl_lib::config::{Config, MarkdownFlavor};
+        use rumdl_lib::lint_context::LintContext;
+        use rumdl_lib::rule::{
+            CrossFileScope, Fix, FixCapability, LintError, LintResult, LintWarning, Rule, RuleCategory, Severity,
+        };
+
+        // A test-only rule that returns a single warning spanning lines 2–3,
+        // with a fixed replacement string. This exercises the multiline splice
+        // branch of simulate_vscode_fix directly.
+        #[derive(Clone)]
+        struct MultilineTestRule;
+
+        impl Rule for MultilineTestRule {
+            fn name(&self) -> &'static str {
+                "TEST"
+            }
+            fn description(&self) -> &'static str {
+                "Test rule for multiline splice"
+            }
+            fn check(&self, _ctx: &LintContext) -> LintResult {
+                // Warning spans line 2 col 1 → line 3 col 6.
+                // end_column 6 is exclusive: "END X" has 5 chars, so col 6 points past the last char.
+                Ok(vec![LintWarning {
+                    line: 2,
+                    column: 1,
+                    end_line: 3,
+                    end_column: 6,
+                    message: "test".to_string(),
+                    fix: Some(Fix::new(0..0, "REPLACED".to_string())),
+                    severity: Severity::Warning,
+                    rule_name: Some("TEST".to_string()),
+                }])
+            }
+            fn fix(&self, ctx: &LintContext) -> Result<String, LintError> {
+                Ok(ctx.content.to_string())
+            }
+            fn category(&self) -> RuleCategory {
+                RuleCategory::Other
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn fix_capability(&self) -> FixCapability {
+                FixCapability::FullyFixable
+            }
+            fn cross_file_scope(&self) -> CrossFileScope {
+                CrossFileScope::None
+            }
+            fn from_config(_config: &Config) -> Box<dyn Rule>
+            where
+                Self: Sized,
+            {
+                Box::new(MultilineTestRule)
+            }
+        }
+
+        // 4-line content: line 1 "BEFORE", line 2 "START HERE", line 3 "END X", line 4 "AFTER"
+        // The warning spans line 2 col 1 → line 3 col 6 (the entirety of "START HERE\nEND X").
+        // After the splice, lines 2–3 should be replaced with "REPLACED".
+        let content = "BEFORE\nSTART HERE\nEND X\nAFTER\n";
+        let rule = MultilineTestRule;
+
+        // Verify the warning is indeed multiline before testing the fix path.
+        let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let warnings = rule.check(&ctx).unwrap();
+        let multiline_warning = warnings
+            .iter()
+            .find(|w| w.end_line != w.line)
+            .expect("MultilineTestRule should produce a multiline warning");
+        assert_eq!(multiline_warning.line, 2);
+        assert_eq!(multiline_warning.end_line, 3);
+
+        let result = simulate_vscode_fix(content, &rule);
+        let fixed = result.expect("Multiline fix should succeed");
+
+        // Lines 2–3 ("START HERE" and "END X") should be replaced by "REPLACED".
+        assert_eq!(
+            fixed, "BEFORE\nREPLACED\nAFTER\n",
+            "Multiline splice should replace lines 2–3 with the replacement text. Got: {fixed:?}"
+        );
+    }
+
+    #[test]
+    fn test_simulate_vscode_fix_handles_multiline_warning_range() {
+        use rumdl_lib::config::MarkdownFlavor;
+        use rumdl_lib::lint_context::LintContext;
+
+        // This test verifies that when rules DO produce multiline warnings,
+        // simulate_vscode_fix handles them rather than returning "not implemented".
+        // Currently, no rules in create_test_case_for_rule produce multiline warnings
+        // with their test fixtures, so this loop is a no-op today. It acts as a
+        // regression guard for future rules.
+        let rule_names = [
+            "MD001", "MD003", "MD004", "MD005", "MD007", "MD009", "MD010", "MD011", "MD012", "MD013", "MD014", "MD018",
+            "MD019", "MD020", "MD021", "MD022", "MD023", "MD024", "MD025", "MD026", "MD027", "MD028", "MD029", "MD030",
+            "MD031", "MD032", "MD033", "MD034", "MD035", "MD036", "MD037", "MD038", "MD039", "MD040", "MD041", "MD042",
+            "MD043", "MD044", "MD045", "MD046", "MD047", "MD048", "MD049", "MD050", "MD051", "MD052", "MD053", "MD054",
+            "MD055", "MD056", "MD057", "MD058",
+        ];
+
+        for rule_name in rule_names {
+            if let Some((content, rule)) = create_test_case_for_rule(rule_name) {
+                let ctx = LintContext::new(content, MarkdownFlavor::Standard, None);
+                if let Ok(warnings) = rule.check(&ctx) {
+                    let has_multiline = warnings.iter().any(|w| w.end_line != w.line);
+                    if has_multiline {
+                        let result = simulate_vscode_fix(content, rule.as_ref());
+                        assert!(
+                            result != Err("Multi-line warning ranges not implemented yet".to_string()),
+                            "Rule {rule_name} has multiline warnings but simulate_vscode_fix returned 'not implemented'"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

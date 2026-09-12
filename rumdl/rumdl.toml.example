@@ -1,0 +1,84 @@
+# rumdl.toml.example - Sample configuration file for rumdl
+
+# Global configuration options
+[global]
+# List of rules to disable
+disable = ["MD013", "MD033"]
+
+# List of rules to enable exclusively (if provided, only these rules will run)
+# enable = ["MD001", "MD003", "MD004"]
+
+# List of file/directory patterns to exclude from linting
+exclude = [
+    # Common directories to exclude
+    ".git",
+    ".github",
+    "node_modules",
+    "vendor",
+    "dist",
+    "build",
+
+    # Specific files or patterns
+    "CHANGELOG.md",
+    "LICENSE.md",
+    "generated/*.md",
+    "**/temp_*.md",
+]
+
+# Respect .gitignore files when scanning directories
+respect_gitignore = true
+
+# Per-file rule ignores - disable specific rules for specific files or file patterns
+# Useful when certain files (like README.md) need different rules than the rest
+[per-file-ignores]
+# Disable inline HTML check for GitHub README (GitHub doesn't support all MkDocs extensions)
+"README.md" = ["MD033"]
+
+# Disable line length check for documentation with long code examples
+"docs/api/**/*.md" = ["MD013"]
+
+# Disable first line heading check for generated files
+"generated/**/*.md" = ["MD041"]
+
+# Rule-specific configurations
+[MD003]
+style = "atx"  # Heading style (atx, atx_closed, setext)
+
+[MD004]
+style = "asterisk"  # Unordered list style (asterisk, plus, dash, consistent)
+
+[MD007]
+indent = 4  # Unordered list indentation
+
+[MD013]
+line_length = 100  # Line length
+code_blocks = false  # Exclude code blocks from line length check
+tables = false  # Exclude tables from line length check
+headings = true  # Exclude headings from line length check
+
+[MD044]
+names = ["rumdl", "Markdown", "GitHub"]  # Proper names that should be capitalized correctly
+code-blocks = false  # Check code blocks for proper names (default: false, skips code blocks)
+
+# Code block tools [preview] - external linters/formatters for fenced code blocks
+# Runs external tools on code blocks during `rumdl check` (lint) and `--fix` (format)
+# Note: This feature is in preview and may change in future versions.
+[code-block-tools]
+enabled = false                    # Enable to activate code block linting/formatting
+normalize-language = "linguist"    # Resolve language aliases (py -> python, bash -> shell)
+on-error = "warn"                  # How to handle tool failures: "fail", "warn", or "skip"
+timeout = 30000                    # Timeout per tool execution in milliseconds
+
+# Custom language aliases (in addition to built-in linguist aliases)
+[code-block-tools.language-aliases]
+py = "python"
+sh = "shell"
+
+# Configure tools per language (inline table syntax for compact config)
+[code-block-tools.languages]
+python = { lint = ["ruff:check"], format = ["ruff:format"] }
+shell = { lint = ["shellcheck"], format = ["shfmt"] }
+javascript = { format = ["prettier"] }
+json = { format = ["jq"] }
+# rust = { format = ["rustfmt"] }
+# go = { format = ["gofmt"] }

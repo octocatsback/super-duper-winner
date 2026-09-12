@@ -1,0 +1,956 @@
+//! Output formatting and display utilities
+
+use colored::*;
+use rumdl_lib::config as rumdl_config;
+use rumdl_lib::rule::Rule;
+use rumdl_lib::rules::MD013Config;
+
+/// Arguments for printing check results
+pub struct PrintResultsArgs<'a> {
+    pub args: &'a crate::CheckArgs,
+    pub has_issues: bool,
+    pub files_with_issues: usize,
+    pub files_fixed: usize,
+    pub total_issues: usize,
+    pub summary_issues_fixed: usize,
+    pub total_fixable_issues: usize,
+    pub total_files_processed: usize,
+    pub duration_ms: u64,
+    /// The run was incomplete: a file could not be read, or a code-block tool
+    /// could not run under a setting of `fail`. Details are already printed to
+    /// stderr. Suppresses the misleading "No issues found" success summary.
+    pub had_tool_error: bool,
+}
+
+/// Print summary of check/fix results
+pub fn print_results_from_checkargs(params: PrintResultsArgs) {
+    let PrintResultsArgs {
+        args,
+        has_issues,
+        files_with_issues,
+        files_fixed,
+        total_issues,
+        summary_issues_fixed,
+        total_fixable_issues,
+        total_files_processed,
+        duration_ms,
+        had_tool_error,
+    } = params;
+    // Choose singular or plural form of "file" based on count
+    let file_text = if total_files_processed == 1 { "file" } else { "files" };
+    let files_fixed_text = if files_fixed == 1 { "file" } else { "files" };
+    let dry_run = args.diff || args.check;
+    let change_label = if dry_run {
+        "Would fix:".yellow().bold().to_string()
+    } else {
+        "Fixed:".green().bold().to_string()
+    };
+    let change_verb = if dry_run { "Would fix" } else { "Fixed" };
+
+    // Show results summary
+    // In fix/format mode, show a change summary whenever we changed files or would change them in dry-run mode.
+    let should_show_change_message = args.fix_mode != crate::FixMode::Check && files_fixed > 0;
+
+    if should_show_change_message {
+        println!(
+            "\n{change_label} {change_verb} {summary_issues_fixed}/{total_issues} issues in {files_fixed} {files_fixed_text} ({duration_ms}ms)"
+        );
+    } else if has_issues {
+        // In non-fix mode, show issues summary with simplified count when appropriate
+        let files_display = if files_with_issues == total_files_processed {
+            // Just show the number if all files have issues
+            format!("{files_with_issues}")
+        } else {
+            // Show the fraction if only some files have issues
+            format!("{files_with_issues}/{total_files_processed}")
+        };
+
+        println!(
+            "\n{} Found {} issues in {} {} ({}ms)",
+            "Issues:".yellow(),
+            total_issues,
+            files_display,
+            file_text,
+            duration_ms
+        );
+
+        if args.fix_mode == crate::FixMode::Check && total_fixable_issues > 0 {
+            // Display the exact count of fixable issues
+            println!("Run `rumdl fmt` to automatically fix {total_fixable_issues} of the {total_issues} issues");
+        }
+    } else if !had_tool_error {
+        println!(
+            "\n{} No issues found in {} {} ({}ms)",
+            "Success:".green().bold(),
+            total_files_processed,
+            file_text,
+            duration_ms
+        );
+    }
+
+    // Part of the run did not happen: a file that could not be read, or a
+    // code-block tool that could not run. Either way the counts above describe
+    // less than the whole set, so say so rather than let them read as complete.
+    // The individual causes were already printed to stderr.
+    if had_tool_error {
+        println!(
+            "\n{} the run was incomplete, see the errors above ({}ms)",
+            "Error:".red().bold(),
+            duration_ms
+        );
+    }
+}
+
+/// Format config source provenance for display
+pub fn format_provenance(src: rumdl_config::ConfigSource) -> &'static str {
+    match src {
+        rumdl_config::ConfigSource::Cli => "CLI",
+        rumdl_config::ConfigSource::UserConfig => "user config",
+        rumdl_config::ConfigSource::ProjectConfig => "project config",
+        rumdl_config::ConfigSource::PyprojectToml => "pyproject.toml",
+        rumdl_config::ConfigSource::EditorConfig => ".editorconfig",
+        rumdl_config::ConfigSource::Default => "default",
+    }
+}
+
+/// Format the `[from ...]` provenance label for a config value.
+///
+/// File-based sources show the originating file (relativized to the project
+/// root), so extends chains attribute each value to the file that actually
+/// set it rather than a generic "project config". Defaults and CLI flags
+/// have no file and fall back to the source-kind name.
+pub fn provenance_label<T>(sv: &rumdl_config::SourcedValue<T>, project_root: Option<&std::path::Path>) -> String {
+    match &sv.origin {
+        Some(file) => format!("[from {}]", origin_display(file, project_root)),
+        None => format!("[from {}]", format_provenance(sv.source)),
+    }
+}
+
+/// Render a config-file origin path for display: canonicalized (extends
+/// resolution can embed `../` segments), relativized to the project root
+/// when inside it, and shown as a short `../`-style path for nearby
+/// out-of-tree files (the common shape for shared extends bases). Distant
+/// files fall back to the canonical absolute path.
+fn origin_display(file: &str, project_root: Option<&std::path::Path>) -> String {
+    use std::path::{Component, Path, PathBuf};
+
+    fn normalize(path: &Path) -> String {
+        let s = path.to_string_lossy();
+        if cfg!(windows) {
+            s.replace('\\', "/")
+        } else {
+            s.to_string()
+        }
+    }
+
+    let canonical = Path::new(file).canonicalize().unwrap_or_else(|_| PathBuf::from(file));
+
+    // Relativize against the project root, falling back to the current
+    // directory when no project root is known (e.g. markdownlint-only
+    // discovery).
+    let base = project_root
+        .and_then(|root| root.canonicalize().ok())
+        .or_else(|| std::env::current_dir().ok().and_then(|cwd| cwd.canonicalize().ok()));
+
+    if let Some(base) = base {
+        if let Ok(rel) = canonical.strip_prefix(&base) {
+            return normalize(rel);
+        }
+        // Out-of-tree file: build a ../-relative path from the base.
+        let path_comps: Vec<Component> = canonical.components().collect();
+        let base_comps: Vec<Component> = base.components().collect();
+        let common = path_comps.iter().zip(&base_comps).take_while(|(a, b)| a == b).count();
+        let ups = base_comps.len() - common;
+        if common > 0 && ups <= 3 {
+            let mut rel = PathBuf::new();
+            for _ in 0..ups {
+                rel.push("..");
+            }
+            for comp in &path_comps[common..] {
+                rel.push(comp);
+            }
+            return normalize(&rel);
+        }
+    }
+    normalize(&canonical)
+}
+
+/// What a section with no entries shows under its header.
+///
+/// A bare header with nothing under it reads as output that got cut off rather
+/// than as "nothing is configured here", and these printers exist to state the
+/// effective configuration rather than leave it inferred. An empty list already
+/// renders as `enable = []` for the same reason; a TOML table has no equivalent
+/// spelling, so it is said in a comment.
+const EMPTY_SECTION: &str = "# (none)";
+
+/// Render the `[per-file-ignores]` section as `pattern = [rules]` lines.
+fn per_file_ignores_lines(
+    sourced: &rumdl_config::SourcedConfig,
+    root: Option<&std::path::Path>,
+) -> Vec<(String, String)> {
+    let label = provenance_label(&sourced.per_file_ignores, root);
+    let mut lines = vec![("[per-file-ignores]".to_string(), String::new())];
+    for (pattern, rules) in &sourced.per_file_ignores.value {
+        lines.push((format!("{pattern:?} = {rules:?}"), label.clone()));
+    }
+    if sourced.per_file_ignores.value.is_empty() {
+        lines.push((EMPTY_SECTION.to_string(), label));
+    }
+    lines
+}
+
+/// Render the `[per-file-flavor]` section as `pattern = "flavor"` lines.
+fn per_file_flavor_lines(
+    sourced: &rumdl_config::SourcedConfig,
+    root: Option<&std::path::Path>,
+) -> Vec<(String, String)> {
+    let label = provenance_label(&sourced.per_file_flavor, root);
+    let mut lines = vec![("[per-file-flavor]".to_string(), String::new())];
+    for (pattern, flavor) in &sourced.per_file_flavor.value {
+        lines.push((format!("{pattern:?} = \"{flavor}\""), label.clone()));
+    }
+    if sourced.per_file_flavor.value.is_empty() {
+        lines.push((EMPTY_SECTION.to_string(), label));
+    }
+    lines
+}
+
+/// Render the `[code-block-tools]` section.
+///
+/// The section nests (`[code-block-tools.languages.python]`), which the flat
+/// `key = value` shape used everywhere else cannot represent, so it is rendered
+/// as the TOML it would be written as and the provenance label goes on the value
+/// lines. The whole section merges as a single value, so one label describes all
+/// of them.
+///
+/// Values are shown as written even when they came from a file whose text is not
+/// quoted back in warnings: this output answers a question the user asked about
+/// their own configuration, the same reason rule option values are shown here in
+/// full.
+fn code_block_tools_lines(
+    sourced: &rumdl_config::SourcedConfig,
+    root: Option<&std::path::Path>,
+) -> Vec<(String, String)> {
+    let label = provenance_label(&sourced.code_block_tools, root);
+    let mut document = toml::map::Map::new();
+    let value = match toml::Value::try_from(&sourced.code_block_tools.value) {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    };
+    document.insert("code-block-tools".to_string(), value);
+    // `to_string`, not `to_string_pretty`: pretty rendering breaks an array over
+    // several lines, and each of those lines then gets the provenance label
+    // repeated beside it, closing bracket included. Every other section here
+    // prints an array inline, so this one does too.
+    let rendered = match toml::to_string(&toml::Value::Table(document)) {
+        Ok(rendered) => rendered,
+        Err(_) => return Vec::new(),
+    };
+    let rows: Vec<(String, String)> = rendered
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            if line.starts_with('[') {
+                (line.to_string(), String::new())
+            } else {
+                (line.to_string(), label.clone())
+            }
+        })
+        .collect();
+
+    // `[code-block-tools.languages]` and its siblings are tables, so a section
+    // holding no entries renders as a header with nothing under it.
+    let mut lines = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        lines.push(row.clone());
+        if row.0.starts_with('[') && rows.get(index + 1).is_none_or(|next| next.0.starts_with('[')) {
+            lines.push((EMPTY_SECTION.to_string(), label.clone()));
+        }
+    }
+    lines
+}
+
+/// Print configuration with provenance information, excluding default values
+pub fn print_config_with_provenance_no_defaults(sourced: &rumdl_config::SourcedConfig, _all_rules: &[Box<dyn Rule>]) {
+    let g = &sourced.global;
+    let root = sourced.project_root.as_deref();
+    let mut all_lines = Vec::new();
+    let mut has_global_section = false;
+
+    // Build global section, filtering out defaults
+    let mut global_lines = Vec::new();
+    if g.enable.source != rumdl_config::ConfigSource::Default {
+        global_lines.push((
+            format!("enable = {:?}", g.enable.value),
+            provenance_label(&g.enable, root),
+        ));
+        has_global_section = true;
+    }
+    if g.disable.source != rumdl_config::ConfigSource::Default {
+        global_lines.push((
+            format!("disable = {:?}", g.disable.value),
+            provenance_label(&g.disable, root),
+        ));
+        has_global_section = true;
+    }
+    if g.exclude.source != rumdl_config::ConfigSource::Default {
+        global_lines.push((
+            format!("exclude = {:?}", g.exclude.value),
+            provenance_label(&g.exclude, root),
+        ));
+        has_global_section = true;
+    }
+    if g.include.source != rumdl_config::ConfigSource::Default {
+        global_lines.push((
+            format!("include = {:?}", g.include.value),
+            provenance_label(&g.include, root),
+        ));
+        has_global_section = true;
+    }
+    if g.respect_gitignore.source != rumdl_config::ConfigSource::Default {
+        global_lines.push((
+            format!("respect_gitignore = {}", g.respect_gitignore.value),
+            provenance_label(&g.respect_gitignore, root),
+        ));
+        has_global_section = true;
+    }
+    if g.flavor.source != rumdl_config::ConfigSource::Default {
+        global_lines.push((
+            format!("flavor = \"{}\"", g.flavor.value),
+            provenance_label(&g.flavor, root),
+        ));
+        has_global_section = true;
+    }
+    if g.line_length.source != rumdl_config::ConfigSource::Default {
+        global_lines.push((
+            format!("line_length = {}", g.line_length.value.get()),
+            provenance_label(&g.line_length, root),
+        ));
+        has_global_section = true;
+    }
+    if g.force_exclude.source != rumdl_config::ConfigSource::Default {
+        global_lines.push((
+            format!("force_exclude = {}", g.force_exclude.value),
+            provenance_label(&g.force_exclude, root),
+        ));
+        has_global_section = true;
+    }
+    if g.cache.source != rumdl_config::ConfigSource::Default {
+        global_lines.push((format!("cache = {}", g.cache.value), provenance_label(&g.cache, root)));
+        has_global_section = true;
+    }
+    if g.editorconfig.source != rumdl_config::ConfigSource::Default {
+        global_lines.push((
+            format!("editorconfig = {}", g.editorconfig.value),
+            provenance_label(&g.editorconfig, root),
+        ));
+        has_global_section = true;
+    }
+    if let Some(ref output_format) = g.output_format
+        && output_format.source != rumdl_config::ConfigSource::Default
+    {
+        global_lines.push((
+            format!("output_format = {:?}", output_format.value),
+            provenance_label(output_format, root),
+        ));
+        has_global_section = true;
+    }
+    if let Some(ref cache_dir) = g.cache_dir
+        && cache_dir.source != rumdl_config::ConfigSource::Default
+    {
+        global_lines.push((
+            format!("cache_dir = {:?}", cache_dir.value),
+            provenance_label(cache_dir, root),
+        ));
+        has_global_section = true;
+    }
+    if g.fixable.source != rumdl_config::ConfigSource::Default {
+        global_lines.push((
+            format!("fixable = {:?}", g.fixable.value),
+            provenance_label(&g.fixable, root),
+        ));
+        has_global_section = true;
+    }
+    if g.unfixable.source != rumdl_config::ConfigSource::Default {
+        global_lines.push((
+            format!("unfixable = {:?}", g.unfixable.value),
+            provenance_label(&g.unfixable, root),
+        ));
+        has_global_section = true;
+    }
+    if g.extend_enable.source != rumdl_config::ConfigSource::Default {
+        global_lines.push((
+            format!("extend_enable = {:?}", g.extend_enable.value),
+            provenance_label(&g.extend_enable, root),
+        ));
+        has_global_section = true;
+    }
+    if g.extend_disable.source != rumdl_config::ConfigSource::Default {
+        global_lines.push((
+            format!("extend_disable = {:?}", g.extend_disable.value),
+            provenance_label(&g.extend_disable, root),
+        ));
+        has_global_section = true;
+    }
+
+    if has_global_section {
+        all_lines.push(("[global]".to_string(), String::new()));
+        all_lines.extend(global_lines);
+        all_lines.push((String::new(), String::new()));
+    }
+
+    // Handle per-file ignores if non-default
+    if sourced.per_file_ignores.source != rumdl_config::ConfigSource::Default
+        && !sourced.per_file_ignores.value.is_empty()
+    {
+        all_lines.extend(per_file_ignores_lines(sourced, root));
+        all_lines.push((String::new(), String::new()));
+    }
+
+    // Handle per-file flavors if non-default
+    if sourced.per_file_flavor.source != rumdl_config::ConfigSource::Default
+        && !sourced.per_file_flavor.value.is_empty()
+    {
+        all_lines.extend(per_file_flavor_lines(sourced, root));
+        all_lines.push((String::new(), String::new()));
+    }
+
+    // Handle code block tools if non-default
+    if sourced.code_block_tools.source != rumdl_config::ConfigSource::Default {
+        all_lines.extend(code_block_tools_lines(sourced, root));
+        all_lines.push((String::new(), String::new()));
+    }
+
+    // Handle rule configurations
+    let mut rule_names: Vec<_> = sourced.rules.keys().cloned().collect();
+    rule_names.sort();
+    for rule_name in rule_names {
+        let rule_cfg = &sourced.rules[&rule_name];
+        let mut lines = Vec::new();
+        let mut keys: Vec<_> = rule_cfg.values.keys().collect();
+        keys.sort();
+        for key in keys {
+            let sv = &rule_cfg.values[key];
+            // Only include non-default values
+            if sv.source != rumdl_config::ConfigSource::Default {
+                let value_str = match &sv.value {
+                    toml::Value::Array(arr) => {
+                        let vals: Vec<String> = arr.iter().map(|v| v.to_string()).collect();
+                        format!("[{}]", vals.join(", "))
+                    }
+                    toml::Value::String(s) => format!("\"{s}\""),
+                    toml::Value::Boolean(b) => b.to_string(),
+                    toml::Value::Integer(i) => i.to_string(),
+                    toml::Value::Float(f) => f.to_string(),
+                    _ => sv.value.to_string(),
+                };
+                lines.push((format!("{key} = {value_str}"), provenance_label(sv, root)));
+            }
+        }
+        // MD013's effective limit differs from its default exactly when the
+        // global setting is not itself the default, which is the condition this
+        // listing of non-default values is selecting on.
+        if sourced.global.line_length.source != rumdl_config::ConfigSource::Default {
+            apply_inherited_md013_line_length(&rule_name, &mut lines, sourced, root);
+        }
+        if !lines.is_empty() {
+            all_lines.push((format!("[{rule_name}]"), String::new()));
+            all_lines.extend(lines);
+            all_lines.push((String::new(), String::new()));
+        }
+    }
+
+    // Print output
+    if all_lines.is_empty() {
+        // All configurations are using defaults
+        println!("All configurations are using default values.");
+        return;
+    }
+
+    let max_left = all_lines.iter().map(|(l, _)| l.len()).max().unwrap_or(0);
+    for (left, right) in &all_lines {
+        if left.is_empty() && right.is_empty() {
+            println!();
+        } else if !right.is_empty() {
+            println!("{:<width$} {}", left, right.dimmed(), width = max_left);
+        } else {
+            println!("{left:<max_left$} {right}");
+        }
+    }
+}
+
+/// The `[MD013]` `line-length` line when the `[global]` setting supplies it.
+///
+/// MD013 measures against `[global] line-length` unless it sets its own, so the
+/// value printed under `[MD013]` is neither the option's default nor necessarily
+/// what the rule's own section says. The number comes from the same
+/// [`MD013Config::from_document_config`] the rule is built with, and the
+/// provenance from the global setting it was taken from.
+fn inherited_md013_line_length(
+    sourced: &rumdl_config::SourcedConfig,
+    root: Option<&std::path::Path>,
+) -> Option<(String, String)> {
+    let config: rumdl_config::Config = sourced.clone().into_validated_unchecked().into();
+    if !rumdl_lib::rule_config_serde::load_rule_config::<MD013Config>(&config).line_length_is_default() {
+        return None;
+    }
+    let resolved = MD013Config::from_document_config(&config).line_length;
+    Some((
+        format!("line-length = {}", resolved.get()),
+        provenance_label(&sourced.global.line_length, root),
+    ))
+}
+
+/// Replace a rule's `line-length` line with the value inherited from `[global]`.
+///
+/// A no-op for every rule but MD013, and for an MD013 that sets its own limit.
+fn apply_inherited_md013_line_length(
+    rule_name: &str,
+    lines: &mut Vec<(String, String)>,
+    sourced: &rumdl_config::SourcedConfig,
+    root: Option<&std::path::Path>,
+) {
+    if rule_name != "MD013" {
+        return;
+    }
+    let Some(inherited) = inherited_md013_line_length(sourced, root) else {
+        return;
+    };
+    // Both spellings reach here: a section prints the key as the user wrote it.
+    lines.retain(|(text, _)| !(text.starts_with("line-length =") || text.starts_with("line_length =")));
+    lines.push(inherited);
+    lines.sort_by(|a, b| a.0.cmp(&b.0));
+}
+
+/// Print configuration with provenance information
+pub fn print_config_with_provenance(sourced: &rumdl_config::SourcedConfig, all_rules: &[Box<dyn Rule>]) {
+    let g = &sourced.global;
+    let root = sourced.project_root.as_deref();
+    let mut all_lines = Vec::new();
+    // [global] section
+    let global_lines = vec![
+        ("[global]".to_string(), String::new()),
+        (
+            format!("enable = {:?}", g.enable.value),
+            provenance_label(&g.enable, root),
+        ),
+        (
+            format!("disable = {:?}", g.disable.value),
+            provenance_label(&g.disable, root),
+        ),
+        (
+            format!("exclude = {:?}", g.exclude.value),
+            provenance_label(&g.exclude, root),
+        ),
+        (
+            format!("include = {:?}", g.include.value),
+            provenance_label(&g.include, root),
+        ),
+        (
+            format!("respect_gitignore = {}", g.respect_gitignore.value),
+            provenance_label(&g.respect_gitignore, root),
+        ),
+        (
+            format!("editorconfig = {}", g.editorconfig.value),
+            provenance_label(&g.editorconfig, root),
+        ),
+    ];
+
+    // Add flavor if it's set
+    let mut global_lines = global_lines;
+    global_lines.push((
+        format!("flavor = \"{}\"", g.flavor.value),
+        format!("[from {}]", format_provenance(g.flavor.source)),
+    ));
+    global_lines.push((
+        format!("line_length = {}", g.line_length.value.get()),
+        provenance_label(&g.line_length, root),
+    ));
+    global_lines.push((
+        format!("force_exclude = {}", g.force_exclude.value),
+        provenance_label(&g.force_exclude, root),
+    ));
+    global_lines.push((format!("cache = {}", g.cache.value), provenance_label(&g.cache, root)));
+    global_lines.push((
+        format!("fixable = {:?}", g.fixable.value),
+        provenance_label(&g.fixable, root),
+    ));
+    global_lines.push((
+        format!("unfixable = {:?}", g.unfixable.value),
+        provenance_label(&g.unfixable, root),
+    ));
+    global_lines.push((
+        format!("extend_enable = {:?}", g.extend_enable.value),
+        provenance_label(&g.extend_enable, root),
+    ));
+    global_lines.push((
+        format!("extend_disable = {:?}", g.extend_disable.value),
+        provenance_label(&g.extend_disable, root),
+    ));
+    // `output_format` and `cache_dir` have no default to stand in for an unset
+    // value, so they are shown only once something has set them.
+    if let Some(ref output_format) = g.output_format {
+        global_lines.push((
+            format!("output_format = {:?}", output_format.value),
+            provenance_label(output_format, root),
+        ));
+    }
+    if let Some(ref cache_dir) = g.cache_dir {
+        global_lines.push((
+            format!("cache_dir = {:?}", cache_dir.value),
+            provenance_label(cache_dir, root),
+        ));
+    }
+    global_lines.push((String::new(), String::new()));
+    all_lines.extend(global_lines);
+
+    // The remaining sections are always shown, defaults included: this output is
+    // the whole effective configuration, and a section left out reads as one that
+    // does not exist.
+    all_lines.extend(per_file_ignores_lines(sourced, root));
+    all_lines.push((String::new(), String::new()));
+    all_lines.extend(per_file_flavor_lines(sourced, root));
+    all_lines.push((String::new(), String::new()));
+    all_lines.extend(code_block_tools_lines(sourced, root));
+    all_lines.push((String::new(), String::new()));
+
+    let mut rule_names: Vec<_> = all_rules.iter().map(|r| r.name().to_string()).collect();
+    rule_names.sort();
+    for rule_name in rule_names {
+        let mut lines = Vec::new();
+        let norm_rule_name = rule_name.to_ascii_uppercase(); // Use uppercase for lookup
+        if let Some(rule_cfg) = sourced.rules.get(&norm_rule_name) {
+            let mut keys: Vec<_> = rule_cfg.values.keys().collect();
+            keys.sort();
+            for key in keys {
+                let sv = &rule_cfg.values[key];
+                let value_str = match &sv.value {
+                    toml::Value::Array(arr) => {
+                        let vals: Vec<String> = arr.iter().map(|v| v.to_string()).collect();
+                        format!("[{}]", vals.join(", "))
+                    }
+                    toml::Value::String(s) => format!("\"{s}\""),
+                    toml::Value::Boolean(b) => b.to_string(),
+                    toml::Value::Integer(i) => i.to_string(),
+                    toml::Value::Float(f) => f.to_string(),
+                    _ => sv.value.to_string(),
+                };
+                lines.push((format!("{key} = {value_str}"), provenance_label(sv, root)));
+            }
+        } else {
+            // Print default config for this rule, if available
+            if let Some((_, toml::Value::Table(table))) = all_rules
+                .iter()
+                .find(|r| r.name() == rule_name)
+                .and_then(|r| r.default_config_section())
+            {
+                let mut keys: Vec<_> = table.keys().collect();
+                keys.sort();
+                for key in keys {
+                    let v = &table[key];
+                    let value_str = match v {
+                        toml::Value::Array(arr) => {
+                            let vals: Vec<String> = arr.iter().map(|v| v.to_string()).collect();
+                            format!("[{}]", vals.join(", "))
+                        }
+                        toml::Value::String(s) => format!("\"{s}\""),
+                        toml::Value::Boolean(b) => b.to_string(),
+                        toml::Value::Integer(i) => i.to_string(),
+                        toml::Value::Float(f) => f.to_string(),
+                        _ => v.to_string(),
+                    };
+                    lines.push((
+                        format!("{key} = {value_str}"),
+                        format!("[from {}]", format_provenance(rumdl_config::ConfigSource::Default)),
+                    ));
+                }
+            }
+        }
+        apply_inherited_md013_line_length(&rule_name, &mut lines, sourced, root);
+        if !lines.is_empty() {
+            all_lines.push((format!("[{rule_name}]"), String::new()));
+            all_lines.extend(lines);
+            all_lines.push((String::new(), String::new()));
+        }
+    }
+    let max_left = all_lines.iter().map(|(l, _)| l.len()).max().unwrap_or(0);
+    for (left, right) in &all_lines {
+        if left.is_empty() && right.is_empty() {
+            println!();
+        } else if !right.is_empty() {
+            println!("{:<width$} {}", left, right.dimmed(), width = max_left);
+        } else {
+            println!("{left:<max_left$} {right}");
+        }
+    }
+}
+
+/// Format a TOML value for display
+pub fn format_toml_value(val: &toml::Value) -> String {
+    match val {
+        toml::Value::String(s) => format!("\"{s}\""),
+        toml::Value::Integer(i) => i.to_string(),
+        toml::Value::Float(f) => f.to_string(),
+        toml::Value::Boolean(b) => b.to_string(),
+        toml::Value::Array(arr) => {
+            let vals: Vec<String> = arr.iter().map(format_toml_value).collect();
+            format!("[{}]", vals.join(", "))
+        }
+        toml::Value::Table(_) => "<table>".to_string(),
+        toml::Value::Datetime(dt) => dt.to_string(),
+    }
+}
+
+/// Print statistics about lint warnings by rule
+pub fn print_statistics(warnings: &[rumdl_lib::rule::LintWarning]) {
+    use std::collections::HashMap;
+
+    // Group warnings by rule name
+    let mut rule_counts: HashMap<&str, usize> = HashMap::new();
+    let mut fixable_counts: HashMap<&str, usize> = HashMap::new();
+
+    for warning in warnings {
+        let rule_name = warning.rule_name.as_deref().unwrap_or("unknown");
+        *rule_counts.entry(rule_name).or_insert(0) += 1;
+
+        if warning.fix.is_some() {
+            *fixable_counts.entry(rule_name).or_insert(0) += 1;
+        }
+    }
+
+    // Sort rules by count (descending)
+    let mut sorted_rules: Vec<_> = rule_counts.iter().collect();
+    sorted_rules.sort_by(|a, b| b.1.cmp(a.1));
+
+    println!("\n{}", "Rule Violation Statistics:".bold().underline());
+    println!("{:<8} {:<12} {:<8} Percentage", "Rule", "Violations", "Fixable");
+    println!("{}", "-".repeat(50));
+
+    let total_warnings = warnings.len();
+    for (rule, count) in sorted_rules {
+        let fixable = fixable_counts.get(rule).unwrap_or(&0);
+        let percentage = (*count as f64 / total_warnings as f64) * 100.0;
+
+        println!(
+            "{:<8} {:<12} {:<8} {:>6.1}%",
+            rule,
+            count,
+            if *fixable > 0 {
+                format!("{fixable}")
+            } else {
+                "-".to_string()
+            },
+            percentage
+        );
+    }
+
+    println!("{}", "-".repeat(50));
+    println!(
+        "{:<8} {:<12} {:<8} {:>6.1}%",
+        "Total",
+        total_warnings,
+        fixable_counts.values().sum::<usize>(),
+        100.0
+    );
+}
+
+/// Generate a unified diff between original and modified content
+pub fn generate_diff(original: &str, modified: &str, file_path: &str) -> String {
+    let mut diff = String::new();
+
+    // Create diff header
+    diff.push_str(&format!("--- {file_path}\n"));
+    diff.push_str(&format!("+++ {file_path} (fixed)\n"));
+
+    let original_lines: Vec<&str> = original.lines().collect();
+    let modified_lines: Vec<&str> = modified.lines().collect();
+
+    // Simple line-by-line diff (could be improved with a proper diff algorithm)
+    let max_lines = original_lines.len().max(modified_lines.len());
+    let mut in_diff_block = false;
+    let mut diff_start = 0;
+    let mut changes = Vec::new();
+
+    for i in 0..max_lines {
+        let orig_line = original_lines.get(i).copied().unwrap_or("");
+        let mod_line = modified_lines.get(i).copied().unwrap_or("");
+
+        if orig_line != mod_line {
+            if !in_diff_block {
+                in_diff_block = true;
+                diff_start = i.saturating_sub(3); // Include 3 lines of context before
+            }
+        } else if in_diff_block {
+            // End of diff block, include 3 lines of context after
+            let diff_end = (i + 3).min(max_lines);
+            changes.push((diff_start, diff_end));
+            in_diff_block = false;
+        }
+    }
+
+    // Handle case where diff extends to the end of file
+    if in_diff_block {
+        changes.push((diff_start, max_lines));
+    }
+
+    // Generate unified diff format for each change block
+    if changes.is_empty() {
+        diff.push_str("No changes\n");
+    } else {
+        for (start, end) in changes {
+            diff.push_str(&format!(
+                "@@ -{},{} +{},{} @@\n",
+                start + 1,
+                end - start,
+                start + 1,
+                end - start
+            ));
+
+            for i in start..end {
+                let orig_line = original_lines.get(i).copied().unwrap_or("");
+                let mod_line = modified_lines.get(i).copied().unwrap_or("");
+
+                if i >= original_lines.len() {
+                    // Line only in modified
+                    diff.push_str(&format!("+{mod_line}\n"));
+                } else if i >= modified_lines.len() {
+                    // Line only in original
+                    diff.push_str(&format!("-{orig_line}\n"));
+                } else if orig_line == mod_line {
+                    // Context line
+                    diff.push_str(&format!(" {orig_line}\n"));
+                } else {
+                    // Changed line
+                    diff.push_str(&format!("-{orig_line}\n"));
+                    diff.push_str(&format!("+{mod_line}\n"));
+                }
+            }
+        }
+    }
+
+    diff
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_diff_identical_content_reports_no_changes() {
+        let content = "line one\nline two\nline three\n";
+        let result = generate_diff(content, content, "test.md");
+        assert!(
+            result.contains("No changes"),
+            "Expected 'No changes' for identical inputs, got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_generate_diff_single_line_change() {
+        let original = "line one\nline two\nline three\n";
+        let modified = "line one\nLINE TWO\nline three\n";
+        let result = generate_diff(original, modified, "test.md");
+
+        assert!(result.contains("--- test.md"), "Missing original header");
+        assert!(result.contains("+++ test.md (fixed)"), "Missing modified header");
+        assert!(result.contains("-line two"), "Missing removed line");
+        assert!(result.contains("+LINE TWO"), "Missing added line");
+    }
+
+    #[test]
+    fn test_generate_diff_line_added_to_modified() {
+        let original = "line one\nline three\n";
+        let modified = "line one\nline two\nline three\n";
+        let result = generate_diff(original, modified, "test.md");
+
+        assert!(result.contains("+line two"), "Expected added line in diff");
+    }
+
+    #[test]
+    fn test_generate_diff_line_removed_from_original() {
+        let original = "line one\nline two\nline three\n";
+        let modified = "line one\nline three\n";
+        let result = generate_diff(original, modified, "test.md");
+
+        assert!(result.contains("-line two"), "Expected removed line in diff");
+    }
+
+    #[test]
+    fn test_generate_diff_includes_three_lines_of_context() {
+        let lines: Vec<String> = (1..=10).map(|i| format!("line {i}")).collect();
+        let mut modified = lines.clone();
+        modified[4] = "CHANGED".to_string();
+
+        let original_str = lines.join("\n");
+        let modified_str = modified.join("\n");
+        let result = generate_diff(&original_str, &modified_str, "test.md");
+
+        assert!(result.contains(" line 4"), "Expected context line before change");
+        assert!(result.contains(" line 6"), "Expected context line after change");
+        assert!(result.contains("-line 5"), "Expected removed line");
+        assert!(result.contains("+CHANGED"), "Expected added line");
+    }
+
+    #[test]
+    fn test_generate_diff_hunk_header_format() {
+        let original = "a\nb\nc\n";
+        let modified = "a\nB\nc\n";
+        let result = generate_diff(original, modified, "f.md");
+
+        assert!(result.contains("@@"), "Expected @@ hunk header in diff:\n{result}");
+    }
+
+    #[test]
+    fn test_format_toml_value_string_is_quoted() {
+        let val = toml::Value::String("hello world".to_string());
+        assert_eq!(format_toml_value(&val), "\"hello world\"");
+    }
+
+    #[test]
+    fn test_format_toml_value_integer() {
+        let val = toml::Value::Integer(42);
+        assert_eq!(format_toml_value(&val), "42");
+    }
+
+    #[test]
+    fn test_format_toml_value_boolean_true() {
+        assert_eq!(format_toml_value(&toml::Value::Boolean(true)), "true");
+    }
+
+    #[test]
+    fn test_format_toml_value_boolean_false() {
+        assert_eq!(format_toml_value(&toml::Value::Boolean(false)), "false");
+    }
+
+    #[test]
+    fn test_format_toml_value_array_of_strings() {
+        let val = toml::Value::Array(vec![
+            toml::Value::String("a".to_string()),
+            toml::Value::String("b".to_string()),
+        ]);
+        assert_eq!(format_toml_value(&val), r#"["a", "b"]"#);
+    }
+
+    #[test]
+    fn test_format_toml_value_empty_array() {
+        let val = toml::Value::Array(vec![]);
+        assert_eq!(format_toml_value(&val), "[]");
+    }
+
+    #[test]
+    fn test_format_toml_value_table_is_placeholder() {
+        let val = toml::Value::Table(toml::map::Map::new());
+        assert_eq!(format_toml_value(&val), "<table>");
+    }
+
+    #[test]
+    fn test_format_toml_value_nested_array() {
+        let val = toml::Value::Array(vec![
+            toml::Value::Integer(1),
+            toml::Value::Integer(2),
+            toml::Value::Integer(3),
+        ]);
+        assert_eq!(format_toml_value(&val), "[1, 2, 3]");
+    }
+}

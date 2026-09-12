@@ -1,0 +1,457 @@
+use rumdl_lib::lint_context::LintContext;
+use rumdl_lib::rule::Rule;
+use rumdl_lib::rules::MD039NoSpaceInLinks;
+
+#[test]
+fn test_valid_links() {
+    let rule = MD039NoSpaceInLinks;
+    let content = "[link](url) and [another link](url) here";
+    let ctx = LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert!(result.is_empty());
+}
+
+#[test]
+fn test_spaces_both_ends() {
+    let rule = MD039NoSpaceInLinks;
+    let content = "[ link ](url) and [ another link ](url) here";
+    let ctx = LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert_eq!(result.len(), 2);
+    let fixed = rule.fix(&ctx).unwrap();
+    assert_eq!(fixed, "[link](url) and [another link](url) here");
+}
+
+#[test]
+fn test_space_at_start() {
+    let rule = MD039NoSpaceInLinks;
+    let content = "[ link](url) and [ another link](url) here";
+    let ctx = LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert_eq!(result.len(), 2);
+    let fixed = rule.fix(&ctx).unwrap();
+    assert_eq!(fixed, "[link](url) and [another link](url) here");
+}
+
+#[test]
+fn test_space_at_end() {
+    let rule = MD039NoSpaceInLinks;
+    let content = "[link ](url) and [another link ](url) here";
+    let ctx = LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert_eq!(result.len(), 2);
+    let fixed = rule.fix(&ctx).unwrap();
+    assert_eq!(fixed, "[link](url) and [another link](url) here");
+}
+
+#[test]
+fn test_link_in_code_block() {
+    let rule = MD039NoSpaceInLinks;
+    let content = "```\n[ link ](url)\n```\n[ link ](url)";
+    let ctx = LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert_eq!(result.len(), 1);
+    let fixed = rule.fix(&ctx).unwrap();
+    assert_eq!(fixed, "```\n[ link ](url)\n```\n[link](url)");
+}
+
+#[test]
+fn test_multiple_links() {
+    let rule = MD039NoSpaceInLinks;
+    let content = "[ link ](url) and [ another ](url) in one line";
+    let ctx = LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert_eq!(result.len(), 2);
+    let fixed = rule.fix(&ctx).unwrap();
+    assert_eq!(fixed, "[link](url) and [another](url) in one line");
+}
+
+#[test]
+fn test_link_with_internal_spaces() {
+    let rule = MD039NoSpaceInLinks;
+    let content = "[this is link](url) and [ this is also link ](url)";
+    let ctx = LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert_eq!(result.len(), 1);
+    let fixed = rule.fix(&ctx).unwrap();
+    assert_eq!(fixed, "[this is link](url) and [this is also link](url)");
+}
+
+#[test]
+fn test_link_with_punctuation() {
+    let rule = MD039NoSpaceInLinks;
+    let content = "[ link! ](url) and [ link? ](url) here";
+    let ctx = LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert_eq!(result.len(), 2);
+    let fixed = rule.fix(&ctx).unwrap();
+    assert_eq!(fixed, "[link!](url) and [link?](url) here");
+}
+
+/// A wikilink has no `[text](dest)` shape to rewrite, so trimming its display
+/// text would mean emitting a destination that does not exist. `[[Target| x ]]`
+/// used to become `[x]` and `![[a.png| 300 ]]` became `[300]`, destroying the
+/// link.
+#[test]
+fn test_wikilinks_are_left_alone() {
+    let rule = MD039NoSpaceInLinks;
+    // The last line is the positive control: without it, a byte-identical
+    // result would also be what a rule that simply never ran produces.
+    let content = "[[Target| Display text ]]\n\
+                   [[Target]]\n\
+                   ![[a.png| 300 ]]\n\
+                   ![[a.png| Some description ]]\n\
+                   ![[a.png]]\n\
+                   [ plain ](url)";
+    for flavor in [
+        rumdl_lib::config::MarkdownFlavor::Obsidian,
+        rumdl_lib::config::MarkdownFlavor::Standard,
+    ] {
+        let ctx = LintContext::new(content, flavor, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(
+            result.len(),
+            1,
+            "{flavor:?}: only the inline link warns, got {result:?}"
+        );
+        assert_eq!(result[0].line, 6);
+
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(
+            fixed,
+            content.replace("[ plain ](url)", "[plain](url)"),
+            "{flavor:?}: wikilinks must survive the fix byte for byte"
+        );
+    }
+}
+
+/// The destination is taken from the `]` that closes the link text, not from
+/// the first `](` in the span: a nested image carries its own `](`, and
+/// splitting there spliced the image's destination back into the document.
+#[test]
+fn test_nested_image_destination_is_not_spliced() {
+    let rule = MD039NoSpaceInLinks;
+    let content = "[ before ![x](real.png) after ](Target.md)\n[ plain ](Target.md \"a title\")";
+    let ctx = LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let result = rule.check(&ctx).unwrap();
+    assert_eq!(result.len(), 2, "got {result:?}");
+
+    let fixed = rule.fix(&ctx).unwrap();
+    assert_eq!(
+        fixed,
+        "[before ![x](real.png) after](Target.md)\n[plain](Target.md \"a title\")"
+    );
+}
+
+/// The nested image sits flush against both trimmed spaces, so the outer text
+/// begins and ends with the image's own brackets.
+#[test]
+fn test_nested_image_flush_against_the_brackets() {
+    let rule = MD039NoSpaceInLinks;
+    let content = "[ ![x](real.png) ](Target.md)";
+    let ctx = LintContext::new(content, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let fixed = rule.fix(&ctx).unwrap();
+    assert_eq!(fixed, "[![x](real.png)](Target.md)");
+}
+
+mod parity_with_markdownlint {
+    use rumdl_lib::lint_context::LintContext;
+    use rumdl_lib::rule::Rule;
+    use rumdl_lib::rules::MD039NoSpaceInLinks;
+
+    #[test]
+    fn parity_leading_trailing_space() {
+        let input = "[ link](url) and [another link ](url)";
+        let expected = "[link](url) and [another link](url)";
+        let ctx = LintContext::new(input, rumdl_lib::config::MarkdownFlavor::Standard, None);
+        let rule = MD039NoSpaceInLinks::new();
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, expected);
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(warnings.len(), 2);
+    }
+
+    #[test]
+    fn parity_both_ends_spaced() {
+        let input = "[ link ](url) and [ another link ](url)";
+        let expected = "[link](url) and [another link](url)";
+        let ctx = LintContext::new(input, rumdl_lib::config::MarkdownFlavor::Standard, None);
+        let rule = MD039NoSpaceInLinks::new();
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, expected);
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(warnings.len(), 2);
+    }
+
+    #[test]
+    fn parity_internal_spaces_only() {
+        let input = "[this is link](url) and [another link](url)";
+        let expected = "[this is link](url) and [another link](url)";
+        let ctx = LintContext::new(input, rumdl_lib::config::MarkdownFlavor::Standard, None);
+        let rule = MD039NoSpaceInLinks::new();
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, expected);
+        let warnings = rule.check(&ctx).unwrap();
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn parity_code_block_containing_links() {
+        let input = "```
+[ link ](url)
+```
+[ link ](url)";
+        let expected = "```
+[ link ](url)
+```
+[link](url)";
+        let ctx = LintContext::new(input, rumdl_lib::config::MarkdownFlavor::Standard, None);
+        let rule = MD039NoSpaceInLinks::new();
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, expected);
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn parity_multiple_links_per_line() {
+        let input = "[ link ](url) and [ another ](url) in one line";
+        let expected = "[link](url) and [another](url) in one line";
+        let ctx = LintContext::new(input, rumdl_lib::config::MarkdownFlavor::Standard, None);
+        let rule = MD039NoSpaceInLinks::new();
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, expected);
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(warnings.len(), 2);
+    }
+
+    #[test]
+    fn parity_punctuation_in_link_text() {
+        let input = "[ link! ](url) and [ link? ](url) here";
+        let expected = "[link!](url) and [link?](url) here";
+        let ctx = LintContext::new(input, rumdl_lib::config::MarkdownFlavor::Standard, None);
+        let rule = MD039NoSpaceInLinks::new();
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, expected);
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(warnings.len(), 2);
+    }
+
+    #[test]
+    fn parity_link_text_only_spaces() {
+        let input = "[   ](url) and [ ](url)";
+        // markdownlint removes all spaces, resulting in empty link text
+        let expected = "[](url) and [](url)";
+        let ctx = LintContext::new(input, rumdl_lib::config::MarkdownFlavor::Standard, None);
+        let rule = MD039NoSpaceInLinks::new();
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, expected);
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(warnings.len(), 2);
+    }
+
+    #[test]
+    fn parity_reference_style_links() {
+        let input = "[ link ][ref] and [ another ][ref2]\n\n[ref]: url\n[ref2]: url2";
+        // markdownlint does not fix reference-style links for MD039, so output is unchanged
+        let expected = "[ link ][ref] and [ another ][ref2]\n\n[ref]: url\n[ref2]: url2";
+        let ctx = LintContext::new(input, rumdl_lib::config::MarkdownFlavor::Standard, None);
+        let rule = MD039NoSpaceInLinks::new();
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, expected);
+        // Should not warn on reference-style links
+        let warnings = rule.check(&ctx).unwrap();
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn parity_unicode_whitespace() {
+        let input = "[\u{00A0}link\u{00A0}](url) and [\u{2003}another\u{2003}](url)"; // non-breaking space and em space
+        let expected = "[link](url) and [another](url)";
+        let ctx = LintContext::new(input, rumdl_lib::config::MarkdownFlavor::Standard, None);
+        let rule = MD039NoSpaceInLinks::new();
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, expected);
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(warnings.len(), 2);
+    }
+
+    #[test]
+    fn parity_tab_whitespace() {
+        let input = "[\tlink\t](url) and [\tanother\t](url)";
+        let expected = "[link](url) and [another](url)";
+        let ctx = LintContext::new(input, rumdl_lib::config::MarkdownFlavor::Standard, None);
+        let rule = MD039NoSpaceInLinks::new();
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, expected);
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(warnings.len(), 2);
+    }
+
+    #[test]
+    fn parity_only_whitespace_and_newlines() {
+        let input = "[   \n  ](url) and [\t\n\t](url)";
+        let expected = "[](url) and [](url)";
+        let ctx = LintContext::new(input, rumdl_lib::config::MarkdownFlavor::Standard, None);
+        let rule = MD039NoSpaceInLinks::new();
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, expected);
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(warnings.len(), 2);
+    }
+
+    #[test]
+    fn parity_internal_newlines() {
+        let input = "[link\ntext](url) and [ another\nlink ](url)";
+        let expected = "[link\ntext](url) and [another\nlink](url)";
+        let ctx = LintContext::new(input, rumdl_lib::config::MarkdownFlavor::Standard, None);
+        let rule = MD039NoSpaceInLinks::new();
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, expected);
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn parity_nested_formatting() {
+        let input = "[ * link * ](url) and [ _ another _ ](url)";
+        let expected = "[* link *](url) and [_ another _](url)";
+        let ctx = LintContext::new(input, rumdl_lib::config::MarkdownFlavor::Standard, None);
+        let rule = MD039NoSpaceInLinks::new();
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, expected);
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(warnings.len(), 2);
+    }
+
+    #[test]
+    fn parity_escaped_brackets() {
+        let input = "[link\\]](url) and [link\\[]](url)";
+        let expected = "[link\\]](url) and [link\\[]](url)";
+        let ctx = LintContext::new(input, rumdl_lib::config::MarkdownFlavor::Standard, None);
+        let rule = MD039NoSpaceInLinks::new();
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, expected);
+        let warnings = rule.check(&ctx).unwrap();
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn parity_inline_images() {
+        let input = "![ alt ](img.png) and ![ another ](img2.png)";
+        let expected = "![alt](img.png) and ![another](img2.png)";
+        let ctx = LintContext::new(input, rumdl_lib::config::MarkdownFlavor::Standard, None);
+        let rule = MD039NoSpaceInLinks::new();
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, expected);
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(warnings.len(), 2);
+    }
+
+    #[test]
+    fn parity_html_entities() {
+        let input = "[ &nbsp;link&nbsp; ](url)";
+        let expected = "[&nbsp;link&nbsp;](url)";
+        let ctx = LintContext::new(input, rumdl_lib::config::MarkdownFlavor::Standard, None);
+        let rule = MD039NoSpaceInLinks::new();
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, expected);
+        let warnings = rule.check(&ctx).unwrap();
+        assert_eq!(warnings.len(), 1);
+    }
+}
+
+/// Helper: fix content, then check the result has zero violations
+fn assert_fix_roundtrip(input: &str) {
+    let rule = MD039NoSpaceInLinks::new();
+    let ctx = LintContext::new(input, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let fixed = rule.fix(&ctx).unwrap();
+    let ctx2 = LintContext::new(&fixed, rumdl_lib::config::MarkdownFlavor::Standard, None);
+    let remaining = rule.check(&ctx2).unwrap();
+    assert!(
+        remaining.is_empty(),
+        "After fix, check() should return 0 warnings but got {} for input: {:?}\nFixed output: {:?}",
+        remaining.len(),
+        input,
+        fixed,
+    );
+}
+
+mod roundtrip_tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip_spaces_both_ends() {
+        assert_fix_roundtrip("[ link ](url) and [ another link ](url) here");
+    }
+
+    #[test]
+    fn roundtrip_space_at_start() {
+        assert_fix_roundtrip("[ link](url) and [ another link](url) here");
+    }
+
+    #[test]
+    fn roundtrip_space_at_end() {
+        assert_fix_roundtrip("[link ](url) and [another link ](url) here");
+    }
+
+    #[test]
+    fn roundtrip_code_block() {
+        assert_fix_roundtrip("```\n[ link ](url)\n```\n[ link ](url)");
+    }
+
+    #[test]
+    fn roundtrip_multiple_links_same_line() {
+        assert_fix_roundtrip("[ link ](url) and [ another ](url) in one line");
+    }
+
+    #[test]
+    fn roundtrip_only_whitespace_text() {
+        assert_fix_roundtrip("[   ](url) and [ ](url)");
+    }
+
+    #[test]
+    fn roundtrip_unicode_whitespace() {
+        assert_fix_roundtrip("[\u{00A0}link\u{00A0}](url) and [\u{2003}another\u{2003}](url)");
+    }
+
+    #[test]
+    fn roundtrip_tab_whitespace() {
+        assert_fix_roundtrip("[\tlink\t](url) and [\tanother\t](url)");
+    }
+
+    #[test]
+    fn roundtrip_inline_images() {
+        assert_fix_roundtrip("![ alt ](img.png) and ![ another ](img2.png)");
+    }
+
+    #[test]
+    fn roundtrip_nested_formatting() {
+        assert_fix_roundtrip("[ * link * ](url) and [ _ another _ ](url)");
+    }
+
+    #[test]
+    fn roundtrip_html_entities() {
+        assert_fix_roundtrip("[ &nbsp;link&nbsp; ](url)");
+    }
+
+    #[test]
+    fn roundtrip_mixed_links_and_images() {
+        assert_fix_roundtrip("[ link ](url) and ![ image ](img.png) together");
+    }
+
+    #[test]
+    fn roundtrip_link_with_title() {
+        assert_fix_roundtrip("[ link ](url \"title\") here");
+    }
+
+    #[test]
+    fn roundtrip_multiple_spaces() {
+        assert_fix_roundtrip("[   link   ](url) text");
+    }
+
+    #[test]
+    fn roundtrip_unicode_content() {
+        assert_fix_roundtrip("[ 日本語 ](url) and [ émojis 🎉 ](url2)");
+    }
+}

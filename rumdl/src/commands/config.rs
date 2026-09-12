@@ -1,0 +1,579 @@
+//! Handler for the `config` command.
+
+use colored::*;
+
+use rumdl_lib::config as rumdl_config;
+use rumdl_lib::exit_codes::exit;
+
+use rumdl_config::ConfigSource;
+use rumdl_config::normalize_key;
+use rumdl_lib::rules::MD013Config;
+
+use crate::ConfigSubcommand;
+use crate::cli_utils::load_config_with_cli_error_handling;
+use crate::formatter;
+
+/// Handle the config command: show or query configuration.
+#[allow(clippy::too_many_arguments)]
+pub fn handle_config(
+    subcmd: Option<ConfigSubcommand>,
+    defaults: bool,
+    no_defaults: bool,
+    output: Option<String>,
+    config_path: Option<&str>,
+    no_config: bool,
+    isolated: bool,
+    inline_overrides: &[toml::Table],
+) {
+    // Validate mutual exclusivity of --defaults and --no-defaults
+    if defaults && no_defaults {
+        eprintln!(
+            "{}: Cannot use both --defaults and --no-defaults flags together",
+            "Error".red().bold()
+        );
+        exit::tool_error();
+    }
+
+    // Handle config subcommands
+    if let Some(ConfigSubcommand::Get { key }) = subcmd {
+        handle_config_get(&key, config_path, no_config, inline_overrides);
+    } else if let Some(ConfigSubcommand::File) = subcmd {
+        handle_config_file(config_path, no_config, isolated);
+    } else {
+        // No subcommand: display full config
+        handle_config_display(
+            defaults,
+            no_defaults,
+            output,
+            config_path,
+            no_config,
+            isolated,
+            inline_overrides,
+        );
+    }
+}
+
+/// Stands in for the value of a key rumdl accepts that is neither set nor backed by a
+/// default it could show (an unset `Option`). Deliberately not valid TOML, so it can
+/// never be read back as a real setting.
+const UNSET_DISPLAY: &str = "<unset>";
+
+fn print_config_value(rule: &str, field: &str, value: &toml::Value, source: ConfigSource) {
+    println!(
+        "{}.{} = {} [from {}]",
+        rule,
+        field,
+        formatter::format_toml_value(value),
+        formatter::format_provenance(source)
+    );
+}
+
+/// Reports a key as accepted but carrying no value, which is a different answer from
+/// "unknown key" and must not be collapsed into one.
+fn print_unset_config_value(rule: &str, field: &str) {
+    println!("{rule}.{field} = {UNSET_DISPLAY} [no default]");
+}
+
+/// The defaults a rule publishes for display, which is where a shown value comes from.
+/// Distinct from the validation schema in [`rumdl_config::RuleRegistry`]: that one
+/// carries sentinels for keys whose type cannot be checked, and a sentinel must never
+/// reach output.
+fn default_config_values_for_rule(rule_name: &str) -> toml::map::Map<String, toml::Value> {
+    rumdl_lib::rules::all_rules(&rumdl_config::Config::default())
+        .iter()
+        .find_map(|rule| match rule.default_config_section() {
+            Some((name, toml::Value::Table(table))) if normalize_key(&name) == rule_name => Some(table),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// The value and provenance of a rule option that a global setting supplies.
+///
+/// One option is inherited: MD013's `line-length` is the `[global]` setting when
+/// MD013 does not set its own. Reporting the option's static default there names
+/// a limit the lint does not enforce, so the answer is read from the same
+/// [`MD013Config::from_document_config`] the rule is built with and attributed to
+/// the global setting it came from.
+fn inherited_global_option(
+    rule_name: &str,
+    field: &str,
+    final_config: &rumdl_config::Config,
+    sourced: &rumdl_config::SourcedConfig,
+) -> Option<(toml::Value, ConfigSource)> {
+    if rule_name != "MD013" || field != "line-length" {
+        return None;
+    }
+    let written = rumdl_lib::rule_config_serde::load_rule_config::<MD013Config>(final_config);
+    if !written.line_length_is_default() {
+        return None;
+    }
+    let resolved = MD013Config::from_document_config(final_config).line_length;
+    let value = toml::Value::Integer(i64::try_from(resolved.get()).ok()?);
+    Some((value, sourced.global.line_length.source))
+}
+
+fn handle_config_get(key: &str, config_path: Option<&str>, no_config: bool, inline_overrides: &[toml::Table]) {
+    // Load config once; both dot-key and bare-rule paths use the same sourced state.
+    let mut sourced = match rumdl_config::SourcedConfig::load_with_discovery(config_path, None, no_config) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{}: {}", "Config error".red().bold(), e);
+            exit::tool_error();
+        }
+    };
+    crate::cli_config_override::apply_inline_overrides(&mut sourced, inline_overrides);
+    // config-get doesn't emit validation warnings; convert directly.
+    let final_config: rumdl_config::Config = sourced.clone().into_validated_unchecked().into();
+
+    if let Some((section_part, field_part)) = key.split_once('.') {
+        let normalized_field = normalize_key(field_part);
+
+        // Handle GLOBAL keys
+        if section_part.eq_ignore_ascii_case("global") {
+            match rumdl_config::read_global_key(&final_config.global, &sourced.global, &normalized_field) {
+                Some(rumdl_config::GlobalKeyValue::Set(value, source)) => {
+                    print_config_value("global", &normalized_field, &value, source);
+                }
+                Some(rumdl_config::GlobalKeyValue::Unset) => {
+                    print_unset_config_value("global", &normalized_field);
+                }
+                None => {
+                    eprintln!("Unknown global key: {field_part}");
+                    exit::tool_error();
+                }
+            }
+        }
+        // Handle RULE keys (MDxxx.field or alias.field)
+        else {
+            let normalized_rule_name = rumdl_config::resolve_rule_name_alias(section_part)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| normalize_key(section_part));
+            let registry = rumdl_config::default_registry();
+
+            if !registry.rule_schemas.contains_key(&normalized_rule_name) {
+                eprintln!("Unknown config key: {normalized_rule_name}.{normalized_field}");
+                exit::tool_error();
+            }
+
+            // `severity` is accepted for every rule but is parsed into its own field
+            // rather than into `values`, so it needs its own lookup.
+            if normalized_field == "severity" {
+                match sourced
+                    .rules
+                    .get(&normalized_rule_name)
+                    .and_then(|sc| sc.severity.as_ref())
+                {
+                    Some(sourced_severity) => print_config_value(
+                        &normalized_rule_name,
+                        &normalized_field,
+                        &toml::Value::try_from(sourced_severity.value).expect("Severity serializes to a TOML string"),
+                        sourced_severity.source,
+                    ),
+                    None => print_unset_config_value(&normalized_rule_name, &normalized_field),
+                }
+                return;
+            }
+
+            // An inherited option is checked before the rule's own section: when
+            // the section names the same number as the option's default, the
+            // global setting still wins, so the written value is not the enforced
+            // one.
+            if let Some((value, source)) =
+                inherited_global_option(&normalized_rule_name, &normalized_field, &final_config, &sourced)
+            {
+                print_config_value(&normalized_rule_name, &normalized_field, &value, source);
+                return;
+            }
+
+            // Try to get the value from the final config first
+            let final_value: Option<&toml::Value> = final_config
+                .rules
+                .get(&normalized_rule_name)
+                .and_then(|rule_cfg| rule_cfg.values.get(&normalized_field));
+
+            if let Some(value) = final_value {
+                let provenance = sourced
+                    .rules
+                    .get(&normalized_rule_name)
+                    .and_then(|sc| sc.values.get(&normalized_field))
+                    .map_or(ConfigSource::Default, |sv| sv.source);
+
+                print_config_value(&normalized_rule_name, &normalized_field, value, provenance);
+                return;
+            }
+
+            // `enabled` is accepted for every rule and belongs to no rule's schema,
+            // so an unset one is reported as unset rather than as an unknown key.
+            let Some(canonical_key) = registry.canonical_config_key(&normalized_rule_name, &normalized_field) else {
+                if normalized_field == "enabled" {
+                    print_unset_config_value(&normalized_rule_name, &normalized_field);
+                    return;
+                }
+                eprintln!("Unknown config key: {normalized_rule_name}.{normalized_field}");
+                exit::tool_error();
+            };
+
+            // The default comes from the rule's user-facing table, not from the
+            // validation schema: a key whose schema entry is a sentinel can still have
+            // a displayable default (a polymorphic key), and one that has none is unset
+            // rather than unknown.
+            match default_config_values_for_rule(&normalized_rule_name).get(canonical_key) {
+                Some(value) => {
+                    print_config_value(&normalized_rule_name, &normalized_field, value, ConfigSource::Default)
+                }
+                None => print_unset_config_value(&normalized_rule_name, &normalized_field),
+            }
+        }
+    } else {
+        // Handle bare rule name or alias (e.g. "MD076", "heading-style") — return all config keys for the rule.
+        let normalized_rule_name = rumdl_config::resolve_rule_name_alias(key)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| normalize_key(key));
+        let registry = rumdl_config::default_registry();
+
+        if registry.rule_schemas.contains_key(&normalized_rule_name) {
+            let schema = &registry.rule_schemas[&normalized_rule_name];
+            let defaults = default_config_values_for_rule(&normalized_rule_name);
+
+            // Every key the rule accepts, so the listing is the answer to "what can I
+            // set here?": the rule's own schema plus the two keys every rule takes.
+            let mut fields: Vec<&str> = schema.keys().map(String::as_str).collect();
+            fields.push("enabled");
+            fields.push("severity");
+            fields.sort_unstable();
+            fields.dedup();
+
+            for field in fields {
+                let normalized_field = normalize_key(field);
+
+                if normalized_field == "severity" {
+                    match sourced
+                        .rules
+                        .get(&normalized_rule_name)
+                        .and_then(|sc| sc.severity.as_ref())
+                    {
+                        Some(sourced_severity) => print_config_value(
+                            &normalized_rule_name,
+                            &normalized_field,
+                            &toml::Value::try_from(sourced_severity.value)
+                                .expect("Severity serializes to a TOML string"),
+                            sourced_severity.source,
+                        ),
+                        None => print_unset_config_value(&normalized_rule_name, &normalized_field),
+                    }
+                    continue;
+                }
+
+                if let Some((value, source)) =
+                    inherited_global_option(&normalized_rule_name, &normalized_field, &final_config, &sourced)
+                {
+                    print_config_value(&normalized_rule_name, &normalized_field, &value, source);
+                    continue;
+                }
+
+                let final_value = final_config
+                    .rules
+                    .get(&normalized_rule_name)
+                    .and_then(|rule_cfg| rule_cfg.values.get(&normalized_field));
+
+                let (value, source) = if let Some(v) = final_value {
+                    let provenance = sourced
+                        .rules
+                        .get(&normalized_rule_name)
+                        .and_then(|sc| sc.values.get(&normalized_field))
+                        .map_or(rumdl_config::ConfigSource::Default, |sv| sv.source);
+                    (v, provenance)
+                } else if let Some(v) = defaults.get(field) {
+                    (v, rumdl_config::ConfigSource::Default)
+                } else {
+                    print_unset_config_value(&normalized_rule_name, &normalized_field);
+                    continue;
+                };
+
+                print_config_value(&normalized_rule_name, &normalized_field, value, source);
+            }
+        } else {
+            eprintln!(
+                "Unknown key: {key}. Must be in the form global.key, MDxxx.key, or MDxxx (rule name for all keys)"
+            );
+            exit::tool_error();
+        }
+    }
+}
+
+fn handle_config_file(config_path: Option<&str>, no_config: bool, isolated: bool) {
+    let sourced = load_config_with_cli_error_handling(config_path, no_config || isolated);
+
+    // Warn to stderr (keeping stdout the bare path) when a sibling config is shadowed,
+    // so `rumdl config file` shows both the winner and what it overrides.
+    for warning in &sourced.discovery_warnings {
+        eprintln!("\x1b[33m[config warning]\x1b[0m {warning}");
+    }
+
+    if sourced.loaded_files.is_empty() {
+        if no_config || isolated {
+            println!("No configuration file loaded (--no-config/--isolated specified)");
+        } else {
+            println!("No configuration file found (using defaults)");
+        }
+    } else {
+        // Convert relative paths to absolute paths
+        for file_path in &sourced.loaded_files {
+            match std::fs::canonicalize(file_path) {
+                Ok(absolute_path) => {
+                    println!("{}", absolute_path.display());
+                }
+                Err(_) => {
+                    // If canonicalize fails, it might be a file that doesn't exist anymore
+                    // or a relative path that can't be resolved. Just print as-is.
+                    println!("{file_path}");
+                }
+            }
+        }
+    }
+}
+
+fn handle_config_display(
+    defaults: bool,
+    no_defaults: bool,
+    output: Option<String>,
+    config_path: Option<&str>,
+    no_config: bool,
+    isolated: bool,
+    inline_overrides: &[toml::Table],
+) {
+    let registry = rumdl_config::default_registry();
+    let all_rules_reg = rumdl_lib::rules::all_rules(&rumdl_config::Config::default());
+    let mut sourced_reg = if defaults {
+        // For defaults, create a SourcedConfig that includes all rule defaults
+        let mut default_sourced = rumdl_config::SourcedConfig::default();
+
+        // Add default configurations from all rules
+        for rule in &all_rules_reg {
+            if let Some((rule_name, toml::Value::Table(table))) = rule.default_config_section() {
+                let mut rule_config = rumdl_config::SourcedRuleConfig::default();
+                for (key, value) in table {
+                    rule_config.values.insert(
+                        key.clone(),
+                        rumdl_config::SourcedValue::new(value.clone(), rumdl_config::ConfigSource::Default),
+                    );
+                }
+                default_sourced.rules.insert(rule_name.to_uppercase(), rule_config);
+            }
+        }
+
+        default_sourced
+    } else {
+        load_config_with_cli_error_handling(config_path, no_config || isolated)
+    };
+    if !defaults {
+        crate::cli_config_override::apply_inline_overrides(&mut sourced_reg, inline_overrides);
+    }
+    for warning in &sourced_reg.discovery_warnings {
+        eprintln!("\x1b[33m[config warning]\x1b[0m {warning}");
+    }
+    let validation_warnings = rumdl_config::validate_config_sourced(&sourced_reg, registry);
+    if !validation_warnings.is_empty() {
+        for warn in &validation_warnings {
+            eprintln!("\x1b[33m[config warning]\x1b[0m {}", warn.message);
+        }
+    }
+
+    // Decide which config to print based on --defaults and --no-defaults
+    let final_sourced_to_print = sourced_reg;
+
+    // Handle output format (toml, json, or smart output)
+    match output.as_deref() {
+        Some("toml") => {
+            if defaults {
+                // For defaults with TOML output, generate a complete default config
+                let mut default_config = rumdl_config::Config::default();
+
+                // Add all rule default configurations
+                for rule in &all_rules_reg {
+                    if let Some((rule_name, toml::Value::Table(table))) = rule.default_config_section() {
+                        let rule_config = rumdl_config::RuleConfig {
+                            severity: None,
+                            values: table.into_iter().collect(),
+                        };
+                        default_config.rules.insert(rule_name.to_uppercase(), rule_config);
+                    }
+                }
+
+                match toml::to_string_pretty(&default_config) {
+                    Ok(s) => println!("{s}"),
+                    Err(e) => {
+                        eprintln!("Failed to serialize config to TOML: {e}");
+                        exit::tool_error();
+                    }
+                }
+            } else if no_defaults {
+                // For --no-defaults with TOML output, filter to non-defaults
+                let filtered_sourced = filter_sourced_config_to_non_defaults(&final_sourced_to_print);
+                let config_to_print: rumdl_config::Config = filtered_sourced.into_validated_unchecked().into();
+                match toml::to_string_pretty(&config_to_print) {
+                    Ok(s) => println!("{s}"),
+                    Err(e) => {
+                        eprintln!("Failed to serialize config to TOML: {e}");
+                        exit::tool_error();
+                    }
+                }
+            } else {
+                let config_to_print: rumdl_config::Config = final_sourced_to_print.into_validated_unchecked().into();
+                match toml::to_string_pretty(&config_to_print) {
+                    Ok(s) => println!("{s}"),
+                    Err(e) => {
+                        eprintln!("Failed to serialize config to TOML: {e}");
+                        exit::tool_error();
+                    }
+                }
+            }
+        }
+        Some("json") => {
+            if defaults {
+                // For defaults with JSON output, generate a complete default config
+                let mut default_config = rumdl_config::Config::default();
+
+                // Add all rule default configurations
+                for rule in &all_rules_reg {
+                    if let Some((rule_name, toml::Value::Table(table))) = rule.default_config_section() {
+                        let rule_config = rumdl_config::RuleConfig {
+                            severity: None,
+                            values: table.into_iter().collect(),
+                        };
+                        default_config.rules.insert(rule_name.to_uppercase(), rule_config);
+                    }
+                }
+
+                match serde_json::to_string_pretty(&default_config) {
+                    Ok(s) => println!("{s}"),
+                    Err(e) => {
+                        eprintln!("Failed to serialize config to JSON: {e}");
+                        exit::tool_error();
+                    }
+                }
+            } else if no_defaults {
+                // For --no-defaults with JSON output, filter to non-defaults
+                let filtered_sourced = filter_sourced_config_to_non_defaults(&final_sourced_to_print);
+                let config_to_print: rumdl_config::Config = filtered_sourced.into_validated_unchecked().into();
+                match serde_json::to_string_pretty(&config_to_print) {
+                    Ok(s) => println!("{s}"),
+                    Err(e) => {
+                        eprintln!("Failed to serialize config to JSON: {e}");
+                        exit::tool_error();
+                    }
+                }
+            } else {
+                let config_to_print: rumdl_config::Config = final_sourced_to_print.into_validated_unchecked().into();
+                match serde_json::to_string_pretty(&config_to_print) {
+                    Ok(s) => println!("{s}"),
+                    Err(e) => {
+                        eprintln!("Failed to serialize config to JSON: {e}");
+                        exit::tool_error();
+                    }
+                }
+            }
+        }
+        _ => {
+            // `.editorconfig` resolves per file, so no single value can be shown
+            // here. Say so rather than print a settled-looking number that the
+            // next `rumdl check` overrides.
+            let editorconfig_enabled = final_sourced_to_print.global.editorconfig.value;
+
+            // Otherwise, print the smart output with provenance annotations
+            if no_defaults {
+                formatter::print_config_with_provenance_no_defaults(&final_sourced_to_print, &all_rules_reg);
+            } else {
+                formatter::print_config_with_provenance(&final_sourced_to_print, &all_rules_reg);
+            }
+
+            if editorconfig_enabled {
+                println!(
+                    "\nNote: editorconfig = true. Settings that a `.editorconfig` supplies are resolved \
+                     per file and are not shown above."
+                );
+            }
+        }
+    }
+}
+
+/// Filter a SourcedConfig to only include non-default values
+fn filter_sourced_config_to_non_defaults(
+    sourced: &rumdl_config::SourcedConfig<rumdl_config::ConfigLoaded>,
+) -> rumdl_config::SourcedConfig<rumdl_config::ConfigLoaded> {
+    let mut filtered = rumdl_config::SourcedConfig::default();
+
+    // Filter global config - only include fields with non-default sources
+    if sourced.global.enable.source != rumdl_config::ConfigSource::Default {
+        filtered.global.enable = sourced.global.enable.clone();
+    }
+    if sourced.global.disable.source != rumdl_config::ConfigSource::Default {
+        filtered.global.disable = sourced.global.disable.clone();
+    }
+    if sourced.global.exclude.source != rumdl_config::ConfigSource::Default {
+        filtered.global.exclude = sourced.global.exclude.clone();
+    }
+    if sourced.global.include.source != rumdl_config::ConfigSource::Default {
+        filtered.global.include = sourced.global.include.clone();
+    }
+    if sourced.global.respect_gitignore.source != rumdl_config::ConfigSource::Default {
+        filtered.global.respect_gitignore = sourced.global.respect_gitignore.clone();
+    }
+    if sourced.global.line_length.source != rumdl_config::ConfigSource::Default {
+        filtered.global.line_length = sourced.global.line_length.clone();
+    }
+    if sourced.global.flavor.source != rumdl_config::ConfigSource::Default {
+        filtered.global.flavor = sourced.global.flavor.clone();
+    }
+    if sourced.global.force_exclude.source != rumdl_config::ConfigSource::Default {
+        filtered.global.force_exclude = sourced.global.force_exclude.clone();
+    }
+    if sourced.global.cache.source != rumdl_config::ConfigSource::Default {
+        filtered.global.cache = sourced.global.cache.clone();
+    }
+    if sourced.global.editorconfig.source != rumdl_config::ConfigSource::Default {
+        filtered.global.editorconfig = sourced.global.editorconfig.clone();
+    }
+    if sourced.global.fixable.source != rumdl_config::ConfigSource::Default {
+        filtered.global.fixable = sourced.global.fixable.clone();
+    }
+    if sourced.global.unfixable.source != rumdl_config::ConfigSource::Default {
+        filtered.global.unfixable = sourced.global.unfixable.clone();
+    }
+    if let Some(ref output_format) = sourced.global.output_format
+        && output_format.source != rumdl_config::ConfigSource::Default
+    {
+        filtered.global.output_format = Some(output_format.clone());
+    }
+    if let Some(ref cache_dir) = sourced.global.cache_dir
+        && cache_dir.source != rumdl_config::ConfigSource::Default
+    {
+        filtered.global.cache_dir = Some(cache_dir.clone());
+    }
+
+    // Filter per-file ignores
+    if sourced.per_file_ignores.source != rumdl_config::ConfigSource::Default {
+        filtered.per_file_ignores = sourced.per_file_ignores.clone();
+    }
+
+    // Filter rules - only include rules with at least one non-default value
+    for (rule_name, rule_cfg) in &sourced.rules {
+        let mut filtered_rule = rumdl_config::SourcedRuleConfig::default();
+        for (key, sv) in &rule_cfg.values {
+            if sv.source != rumdl_config::ConfigSource::Default {
+                filtered_rule.values.insert(key.clone(), sv.clone());
+            }
+        }
+        if !filtered_rule.values.is_empty() {
+            filtered.rules.insert(rule_name.clone(), filtered_rule);
+        }
+    }
+
+    // Preserve metadata
+    filtered.loaded_files = sourced.loaded_files.clone();
+    filtered.unknown_keys = sourced.unknown_keys.clone();
+    filtered.project_root = sourced.project_root.clone();
+
+    filtered
+}

@@ -1,0 +1,1594 @@
+---
+description: "Every setting in the global section, covering file selection, rule enablement, include and exclude patterns, and per file ignores."
+---
+
+# Global Settings Reference
+
+This document provides a comprehensive reference for rumdl's global configuration settings. Global settings control rumdl's overall behavior and apply to all rules and operations.
+
+## Overview
+
+Global settings are configured in the `[global]` section of your configuration file. rumdl supports
+several config file names and locations (`.rumdl.toml`, `rumdl.toml`, `.config/rumdl.toml`, and
+`pyproject.toml`) - see [Configuration Files](configuration/index.md) for the full list and discovery
+order. These settings control file selection, rule enablement, and general linting behavior.
+
+> **Tip:** In `.rumdl.toml`, global keys can also be placed at the top level without a `[global]` section
+> header, similar to [ruff.toml](https://docs.astral.sh/ruff/settings/). If both top-level and `[global]`
+> keys exist, the `[global]` section takes precedence. See [Top-level shorthand](#top-level-shorthand) for
+> details.
+>
+> **Tip:** Any of these settings can also be overridden ad hoc on the command line via
+> `--config 'KEY=VALUE'`. See [CLI `--config` Overrides](cli-config-overrides.md) for the full syntax.
+
+## Quick Reference
+
+| Setting                                   | Type       | Default        | Description                               |
+| ----------------------------------------- | ---------- | -------------- | ----------------------------------------- |
+| [`extends`](#extends)                     | `string`   | not set        | Inherit settings from another config file |
+| [`enable`](#enable)                       | `string[]` | not set        | Enable only specific rules                |
+| [`disable`](#disable)                     | `string[]` | `[]`           | Disable specific rules                    |
+| [`extend-enable`](#extend-enable)         | `string[]` | `[]`           | Additional rules to enable (additive)     |
+| [`extend-disable`](#extend-disable)       | `string[]` | `[]`           | Additional rules to disable (additive)    |
+| [`per-file-ignores`](#per-file-ignores)   | `table`    | `{}`           | Disable specific rules for specific files |
+| [`exclude`](#exclude)                     | `string[]` | `[]`           | Files/directories to exclude              |
+| [`include`](#include)                     | `string[]` | `[]`           | Files/directories to include              |
+| [`respect-gitignore`](#respect-gitignore) | `boolean`  | `true`         | Respect .gitignore files                  |
+| [`line-length`](#line-length)             | `integer`  | `80`           | Default line length for rules             |
+| [`flavor`](#flavor)                       | `string`   | `"standard"`   | Markdown flavor to use                    |
+| [`per-file-flavor`](#per-file-flavor)     | `table`    | `{}`           | Per-file flavor overrides                 |
+| [`output-format`](#output-format)         | `string`   | `"text"`       | Output format for linting results         |
+| [`cache`](#cache)                         | `boolean`  | `true`         | Enable result caching                     |
+| [`cache-dir`](#cache-dir)                 | `string`   | `.rumdl_cache` | Directory for cache files                 |
+| [`editorconfig`](#editorconfig)           | `boolean`  | `false`        | Read settings from `.editorconfig` files  |
+
+## Configuration Examples
+
+### TOML Configuration (`.rumdl.toml`)
+
+```toml
+[global]
+# Disable specific rules
+disable = ["MD013", "MD033"]
+
+# Add opt-in rules on top of defaults (additive)
+extend-enable = ["MD060", "MD063"]
+
+# Exclude files and directories
+exclude = [
+    "node_modules",
+    "build",
+    "dist",
+    "*.tmp.md",
+    "docs/generated/**"
+]
+
+# Include only specific files
+include = [
+    "README.md",
+    "docs/**/*.md",
+    "**/*.markdown"
+]
+
+# Don't respect .gitignore files
+respect-gitignore = false
+
+# Set global line length (used by MD013 and other line-length rules)
+line-length = 120
+
+# Set markdown flavor (standard, gfm, mkdocs, mdx, pandoc, quarto, obsidian, kramdown, azure_devops, myst, hugo, mdg, gh-aw)
+flavor = "mkdocs"
+
+# Per-file flavor overrides (pattern → flavor)
+[per-file-flavor]
+"**/*.mdx" = "mdx"
+"notebooks/**/*.qmd" = "quarto"
+
+# Disable specific rules for specific files
+[per-file-ignores]
+"README.md" = ["MD033"]  # Allow inline HTML in README
+"docs/api/**/*.md" = ["MD013", "MD041"]  # Generated API docs
+"SUMMARY.md" = ["MD025"]  # MkDocs/mdBook table of contents
+```
+
+### pyproject.toml Configuration
+
+```toml
+[tool.rumdl]
+# Global options at root level (both snake_case and kebab-case supported)
+disable = ["MD013", "MD033"]
+extend-enable = ["MD060"]
+exclude = ["node_modules", "build", "dist"]
+include = ["docs/*.md", "README.md"]
+respect-gitignore = true
+line-length = 120
+flavor = "standard"
+
+# Per-file rule ignores (both snake_case and kebab-case supported)
+[tool.rumdl.per-file-ignores]
+"README.md" = ["MD033"]
+"SUMMARY.md" = ["MD025"]
+```
+
+### Top-level shorthand
+
+In `.rumdl.toml`, you can place global keys at the top level without wrapping them in a `[global]` section.
+This is convenient for simple configs and matches the convention used by [ruff.toml](https://docs.astral.sh/ruff/settings/):
+
+```toml
+line-length = 88
+disable = []
+exclude = []
+respect-gitignore = true
+
+[MD004]
+style = "dash"
+
+[MD013]
+line-length = 88
+code_blocks = false
+```
+
+This is equivalent to:
+
+```toml
+[global]
+line-length = 88
+disable = []
+exclude = []
+respect-gitignore = true
+
+[MD004]
+style = "dash"
+
+[MD013]
+line-length = 88
+code_blocks = false
+```
+
+**Precedence:** If the same key appears both at the top level and inside `[global]`, the `[global]` value wins.
+
+**Supported keys:** `enable`, `disable`, `include`, `exclude`, `extend-enable`, `extend-disable`,
+`respect-gitignore`, `force-exclude`, `line-length`, `output-format`, `cache-dir`, `cache`, `fixable`,
+`unfixable`, `flavor`.
+
+**Notes:**
+
+- Table-type settings (`per-file-ignores`, `per-file-flavor`, `code-block-tools`) still require
+  their own section headers. Only scalar and array keys can be placed at the top level.
+- This shorthand is only available in `.rumdl.toml` / `rumdl.toml`. In `pyproject.toml`, use
+  `[tool.rumdl]` as shown in the pyproject.toml example above.
+
+### Rule section names and aliases
+
+Every rule section accepts the rule's name alias as well as its MD number, so you can pick
+whichever reads better. The alias for each rule is listed at the top of its documentation page.
+
+```toml
+# These two sections configure the same rule (MD049)
+[emphasis-style]
+style = "asterisk"
+```
+
+```toml
+[MD049]
+style = "asterisk"
+```
+
+Aliases work in every configuration form: `[emphasis-style]` or `[rules.emphasis-style]` in
+`.rumdl.toml` / `rumdl.toml`, and `[tool.rumdl.emphasis-style]` in `pyproject.toml`. The same
+applies to rule lists such as `enable` and `disable`, which accept `"emphasis-style"` and
+`"MD049"` interchangeably.
+
+## Rule Selection Model
+
+rumdl uses four settings to control which rules are active. These follow the same model as [Ruff's lint rule selection](https://docs.astral.sh/ruff/settings/#lint_select):
+
+| rumdl            | Ruff equivalent | CLI flag    | Behavior                      |
+| ---------------- | --------------- | ----------- | ----------------------------- |
+| `enable`         | `select`        | `--enable`  | Set the enabled rules         |
+| `disable`        | `ignore`        | `--disable` | Set the disabled rules        |
+| `extend-enable`  | `extend-select` | —           | Add rules to the enabled set  |
+| `extend-disable` | `extend-ignore` | —           | Add rules to the disabled set |
+
+### How rules are resolved
+
+1. **Start with the base set.** If `enable` is omitted, the base set is all rules except [opt-in rules](#opt-in-rules). If `enable` is set, only the listed rules form the base set.
+2. **Merge `extend-enable`.** Any rules listed in `extend-enable` are added to the base set. This is the way to activate opt-in rules without replacing the entire default set.
+3. **Apply `disable` and `extend-disable`.** Rules in either list are removed. Disabling always wins over enabling.
+
+Key behaviors:
+
+- **`enable` omitted** — all non-opt-in rules are active (the default)
+- **`enable = []`** (empty list) — *no rules are active*; this is an explicit empty allowlist, not the same as omitting `enable`
+- **`enable = ["ALL"]`** — every rule is active, including opt-in rules
+- **`extend-enable = ["ALL"]`** — every rule is active (same effect as `enable = ["ALL"]`)
+- **`disable = ["all"]`** with no `enable` — no rules are active
+- **Disabling wins** — if a rule appears in both an enable list and a disable list, it is disabled
+
+### Config precedence and merging
+
+rumdl loads configuration from config files
+(with [per-directory resolution](#per-directory-configuration) when available),
+then applies CLI overrides on top.
+When CLI flags overlap with file settings:
+
+- `--enable` and `--disable` **replace** the config file value entirely.
+- `extend-enable` and `extend-disable` (config file only) **merge** additively with the base `enable`/`disable` values.
+
+```bash
+# Config file has disable = ["MD013"]
+# CLI replaces it — only MD033 is disabled, MD013 is re-enabled
+rumdl check --disable MD033 .
+```
+
+To disable MD033 *in addition to* whatever the config file disables, use `extend-disable` in the config file instead of CLI `--disable`.
+
+### Opt-in rules
+
+Some rules are excluded from the default set because they are opinionated, project-specific,
+or may require configuration.
+These rules must be explicitly activated via `extend-enable` or `enable = ["ALL"]`.
+
+Current opt-in rules:
+
+| Rule  | Description                  |
+| ----- | ---------------------------- |
+| MD060 | Table column formatting      |
+| MD063 | Heading capitalization       |
+| MD070 | Nested code fence collision  |
+| MD072 | Frontmatter key sort order   |
+| MD073 | Table of contents validation |
+| MD074 | MkDocs nav validation        |
+| MD080 | Heading anchor collision     |
+| MD082 | No empty sections            |
+
+```toml
+[global]
+extend-enable = ["MD060", "MD063"]
+```
+
+### Common patterns
+
+**Use only a handful of rules (strict allowlist)**:
+
+```toml
+[global]
+enable = ["MD001", "MD003", "MD022", "MD025"]
+```
+
+**Use all defaults but disable a few**:
+
+```toml
+[global]
+disable = ["MD013", "MD033"]
+```
+
+**Use all defaults plus opt-in rules**:
+
+```toml
+[global]
+extend-enable = ["MD060", "MD072"]
+```
+
+**Use every rule including opt-in, minus a few**:
+
+```toml
+[global]
+enable = ["ALL"]
+disable = ["MD013", "MD033"]
+```
+
+## Paths and the Home Directory
+
+Every setting that takes a path or a file pattern - [`extends`](#extends),
+[`exclude`](#exclude), [`include`](#include),
+[`per-file-ignores`](#per-file-ignores), [`per-file-flavor`](#per-file-flavor)
+and [`cache-dir`](#cache-dir) - accepts three forms:
+
+| Form             | Meaning                                      |
+| ---------------- | -------------------------------------------- |
+| `docs/**`        | Relative to the project root                 |
+| `/absolute/path` | That one location on disk                    |
+| `~/path`         | That one location, under your home directory |
+
+A leading `~/` expands to your home directory, so a user-level config
+(`~/.config/rumdl/rumdl.toml`) can name a home path without hardcoding a
+username - useful when that config lives in a dotfiles repository:
+
+```toml
+[global]
+exclude = ["~/.cursor/plans"]
+cache-dir = "~/.cache/rumdl"
+```
+
+Only a leading `~/` (or a bare `~`) is a home reference. `~` is a legal
+filename character elsewhere, so `notes.md~` and `docs/~drafts` stay literal,
+and `~user` is not expanded to another user's home.
+
+Note the difference in reach: an absolute or `~/` pattern matches that one
+location, while a relative pattern matches the name wherever it appears.
+`~/notes` excludes only your home `notes` directory; `notes` excludes every
+project's `notes` directory.
+
+An absolute pattern names a location, not one particular spelling of it. rumdl
+reports every file at its real path, so a pattern that reaches a directory
+through a symlink still speaks for the files there: on macOS, where `/var` is a
+symlink to `/private/var`, `/var/folders/**` and `/private/var/folders/**` match
+the same files. Only the leading literal part of a pattern is resolved this way,
+so a pattern that starts with a wildcard (`/*/folders/**`) has no location to
+resolve and matches the path as written.
+
+## Detailed Settings Reference
+
+### `extends`
+
+**Type**: `string`
+**Default**: not set
+**CLI Equivalent**: None (configuration file only)
+
+Specifies a base configuration file to inherit settings from. The current config file's settings are merged on top of the base config.
+
+This is a **top-level key** (not inside `[global]`).
+
+**In `.rumdl.toml`:**
+
+```toml
+extends = "../base.rumdl.toml"
+
+[global]
+disable = ["MD013"]
+```
+
+**In `pyproject.toml`:**
+
+```toml
+[tool.rumdl]
+extends = "../.rumdl.toml"
+
+[tool.rumdl.global]
+disable = ["MD013"]
+```
+
+**Path Resolution**:
+
+- Environment variables (`$VAR` / `${VAR}`) are expanded first (see [Environment variables](#environment-variables-in-extends) below)
+- Relative paths are resolved relative to the config file's directory (not the working directory)
+- `~/` prefix expands to the user's home directory
+- Absolute paths are used as-is
+- The extended file can be `.rumdl.toml`, `rumdl.toml`, or `pyproject.toml`
+
+#### Environment variables in `extends`
+
+The `extends` path may reference environment variables, which are expanded at config-load
+time before path resolution. This makes a base config that lives at a machine-dependent
+location (for example one delivered by a package manager) portable across machines and CI:
+
+```toml
+# .rumdl.toml in each repo - the base ships inside a package, so its path varies per machine
+extends = "$GEM_PATH/gems/my-style/.rumdl.toml"
+```
+
+Grammar:
+
+- `$VAR` and `${VAR}` expand to the variable's value, where the name matches
+  `[A-Za-z_][A-Za-z0-9_]*`. A bare `$VAR` ends at the first character that is not a letter,
+  digit, or underscore (so `$BASE/base.toml` works); use the `${VAR}` form when the name is
+  immediately followed by an identifier character, e.g. `${BASE}config.toml`.
+- Referencing a variable that is **not set** is a hard error (rumdl will not silently resolve to a different path). The error names the missing variable and the config file.
+- `$$` is a literal `$`. Write `$$` if a real dollar sign is part of the path (e.g. `extends = "weird$$dir/base.toml"`).
+- Replacement values are inserted literally and are not re-scanned for further variables.
+- Use the portable `$VAR` / `${VAR}` syntax on every platform, including Windows (the Windows `%VAR%` syntax is **not** recognized).
+
+> **Note**: rumdl makes no network requests. `extends` resolves to a local file only; there
+> is no remote-URL fetching. To centralize a base config across many repositories, deliver it
+> as a package, git submodule, or shared path and point `extends` at the resulting local file
+> (an environment variable is a convenient way to locate it).
+
+#### What messages about an extended file show
+
+An `extends` value is expanded with environment variables and points at an arbitrary path, so
+errors and warnings about the file it reaches are deliberately narrower than those about a
+config you named yourself:
+
+- The file is identified by the reference **as written** (`'$GEM_PATH/gems/my-style/.rumdl.toml'`)
+  together with the config that declared it, never by the path the variables expanded to.
+  Otherwise a missing base config would print variable values into whatever reads the error,
+  which under CI is the build log.
+- The file's own text is not repeated back. Anything rumdl cannot account for is shown as
+  `<withheld>`: an unrecognized key, section name, rule option, rule name in `enable` and its
+  siblings, glob pattern that does not compile (in `include`, `exclude`, `per-file-ignores` or
+  `per-file-flavor`), or invalid value. A rule reads its options as one section, so a value it
+  cannot read withholds the message about that whole section. The same holds for a value that
+  only fails when something tries to use it, such as a rule option that does not compile as a
+  regular expression or a `code-block-tools` entry naming a tool rumdl has no definition for. An
+  `include` pattern is never quoted, valid or not: the notice for a run that checked nothing says
+  how many of the file's include patterns matched no file rather than listing them. A TOML syntax
+  error is located by line and column without quoting the line. The target need not be a config
+  file at all, and whoever can read it can see the rest.
+- Settings rumdl does recognize are inherited normally. Withholding is a redaction of the entry
+  it names, not a refusal of the file: `enable = ["MD013", "typo-here"]` still enables MD013, and
+  a valid glob still applies beside one that was withheld.
+
+Everything else is unchanged: a config you name directly, on the command line or through
+discovery, is still quoted in full, and output that answers a question about the configuration
+itself still shows resolved paths - `rumdl config`, the language server's startup message to the
+editor that launched it, and `RUST_LOG=debug` logging all report the file an `extends` value
+actually reached.
+
+**Merge Behavior**:
+
+When config B extends config A:
+
+- **Replace fields** (`enable`, `disable`, `line-length`, `flavor`, `exclude`, etc.): B's value replaces A's if B specifies it
+- **Union fields** (`extend-enable`, `extend-disable`): B's values accumulate with A's
+- **Unspecified fields**: A's values are kept
+- **Rule-specific settings**: B's `[MD007]` overrides A's `[MD007]` (per-key)
+
+**Chains**:
+
+Configs can chain: A extends B extends C. The base config is loaded first recursively, then each child merges on top. Maximum chain depth is 10.
+
+**Circular Detection**:
+
+Circular references (A extends B extends A) are detected and produce a clear error.
+
+**Common Patterns**:
+
+**Subdirectory override:**
+
+```toml
+# docs/.rumdl.toml — relaxed rules for documentation
+extends = "../.rumdl.toml"
+
+[global]
+extend-disable = ["MD013"]
+```
+
+**Shared base config:**
+
+```toml
+# .rumdl.toml in each project
+extends = "~/.config/rumdl/base.rumdl.toml"
+
+[global]
+disable = ["MD033"]
+```
+
+### `enable`
+
+**Type**: `string[]`
+**Default**: not set (all rules enabled; `disable` applies normally)
+**CLI Equivalent**: `--enable`
+
+Enables only the specified rules. When this option is set, all other rules are disabled except those explicitly listed.
+
+```toml
+[global]
+enable = ["MD001", "MD003", "MD013", "MD022"]
+```
+
+**Usage Notes**:
+
+- Rule IDs are case-insensitive but conventionally uppercase (e.g., "MD001")
+- `enable = []` (empty list) disables **all** rules — nothing will be linted
+- Omitting `enable` entirely uses the default: all non-opt-in rules enabled, `disable` applied normally
+- `enable = ["ALL"]` explicitly enables every rule including [opt-in rules](#opt-in-rules); `disable` still applies on top
+- If `enable` lists specific rules, only those rules run (subject to `disable` and `extend-disable`)
+- When `enable` is set, `extend-enable` entries are merged into the allowlist
+- To add opt-in rules without replacing the defaults, use [`extend-enable`](#extend-enable) instead
+
+**Example CLI usage**:
+
+```bash
+rumdl check --enable MD001,MD003,MD013 .
+```
+
+### `extend-enable`
+
+**Type**: `string[]`
+**Default**: `[]` (no additional rules)
+**CLI Equivalent**: None (configuration file only)
+
+Adds rules to the enabled set.
+This is the primary way to activate [opt-in rules](#opt-in-rules)
+(MD060, MD063, MD072, MD073, MD074) without replacing the default rule set.
+
+When CLI `--enable` is used, it replaces the config file's `enable` list entirely.
+`extend-enable` in the config file is always additive —
+see [Config precedence and merging](#config-precedence-and-merging).
+
+```toml
+[global]
+extend-enable = ["MD060", "MD063"]
+```
+
+**Usage Notes**:
+
+- `extend-enable = ["ALL"]` enables every rule including opt-in rules (same as `enable = ["ALL"]`)
+- Can be combined with `enable` — when both are set, `extend-enable` entries are merged into the `enable` allowlist
+- Disabling always wins: if a rule appears in both `extend-enable` and `disable`/`extend-disable`, it is disabled
+- Rule IDs are case-insensitive but conventionally uppercase
+
+**Example: Enable opt-in rules alongside defaults**:
+
+```toml
+[global]
+extend-enable = ["MD060", "MD072"]  # Add table formatting and frontmatter key sort
+```
+
+**Example: Combine with disable**:
+
+```toml
+[global]
+extend-enable = ["MD060"]   # Add table formatting
+disable = ["MD013"]          # Remove line length checking
+```
+
+### `disable`
+
+**Type**: `string[]`
+**Default**: `[]` (no rules disabled)
+**CLI Equivalent**: `--disable`
+
+Disables the specified rules. All other rules remain enabled.
+
+```toml
+[global]
+disable = ["MD013", "MD033", "MD041"]
+```
+
+**Usage Notes**:
+
+- Rule IDs are case-insensitive but conventionally uppercase
+- `disable = ["all"]` disables every rule; only rules listed in `enable` (if set) are active
+- Commonly disabled rules include:
+  - `MD013`: Line length (for projects with longer lines)
+  - `MD033`: Inline HTML (for projects that use HTML in Markdown)
+  - `MD041`: First line heading (for files that don't start with headings)
+- Disabling always wins over enabling — if a rule appears in both `enable` and `disable`, it is disabled
+- CLI `--disable` replaces the config file's `disable` list; use [`extend-disable`](#extend-disable) in the config file for values that shouldn't be overridden by CLI
+
+**Example CLI usage**:
+
+```bash
+rumdl check --disable MD013,MD033 .
+```
+
+### `extend-disable`
+
+**Type**: `string[]`
+**Default**: `[]` (no additional rules disabled)
+**CLI Equivalent**: None (configuration file only)
+
+Adds rules to the disabled set. Always merges additively with `disable`, regardless of source.
+Useful for adding disabled rules that survive CLI `--disable` overrides —
+see [Config precedence and merging](#config-precedence-and-merging).
+
+```toml
+[global]
+extend-disable = ["MD033", "MD041"]
+```
+
+**Usage Notes**:
+
+- `extend-disable = ["ALL"]` disables every rule (effectively stops all linting)
+- Disabling always wins over enabling: if a rule appears in both `extend-enable` and `extend-disable`, it is disabled
+- Rule IDs are case-insensitive but conventionally uppercase
+
+**Example: Disable rules that survive CLI overrides**:
+
+```toml
+[global]
+disable = ["MD013"]
+extend-disable = ["MD033"]  # Always disabled, even if --disable overrides the list above
+```
+
+With `rumdl check --disable MD041 .`, the result is: MD013 replaced by MD041 (from CLI), plus MD033 (from `extend-disable`, always additive). Final disabled set: MD041, MD033.
+
+### `per-file-ignores`
+
+**Type**: `table` (file patterns mapped to rule arrays)
+**Default**: `{}` (no per-file ignores)
+**CLI Equivalent**: None (configuration file only)
+
+Disables specific rules for specific files or file patterns. This is useful when certain files have different requirements than the rest of your documentation.
+
+```toml
+[per-file-ignores]
+# Disable inline HTML check for GitHub README (often has badges)
+"README.md" = ["MD033"]
+
+# Disable line length and first-line heading for generated API docs
+"docs/api/**/*.md" = ["MD013", "MD041"]
+
+# Allow multiple top-level headings in table of contents files
+"SUMMARY.md" = ["MD025"]
+"**/TOC.md" = ["MD025"]
+
+# Disable heading style check for legacy documentation
+"docs/legacy/**/*.md" = ["MD003", "MD022"]
+```
+
+**Pattern Syntax**:
+
+Patterns use standard glob syntax:
+
+- `*` matches any characters except path separators
+- `**` matches any characters including path separators (recursive)
+- `?` matches a single character
+- `{a,b}` matches either `a` or `b` (brace expansion)
+
+See [Paths and the Home Directory](#paths-and-the-home-directory) for `~/` and
+absolute patterns.
+
+To match multiple specific files, use **brace expansion**:
+
+```toml
+[per-file-ignores]
+# Match both AGENTS.md and README.md
+"{AGENTS.md,README.md}" = ["MD033"]
+
+# Match multiple directories
+"{docs,guides}/**/*.md" = ["MD013"]
+```
+
+Alternatively, use separate entries (more verbose but equivalent):
+
+```toml
+[per-file-ignores]
+"AGENTS.md" = ["MD033"]
+"README.md" = ["MD033"]
+```
+
+> **Note**: Commas are literal characters in glob patterns. The pattern `"A.md,B.md"` matches a file literally named `A.md,B.md`, not two separate files. Use `"{A.md,B.md}"` to match multiple files.
+
+**Usage Notes**:
+
+- Rule IDs are case-insensitive but conventionally uppercase
+- More specific patterns take precedence over general ones
+- Useful for handling special files like:
+  - `README.md` files (often contain badges, HTML, custom formatting)
+  - Generated documentation (API docs, changelogs)
+  - Table of contents files (`SUMMARY.md`, `TOC.md`)
+  - Legacy or third-party documentation
+- Combines with global `enable`/`disable` settings
+
+**Behavior**:
+
+1. Global rules are applied first
+2. Per-file ignores override global settings for matching files
+3. If a file matches multiple patterns, all ignores are combined
+
+**Example with precedence**:
+
+```toml
+[global]
+disable = ["MD013"]  # Disable line length globally
+
+[per-file-ignores]
+"README.md" = ["MD033", "MD041"]  # Also disable HTML and first-line heading for README
+"docs/**/*.md" = ["MD033"]  # Allow HTML in docs
+```
+
+Result:
+
+- `README.md`: MD013, MD033, MD041 disabled
+- `docs/guide.md`: MD013, MD033 disabled
+- `other.md`: MD013 disabled
+
+**Common Use Cases**:
+
+1. **MkDocs/mdBook Projects**:
+
+    ```toml
+    [per-file-ignores]
+    "SUMMARY.md" = ["MD025"]  # Table of contents has multiple H1 headings
+    ```
+
+2. **GitHub Projects with Badges**:
+
+    ```toml
+    [per-file-ignores]
+    "README.md" = ["MD033", "MD041"]  # Allow HTML badges, may not start with heading
+    ```
+
+3. **Generated Documentation**:
+
+    ```toml
+    [per-file-ignores]
+    "docs/api/**/*.md" = ["MD013", "MD024", "MD041"]  # Relax rules for generated files
+    ```
+
+4. **Mixed Documentation Sources**:
+
+    ```toml
+    [per-file-ignores]
+    "vendor/**/*.md" = ["MD013", "MD033", "MD041"]  # Third-party docs
+    "legacy/**/*.md" = ["MD003", "MD022", "MD032"]  # Old docs with different style
+    ```
+
+5. **Documentation Generators with HTML Links**:
+
+    For documentation generators (mdBook, Jekyll, Hugo) that compile markdown to HTML and place sources in different locations:
+
+    ```toml
+    [per-file-ignores]
+    # mdBook projects - HTML links in book/ point to book/src/*.md sources
+    "book/**/*.md" = ["MD057"]
+
+    # Jekyll projects - HTML links in _posts/ point to generated files
+    "_posts/**/*.md" = ["MD057"]
+    "_docs/**/*.md" = ["MD057"]
+
+    # Hugo projects - HTML links in content/ point to generated files
+    "content/**/*.md" = ["MD057"]
+    ```
+
+    See [MD057 documentation](md057.md#handling-complex-generator-patterns) for more details.
+
+### `exclude`
+
+**Type**: `string[]`
+**Default**: `[]` (no files excluded)
+**CLI Equivalent**: `--exclude`
+
+Specifies files and directories to exclude from linting. Supports glob patterns.
+
+```toml
+[global]
+exclude = [
+    "node_modules",           # Exclude entire directory
+    "build/**",              # Exclude directory and all subdirectories
+    "*.tmp.md",              # Exclude files with specific pattern
+    "docs/generated/**",     # Exclude generated documentation
+    ".git",                  # Exclude version control directory
+    "vendor/",               # Exclude third-party code
+]
+```
+
+**Supported Patterns**:
+
+- `directory/` - Exclude entire directory
+- `**/*.ext` - Exclude all files with extension in any subdirectory
+- `*.pattern` - Exclude files matching pattern in current directory
+- `path/**/file` - Exclude specific files in any subdirectory of path
+- `~/path` - Exclude a path in your home directory
+- `/absolute/path` - Exclude an absolute location
+
+See [Paths and the Home Directory](#paths-and-the-home-directory) for `~/` and
+absolute patterns.
+
+**Usage Notes**:
+
+- Patterns are relative to the project root, unless they are absolute or start with `~/`
+- Exclude patterns are processed before include patterns
+- More specific patterns take precedence over general ones
+- Useful for excluding generated files, dependencies, and temporary files
+
+**Example CLI usage**:
+
+```bash
+rumdl check --exclude "node_modules,build,*.tmp.md" .
+```
+
+### `include`
+
+**Type**: `string[]`
+**Default**: `[]` (all Markdown files included)
+**CLI Equivalent**: `--include`
+
+Specifies files and directories to include in linting. When set, only matching files are processed.
+
+```toml
+[global]
+include = [
+    "README.md",             # Include specific file
+    "docs/**/*.md",          # Include all .md files in docs/
+    "**/*.markdown",         # Include all .markdown files
+    "CHANGELOG.md",          # Include specific files
+    "src/**/*.md",           # Include documentation in source
+    "**/*.md.jinja",         # Include templates with a non-standard extension
+]
+```
+
+See [Paths and the Home Directory](#paths-and-the-home-directory) for `~/` and
+absolute patterns.
+
+**Usage Notes**:
+
+- If `include` is empty, all Markdown files are included (subject to exclude patterns)
+- When `include` is specified, only matching files are processed
+- The language server applies `include` to its background workspace index as well
+  as lint discovery. Files outside the include scope are therefore absent from
+  cross-file features unless they are actively open; open documents remain indexed
+  so in-file navigation and completion continue to work.
+- Combine with `exclude` for fine-grained control
+- Useful for limiting linting to specific documentation areas
+- Patterns that explicitly name an extension (`**/*.md.jinja`) or a literal file name
+  (`templates/NOTES.tmpl`) also pull in files beyond the standard Markdown extensions,
+  matching `--include` behavior. Directory and bare wildcard patterns (`docs/**`, `**/*`)
+  keep the standard extension filter.
+
+**Example CLI usage**:
+
+```bash
+rumdl check --include "docs/**/*.md,README.md" .
+```
+
+### `respect-gitignore`
+
+**Type**: `boolean`
+**Default**: `true`
+**CLI Equivalent**: `--respect-gitignore` / `--respect-gitignore=false`
+
+Controls whether rumdl respects `.gitignore` files when scanning for Markdown files.
+
+```toml
+[global]
+respect-gitignore = true   # Default: respect .gitignore
+# or
+respect-gitignore = false  # Ignore .gitignore files
+```
+
+**Behavior**:
+
+- `true` (default): Files and directories listed in ignore files are automatically excluded
+- `false`: Ignore files are not considered, all Markdown files are scanned
+
+**Supported ignore files**:
+
+- `.gitignore` - Standard Git ignore patterns
+- `.ignore` - Additional ignore patterns (used by ripgrep, fd, and other tools)
+
+Both file types use the same gitignore pattern syntax and are respected at any level in the directory tree.
+
+**Usage Notes**:
+
+- This setting only affects directory scanning, not explicitly provided file paths
+- Useful for linting files that are normally ignored (e.g., generated docs)
+- When disabled, you may need more specific `exclude` patterns
+- Use `.ignore` for rumdl-specific exclusions without affecting Git
+
+**Example CLI usage**:
+
+```bash
+# Don't respect .gitignore files
+rumdl check --respect-gitignore=false .
+```
+
+### `line-length`
+
+**Type**: `integer`
+**Default**: `80`
+**CLI Equivalent**: None (rule-specific only)
+
+Sets the global default line length used by rules that check line length (primarily MD013). Rules can override this value with their own configuration.
+
+```toml
+[global]
+line-length = 120  # Set global line length to 120 characters
+```
+
+**Behavior**:
+
+- Used as the default line length for MD013 and other line-length-related rules
+- Rule-specific configurations override the global setting
+- Useful for projects that want a consistent line length across all line-length rules
+
+**Usage Notes**:
+
+- Must be a positive integer
+- Common values: 80 (traditional), 100 (relaxed), 120 (modern)
+- Individual rules can still override this setting in their own configuration
+- When importing from markdownlint configs, top-level `line-length` is mapped to this setting
+
+**Example with rule override**:
+
+```toml
+[global]
+line-length = 100  # Global default
+
+[MD013]
+line-length = 120  # MD013 uses 120, overriding global setting
+```
+
+### `flavor`
+
+**Type**: `string`
+**Default**: `"standard"`
+**CLI Equivalent**: `--flavor`
+
+Specifies the Markdown flavor to use for parsing and linting. Different flavors have different parsing rules and feature support.
+
+```toml
+[global]
+flavor = "mkdocs"  # Use MkDocs flavor
+```
+
+**Available Flavors**:
+
+- `"standard"` (default): [CommonMark 0.31.2](https://spec.commonmark.org/0.31.2/) + GFM extensions (tables, task lists, strikethrough, autolinks)
+- `"gfm"`: GitHub Flavored Markdown with security-sensitive HTML warnings and extended autolinks
+- `"mkdocs"`: MkDocs-specific extensions (admonitions, content tabs, autorefs, mkdocstrings)
+- `"mdx"`: MDX with JSX components, attributes, expressions, and ESM imports
+- `"pandoc"`: Pandoc Markdown with fenced divs, attributes, citations, and definition lists
+- `"quarto"`: Quarto/RMarkdown for scientific publishing (citations, shortcodes, div blocks)
+- `"obsidian"`: Obsidian notes with callouts, wikilinks, and Dataview syntax
+- `"kramdown"`: Jekyll/kramdown attribute lists and extension blocks
+- `"azure_devops"`: Azure DevOps wikis — treats `:::mermaid` blocks as opaque code fences
+- `"myst"`: MyST/Jupyter Book directives, roles, math, and comments
+- `"hugo"`: Hugo/Goldmark block attribute lists
+- `"mdg"`: Markdown with Gherkin — steers headings, Doc String fences, and Gherkin tables toward the one spelling Gherkin accepts, and withholds corrections that are not safe
+- `"gh-aw"`: GitHub Agentic Workflows — preserves runtime imports, conditionals, and Markdown-looking message templates (preview)
+
+**Aliases**: `"gfm"`, `"commonmark"`, and `"github"` map to `"standard"`; `"qmd"`, `"rmd"`, and `"rmarkdown"` map to `"quarto"`; `"jekyll"` maps to `"kramdown"`; `"azure"` and `"ado"` map to
+`"azure_devops"`; `"mystmd"` maps to `"myst"`; `"goldmark"` maps to `"hugo"`; and `"markdown_with_gherkin"` maps to `"mdg"`
+
+**Behavior**:
+
+- The `standard` flavor is based on CommonMark 0.31.2 with widely-adopted GFM extensions enabled by default
+- Each flavor adjusts specific rule behavior where that system differs from standard Markdown
+- See [Flavors Overview](flavors.md) for detailed rule adjustments per flavor
+
+**Usage Notes**:
+
+- Choose the flavor that matches your documentation system
+- Use `standard` for generic Markdown or when you want the strictest linting
+- Use `gfm` for GitHub-hosted documentation with security-conscious HTML handling
+- Use `mkdocs` for MkDocs or Material for MkDocs projects
+- Use `mdx` for React/Next.js documentation with JSX components
+- Use `quarto` for scientific documents with R/Python code execution
+- Use `azure_devops` (or `azure` / `ado`) for Azure DevOps wiki content with `:::mermaid` blocks
+- Use `mdg` (or `markdown_with_gherkin`) for Markdown with Gherkin; files whose name ends in `.feature.md` are detected automatically
+- Use `gh-aw` for GitHub Agentic Workflow sources; ordinary `.md` files are not auto-detected, so prefer a `.github/workflows/**/*.md` per-file mapping
+
+**Example CLI usage**:
+
+```bash
+# Use MkDocs flavor for linting
+rumdl check --flavor mkdocs docs/
+```
+
+### `per-file-flavor`
+
+**Type**: `table` (file patterns mapped to flavors)
+**Default**: `{}` (no per-file overrides)
+**CLI Equivalent**: None (configuration file only)
+
+Specifies Markdown flavors for specific files or file patterns. This allows different parts of your project to use different Markdown dialects.
+
+```toml
+[per-file-flavor]
+"docs/**/*.md" = "mkdocs"
+"**/*.mdx" = "mdx"
+"**/*.qmd" = "quarto"
+"examples/**/*.md" = "standard"
+".github/workflows/**/*.md" = "gh-aw"
+```
+
+**Available Flavors**:
+
+- `"standard"` (default): Standard Markdown with GFM extensions (tables, task lists, strikethrough)
+- `"gfm"` or `"github"`: Alias for standard (pulldown-cmark already supports GFM)
+- `"commonmark"`: Alias for standard
+- `"mkdocs"`: MkDocs-specific extensions (auto-references, admonitions)
+- `"mdx"`: MDX flavor with JSX and ESM support
+- `"pandoc"`: Pandoc Markdown
+- `"quarto"`: Quarto/RMarkdown for scientific publishing
+- `"obsidian"`: Obsidian notes
+- `"kramdown"` or `"jekyll"`: Jekyll/kramdown content
+- `"azure_devops"`, `"azure"`, or `"ado"`: Azure DevOps wikis
+- `"myst"` or `"mystmd"`: MyST/Jupyter Book content
+- `"hugo"` or `"goldmark"`: Hugo/Goldmark content
+- `"mdg"` or `"markdown_with_gherkin"`: Markdown with Gherkin feature files (`.feature.md`)
+- `"gh-aw"`: GitHub Agentic Workflow sources (`.md`; explicit mapping required)
+
+**Behavior**:
+
+- Uses "first match wins" semantics - order matters in the configuration
+- Patterns are matched against relative paths from the project root
+- Falls back to global `flavor` setting if no pattern matches
+- Falls back to auto-detection by file name if no global flavor is set
+
+**Pattern Syntax**:
+
+- `*` matches any characters except path separators
+- `**` matches any characters including path separators
+- `?` matches a single character
+- Patterns are relative to the project root, unless absolute or starting with
+  `~/` (see [Paths and the Home Directory](#paths-and-the-home-directory))
+
+**Usage Notes**:
+
+- Useful for projects with mixed documentation (e.g., MkDocs site + MDX components)
+- Order patterns from most specific to least specific
+- Auto-detection works for common file names: `.mdx` → MDX, `.qmd`/`.Rmd` → Quarto, and the compound suffix `.feature.md` → MDG; a matching pattern above takes precedence over it
+
+**Example: Mixed Documentation Project**:
+
+```toml
+[global]
+flavor = "standard"  # Default for files not matching any pattern
+
+[per-file-flavor]
+# MkDocs documentation
+"docs/**/*.md" = "mkdocs"
+
+# React components with MDX
+"src/components/**/*.mdx" = "mdx"
+
+# Jupyter/Quarto notebooks
+"notebooks/**/*.qmd" = "quarto"
+
+# Keep README and CHANGELOG as standard
+"README.md" = "standard"
+"CHANGELOG.md" = "standard"
+```
+
+**Example: Monorepo with Multiple Doc Systems**:
+
+```toml
+[per-file-flavor]
+"packages/website/docs/**/*.md" = "mkdocs"
+"packages/storybook/**/*.mdx" = "mdx"
+"packages/api/docs/**/*.md" = "standard"
+```
+
+### `output-format`
+
+**Type**: `string`
+**Default**: `"text"`
+**CLI Equivalent**: `--output-format`
+**Environment Variable**: `RUMDL_OUTPUT_FORMAT`
+
+Specifies the output format for linting results.
+
+```toml
+[global]
+output-format = "github"  # Use GitHub Actions format
+```
+
+**Available Formats**:
+
+- `"text"` (default): One line per warning with file, line, column, rule, and message
+- `"full"`: Source lines with caret underlines highlighting the exact violation location
+- `"concise"`: Minimal output (one line per warning, no brackets)
+- `"grouped"`: Warnings grouped by file with a header per file
+- `"json"`: JSON array of all warnings (collected across files)
+- `"json-lines"`: One JSON object per warning (streaming)
+- `"github"`: GitHub Actions annotation format (`::warning`/`::error`)
+- `"gitlab"`: GitLab Code Quality report (JSON)
+- `"pylint"`: Pylint-compatible format
+- `"azure"`: Azure Pipelines logging commands
+- `"sarif"`: SARIF 2.1.0 for static analysis tools
+- `"junit"`: JUnit XML for CI test reporters
+
+**Precedence**:
+
+1. CLI flag (`--output-format`) wins
+2. Environment variable (`RUMDL_OUTPUT_FORMAT`) overrides config
+3. Config file setting (`output-format`)
+4. Default (`"text"`)
+
+**Usage Notes**:
+
+- Use `github` format in GitHub Actions for inline annotations
+- Use `json` or `sarif` for integration with other tools
+- The environment variable is useful for CI/CD pipelines where you want to override the project config
+
+**Example CLI usage**:
+
+```bash
+# Use GitHub format for Actions
+rumdl check --output-format github .
+
+# Or via environment variable
+RUMDL_OUTPUT_FORMAT=github rumdl check .
+```
+
+**Example GitHub Actions workflow**:
+
+```yaml
+- name: Lint Markdown
+  env:
+    RUMDL_OUTPUT_FORMAT: github
+  run: rumdl check .
+```
+
+### `cache`
+
+**Type**: `boolean`
+**Default**: `true`
+**CLI Equivalent**: `--no-cache` (to disable)
+
+Controls whether rumdl caches linting results to speed up subsequent runs.
+
+```toml
+[global]
+cache = true   # Enable caching (default)
+# or
+cache = false  # Disable caching
+```
+
+**Behavior**:
+
+- `true` (default): Results are cached based on file content hashes
+- `false`: Every run processes all files from scratch
+
+**Usage Notes**:
+
+- Caching significantly speeds up repeated linting of unchanged files
+- Cache is automatically invalidated when file content changes
+- Disable caching during development when debugging rule changes
+- Use `--no-cache` CLI flag for one-time cache bypass without changing config
+
+**Example CLI usage**:
+
+```bash
+# Disable cache for this run only
+rumdl check --no-cache .
+```
+
+### `cache-dir`
+
+**Type**: `string`
+**Default**: `.rumdl_cache`
+**CLI Equivalent**: `--cache-dir`
+**Environment Variable**: `RUMDL_CACHE_DIR`
+
+Specifies the directory where rumdl stores cache files.
+
+```toml
+[global]
+cache-dir = ".rumdl_cache"      # Default location
+# or
+cache-dir = "/tmp/rumdl-cache"  # Custom location
+# or
+cache-dir = "~/.cache/rumdl"    # Shared across projects
+```
+
+See [Paths and the Home Directory](#paths-and-the-home-directory). A relative
+path resolves against the project root.
+
+**Behavior**:
+
+- Cache files are stored in this directory
+- Directory is created automatically if it doesn't exist
+- Each file's cache entry is based on its content hash
+
+**Usage Notes**:
+
+- Default `.rumdl_cache` is relative to the current working directory
+- Use absolute paths for consistent behavior across different working directories
+- Consider adding the cache directory to `.gitignore`
+- Environment variable `RUMDL_CACHE_DIR` can override config file settings
+
+**Example CLI usage**:
+
+```bash
+# Use custom cache directory
+rumdl check --cache-dir /tmp/rumdl-cache .
+
+# Or via environment variable
+RUMDL_CACHE_DIR=/tmp/rumdl-cache rumdl check .
+```
+
+**Adding to .gitignore**:
+
+```gitignore
+# rumdl cache
+.rumdl_cache/
+```
+
+### `editorconfig`
+
+**Type**: `boolean`
+**Default**: `false`
+
+Reads the `.editorconfig` files that apply to each Markdown file and uses the
+properties that have a rumdl equivalent.
+
+```toml
+[global]
+editorconfig = true
+```
+
+**Mapped properties**:
+
+| `.editorconfig` property | rumdl setting    | Notes                                               |
+| ------------------------ | ---------------- | --------------------------------------------------- |
+| `max_line_length`        | `line-length`    | `off` means no limit                                |
+| `indent_size`            | MD007's `indent` | `tab` resolves through `tab_width`; 1-8 spaces only |
+
+**Behavior**:
+
+- A `.editorconfig` value only fills in a setting that no rumdl config sets. A
+  `line-length` in `.rumdl.toml` always wins, whether it is set under `[global]`
+  or on MD013 itself, and so does a `--config` override.
+- Properties are resolved per file, so section globs (`[docs/**.md]`) and nested
+  `.editorconfig` files apply exactly as written.
+- Properties with no rumdl equivalent are reported once, naming the rule whose
+  behavior contradicts them, so you can decide whether to disable that rule:
+  `indent_style = tab` (MD010), `trim_trailing_whitespace = false` (MD009) and
+  `insert_final_newline = false` (MD047).
+- A `.editorconfig` value rumdl cannot use (an unparseable number, an
+  `indent_size` outside 1-8, `indent_size = tab` with no `tab_width`) is
+  reported and ignored rather than guessed at.
+- Both kinds of report are configuration warnings, so `--deny-config-warnings`
+  exits with the tool-error code (2) on them.
+
+**Usage Notes**:
+
+- Because resolution is per file, `rumdl config` cannot show the values a
+  `.editorconfig` supplies; it prints a note saying so when this is enabled.
+- The setting itself is read from your rumdl config, so it is a project-level
+  opt-in: a `.editorconfig` alone never changes rumdl's behavior.
+- `rumdl check --watch` re-runs when an `.editorconfig` it reads changes, the
+  same as for a rumdl config file.
+
+**Example**:
+
+```ini
+# .editorconfig
+root = true
+
+[*.md]
+max_line_length = 100
+indent_size = 4
+```
+
+```toml
+# .rumdl.toml
+[global]
+editorconfig = true
+```
+
+MD013 now allows 100 characters and MD007 expects 4-space list indentation,
+without repeating either value in the rumdl config.
+
+## Per-Directory Configuration
+
+When running `rumdl check .` from the project root, rumdl discovers and applies
+configuration files on a per-directory basis. Files in a subdirectory with their
+own `.rumdl.toml` will use that config instead of the root config.
+
+This follows the same model as [Ruff's per-directory configuration](https://docs.astral.sh/ruff/configuration/#config-file-discovery).
+
+### How it works
+
+1. rumdl identifies the **project root** (the directory containing `.git`)
+2. For each file being linted, rumdl searches from the file's directory upward to the project root for the nearest config file
+3. Files are grouped by their effective config, and each group is linted with its own rules and settings
+
+### Config file search order
+
+At each directory level, rumdl checks for config files in the standard precedence order
+(`.rumdl.toml` > `rumdl.toml` > `.config/rumdl.toml` > `pyproject.toml`, with markdownlint configs as a
+fallback). See [Configuration Files](configuration/index.md) for the complete list, user-level configs,
+and details.
+
+### Subdirectory configs are standalone
+
+Subdirectory configs are **independent** by default — they do not inherit from the root config. To inherit settings from a parent config, use [`extends`](#extends):
+
+```text
+project/
+  .rumdl.toml              # line-length = 80
+  README.md                 # linted with line-length = 80
+  docs/
+    .rumdl.toml             # standalone: only settings in this file apply
+    guide.md                # linted with docs/.rumdl.toml
+    api/
+      endpoint.md           # also linted with docs/.rumdl.toml (walks up to docs/)
+```
+
+To make a subdirectory config inherit from the root:
+
+```toml
+# docs/.rumdl.toml
+extends = "../.rumdl.toml"
+
+[global]
+line-length = 120          # Override just this setting; inherit everything else
+```
+
+### When per-directory resolution is active
+
+Per-directory resolution only activates during **auto-discovery mode**. It is disabled when:
+
+- `--config <file>` is used (the explicit config applies to all files)
+- `--no-config` is used (built-in defaults apply to all files; `--isolated` is still accepted as a compatibility alias)
+- No project root is found (no `.git` directory)
+
+### Example: monorepo with different standards
+
+```text
+monorepo/
+  .rumdl.toml                  # strict defaults for most code
+  docs/
+    .rumdl.toml                # relaxed rules for user-facing docs
+    getting-started.md
+    reference/
+      api.md                   # inherits docs/.rumdl.toml
+  blog/
+    .rumdl.toml                # different style for blog posts
+    2024-01-post.md
+  src/
+    README.md                  # uses root .rumdl.toml (no subdirectory config)
+```
+
+```toml
+# Root .rumdl.toml - strict defaults
+[global]
+line-length = 80
+```
+
+```toml
+# docs/.rumdl.toml - relaxed for documentation
+extends = "../.rumdl.toml"
+
+[global]
+line-length = 120
+extend-disable = ["MD013"]
+```
+
+```toml
+# blog/.rumdl.toml - standalone config for blog
+[global]
+line-length = 100
+disable = ["MD033", "MD041"]
+```
+
+## Configuration Precedence
+
+Settings are applied in the following order (later sources override earlier ones):
+
+1. **Built-in defaults**
+2. **Configuration file** (per-directory `.rumdl.toml` or `pyproject.toml`)
+3. **Command-line arguments**
+
+### Example: Precedence in Action
+
+Given this configuration file:
+
+```toml
+[global]
+disable = ["MD013", "MD033"]
+exclude = ["node_modules", "build"]
+```
+
+And this command:
+
+```bash
+rumdl check --disable MD001,MD013 --exclude "temp/**" docs/
+```
+
+The final configuration will be:
+
+- `disable`: `["MD001", "MD013"]` (CLI overrides file)
+- `exclude`: `["temp/**"]` (CLI overrides file)
+- Paths: `["docs/"]` (CLI argument)
+
+## File Selection Logic
+
+rumdl processes files using the following logic:
+
+1. **Start with candidate files**:
+
+    - If paths are provided via CLI: use those files/directories
+    - Otherwise: recursively scan current directory for `.md` and `.markdown` files
+
+2. **Apply .gitignore filtering** (if `respect-gitignore = true`):
+
+    - Skip files/directories listed in `.gitignore` files
+
+3. **Apply include patterns** (if specified):
+
+    - Keep only files matching at least one include pattern
+
+4. **Apply exclude patterns**:
+
+    - Remove files matching any exclude pattern
+
+5. **Apply rule filtering**:
+
+    - Process remaining files with enabled rules only
+
+### Example: File Selection
+
+Given this configuration:
+
+```toml
+[global]
+include = ["docs/**/*.md", "README.md"]
+exclude = ["docs/temp/**", "*.draft.md"]
+respect-gitignore = true
+```
+
+File selection process:
+
+1. Start with: `docs/guide.md`, `docs/temp/test.md`, `README.md`, `notes.draft.md`
+2. Apply includes: `docs/guide.md`, `docs/temp/test.md`, `README.md` (notes.draft.md excluded)
+3. Apply excludes: `docs/guide.md`, `README.md` (docs/temp/test.md excluded)
+4. Final files: `docs/guide.md`, `README.md`
+
+## Common Configuration Patterns
+
+### Strict Documentation Projects
+
+For projects with strict documentation standards:
+
+```toml
+[global]
+# Enable only essential rules
+enable = [
+    "MD001",  # Heading increment
+    "MD003",  # Heading style
+    "MD022",  # Blanks around headings
+    "MD025",  # Single title
+    "MD032",  # Blanks around lists
+]
+
+# Focus on documentation directories
+include = [
+    "README.md",
+    "CHANGELOG.md",
+    "docs/**/*.md",
+    "guides/**/*.md",
+]
+
+# Set consistent line length for documentation
+line-length = 100
+
+# Exclude generated or temporary content
+exclude = [
+    "node_modules/**",
+    "build/**",
+    "docs/api/**",      # Generated API docs
+    "*.draft.md",       # Draft documents
+]
+```
+
+### Legacy Project Migration
+
+For gradually adopting rumdl in existing projects:
+
+```toml
+[global]
+# Start with basic rules only
+enable = [
+    "MD001",  # Heading increment
+    "MD022",  # Blanks around headings
+    "MD025",  # Single title
+]
+
+# Exclude problematic areas initially
+exclude = [
+    "legacy-docs/**",
+    "third-party/**",
+    "vendor/**",
+]
+
+# Process only main documentation
+include = [
+    "README.md",
+    "docs/user-guide/**/*.md",
+]
+```
+
+### Open Source Projects
+
+For open source projects with community contributions:
+
+```toml
+[global]
+# Disable rules that might be too strict for contributors
+disable = [
+    "MD013",  # Line length (can be restrictive)
+    "MD033",  # Inline HTML (often needed for badges/formatting)
+    "MD041",  # First line heading (README might start with badges)
+]
+
+# Include all documentation but exclude dependencies
+include = ["**/*.md"]
+exclude = [
+    "node_modules/**",
+    "vendor/**",
+    ".git/**",
+    "coverage/**",
+]
+```
+
+### Development Workflow
+
+For active development with frequent documentation changes:
+
+```toml
+[global]
+# Enable rules that help maintain consistency
+enable = [
+    "MD003",  # Heading style
+    "MD004",  # List style
+    "MD022",  # Blanks around headings
+    "MD032",  # Blanks around lists
+    "MD047",  # Single trailing newline
+]
+
+# Include work-in-progress docs but exclude temp files
+include = ["docs/**/*.md", "*.md"]
+exclude = [
+    "*.tmp.md",
+    "*.draft.md",
+    ".backup/**",
+    "node_modules/**",
+]
+
+# Don't respect .gitignore to catch uncommitted docs
+respect-gitignore = false
+```
+
+## Validation and Debugging
+
+### View Effective Configuration
+
+To see how your global settings are applied:
+
+```bash
+# View full effective configuration
+rumdl config
+
+# View only global settings
+rumdl config get global
+
+# View specific global setting
+rumdl config get global.exclude
+```
+
+### Test File Selection
+
+To see which files would be processed:
+
+```bash
+# Dry run with verbose output
+rumdl check --verbose --dry-run .
+
+# Or use a simple script to list files
+find . -name "*.md" -o -name "*.markdown" | head -10
+```
+
+### Common Configuration Issues
+
+1. **No files found**: Check your `include`/`exclude` patterns and `respect-gitignore` setting
+2. **Too many files**: Add more specific `exclude` patterns or limit `include` patterns
+3. **Rules not applying**: Verify rule names in `enable`/`disable` lists (case-insensitive but check spelling)
+4. **Performance issues**: Exclude large directories like `node_modules`, `vendor`, or build outputs
+
+## Integration with CI/CD
+
+### GitHub Actions
+
+```yaml
+- name: Lint Markdown
+  run: |
+    rumdl check --output-format json . > lint-results.json
+    rumdl check .  # Also show human-readable output
+```
+
+### Pre-commit Hook
+
+```yaml
+- repo: https://github.com/rvben/rumdl-pre-commit
+  rev: v0.2.66
+  hooks:
+    - id: rumdl
+      args: [--config=.rumdl.toml]
+```
+
+## See Also
+
+- [Configuration Guide](../README.md#configuration) - Basic configuration setup
+- [Rules Reference](rules.md) - Complete list of available rules
+- [CLI Reference](../README.md#command-line-interface) - Command-line options
+- [Rule-specific Configuration](../README.md#configuration-file-example) - Configuring individual rules
+- [Code Block Tools](code-block-tools.md) - External linters/formatters for code blocks [preview]

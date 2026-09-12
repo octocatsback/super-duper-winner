@@ -1,0 +1,646 @@
+use rumdl_lib::config::Config;
+use rumdl_lib::rules;
+use std::fs;
+use std::io::Write;
+use std::path::Path;
+use std::process::{Command, Stdio};
+use tempfile::tempdir;
+
+fn rumdl_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_rumdl")
+}
+
+/// Run the rumdl binary with `content` piped to stdin, returning normalized
+/// `(stdout, stderr)`. Used to exercise the `--stdin` fix/check pipeline the
+/// way pre-commit hooks and editors drive it.
+fn run_with_stdin(dir: &Path, content: &str, args: &[&str]) -> (String, String) {
+    let mut child = Command::new(rumdl_bin())
+        .current_dir(dir)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(content.as_bytes()).unwrap();
+    let output = child.wait_with_output().unwrap();
+    (
+        String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n"),
+        String::from_utf8_lossy(&output.stderr).replace("\r\n", "\n"),
+    )
+}
+
+#[test]
+fn test_per_file_ignores_integration_actual_linting() {
+    let temp_dir = tempdir().unwrap();
+    let config_path = temp_dir.path().join(".rumdl.toml");
+    let readme_path = temp_dir.path().join("README.md");
+    let docs_path = temp_dir.path().join("docs.md");
+
+    // Create config with per-file-ignores
+    let config_content = r#"
+[per-file-ignores]
+"README.md" = ["MD033"]
+"#;
+    fs::write(&config_path, config_content).unwrap();
+
+    // Create markdown files with HTML (violates MD033)
+    let readme_content = "# Test\n\n<div>HTML content</div>\n";
+    let docs_content = "# Test\n\n<div>HTML content</div>\n";
+    fs::write(&readme_path, readme_content).unwrap();
+    fs::write(&docs_path, docs_content).unwrap();
+
+    // Load config
+    let sourced = rumdl_lib::config::SourcedConfig::load(Some(config_path.to_str().unwrap()), None).unwrap();
+    let config: Config = sourced.into_validated_unchecked().into();
+
+    // Get all rules
+    let all_rules = rules::all_rules(&config);
+
+    // Filter rules for README.md - MD033 should be excluded
+    let ignored_readme = config.get_ignored_rules_for_file(Path::new("README.md"));
+    let readme_rules: Vec<_> = all_rules
+        .iter()
+        .filter(|rule| !ignored_readme.contains(rule.name()))
+        .collect();
+
+    // Filter rules for docs.md - MD033 should be included
+    let ignored_docs = config.get_ignored_rules_for_file(Path::new("docs.md"));
+    let docs_rules: Vec<_> = all_rules
+        .iter()
+        .filter(|rule| !ignored_docs.contains(rule.name()))
+        .collect();
+
+    // Verify README.md rules don't include MD033
+    assert!(!readme_rules.iter().any(|r| r.name() == "MD033"));
+
+    // Verify docs.md rules include MD033
+    assert!(docs_rules.iter().any(|r| r.name() == "MD033"));
+
+    // Lint both files
+    let readme_warnings = rumdl_lib::lint(
+        readme_content,
+        &readme_rules
+            .iter()
+            .map(|r| dyn_clone::clone_box(&***r))
+            .collect::<Vec<_>>(),
+        false,
+        config.markdown_flavor(),
+        None,
+        None,
+    )
+    .unwrap();
+    let docs_warnings = rumdl_lib::lint(
+        docs_content,
+        &docs_rules
+            .iter()
+            .map(|r| dyn_clone::clone_box(&***r))
+            .collect::<Vec<_>>(),
+        false,
+        config.markdown_flavor(),
+        None,
+        None,
+    )
+    .unwrap();
+
+    // README should have no MD033 warnings (rule is ignored)
+    assert!(!readme_warnings.iter().any(|w| w.rule_name.as_deref() == Some("MD033")));
+
+    // docs.md should have MD033 warnings (rule is active)
+    assert!(docs_warnings.iter().any(|w| w.rule_name.as_deref() == Some("MD033")));
+}
+
+#[test]
+fn test_per_file_ignores_combined_with_global_disable() {
+    let temp_dir = tempdir().unwrap();
+    let config_path = temp_dir.path().join(".rumdl.toml");
+
+    // Create config with both global disable and per-file-ignores
+    let config_content = r#"
+[global]
+disable = ["MD013"]
+
+[per-file-ignores]
+"README.md" = ["MD033"]
+"#;
+    fs::write(&config_path, config_content).unwrap();
+
+    // Load config
+    let sourced = rumdl_lib::config::SourcedConfig::load(Some(config_path.to_str().unwrap()), None).unwrap();
+    let config: Config = sourced.into_validated_unchecked().into();
+
+    // Verify config was loaded correctly
+    assert!(config.global.disable.contains(&"MD013".to_string()));
+    assert_eq!(
+        config.per_file_ignores.get("README.md"),
+        Some(&vec!["MD033".to_string()])
+    );
+
+    // For README.md, MD033 should be in per-file ignores
+    let ignored_readme = config.get_ignored_rules_for_file(Path::new("README.md"));
+    assert!(ignored_readme.contains("MD033"));
+    assert_eq!(ignored_readme.len(), 1); // Only MD033, not MD013 (that's in global disable)
+
+    // For other files, per-file ignores should be empty
+    let ignored_other = config.get_ignored_rules_for_file(Path::new("other.md"));
+    assert!(ignored_other.is_empty());
+}
+
+/// Regression test for issue #707: `rumdl fmt` must not apply a rule listed in
+/// `[per-file-ignores]` as a side effect of fixing another (non-ignored) rule.
+///
+/// The bug lived in the fmt pipeline, not in rule filtering: the fix coordinator
+/// was handed the *unfiltered* rule set, so it re-checked and re-fixed every rule
+/// (honoring only global fixable/unfixable and inline disables) - including the
+/// per-file-ignored one. This must be exercised through the real `fmt` binary
+/// because the gap is in which rule set `process_file_with_formatter` passes to
+/// the coordinator; a rule- or config-level test cannot catch it.
+#[test]
+fn test_per_file_ignores_honored_by_fmt_side_effect() {
+    let temp_dir = tempdir().unwrap();
+
+    // Ignore MD004 (list marker style) for everything under slides/.
+    let config_content = r#"
+[per-file-ignores]
+"slides/**/*.md" = ["MD004"]
+"#;
+    fs::write(temp_dir.path().join(".rumdl.toml"), config_content).unwrap();
+
+    // The file has a non-ignored fixable violation (MD032: list not preceded by a
+    // blank line) AND an ignored one (MD004: the nested `*` differs from the `-`
+    // top-level marker). Fixing MD032 must not drag MD004 along.
+    let slides_dir = temp_dir.path().join("slides");
+    fs::create_dir(&slides_dir).unwrap();
+    let deck_path = slides_dir.join("deck.md");
+    fs::write(&deck_path, "# Title\n\ntext\n- parent\n  * child\n").unwrap();
+
+    let output = Command::new(rumdl_bin())
+        .current_dir(temp_dir.path())
+        .args(["fmt", "--no-cache", "slides/deck.md"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    let formatted = fs::read_to_string(&deck_path).unwrap().replace("\r\n", "\n");
+
+    // MD032 (non-ignored) must be fixed: a blank line is inserted before the list.
+    assert!(
+        formatted.contains("text\n\n- parent"),
+        "MD032 should have been fixed (blank line before list), got:\n{formatted}\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    // MD004 (ignored) must NOT be applied: the nested `*` marker is preserved.
+    assert!(
+        formatted.contains("  * child"),
+        "MD004 is in per-file-ignores and must NOT be applied by fmt; the nested `*` \
+         marker was rewritten. Got:\n{formatted}\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !formatted.contains("  - child"),
+        "MD004 was applied as a side effect of the MD032 fix despite per-file-ignores. \
+         Got:\n{formatted}\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    // Full expected output: only MD032 applied, MD004 left untouched.
+    assert_eq!(
+        formatted, "# Title\n\ntext\n\n- parent\n  * child\n",
+        "fmt output should reflect only the non-ignored fix.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+/// Regression test for issue #707 (diff path): `rumdl check --diff` previews the
+/// fixes it *would* apply. That preview must also respect `[per-file-ignores]`,
+/// so an ignored rule never shows up as a proposed change.
+#[test]
+fn test_per_file_ignores_honored_by_fmt_diff() {
+    let temp_dir = tempdir().unwrap();
+    fs::write(
+        temp_dir.path().join(".rumdl.toml"),
+        "[per-file-ignores]\n\"slides/**/*.md\" = [\"MD004\"]\n",
+    )
+    .unwrap();
+    let slides_dir = temp_dir.path().join("slides");
+    fs::create_dir(&slides_dir).unwrap();
+    fs::write(slides_dir.join("deck.md"), "# Title\n\ntext\n- parent\n  * child\n").unwrap();
+
+    let output = Command::new(rumdl_bin())
+        .current_dir(temp_dir.path())
+        .args(["check", "--no-cache", "--diff", "slides/deck.md"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+
+    // The MD032 fix (blank line) is previewed; the MD004 marker rewrite is not.
+    assert!(
+        stdout.contains("* child"),
+        "diff preview must keep the ignored `*` marker, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("- child"),
+        "diff preview proposed the per-file-ignored MD004 rewrite (`*` -> `-`), got:\n{stdout}"
+    );
+}
+
+/// Regression test for issue #707 (stdin path): piping a file's content through
+/// `rumdl check --stdin` must honor `[per-file-ignores]` keyed on `--stdin-filename`,
+/// exactly like linting the file directly. Pre-commit hooks and editors drive rumdl
+/// this way, so an ignored rule must not be reported.
+#[test]
+fn test_per_file_ignores_honored_by_stdin_check() {
+    let temp_dir = tempdir().unwrap();
+    fs::write(
+        temp_dir.path().join(".rumdl.toml"),
+        "[per-file-ignores]\n\"slides/**/*.md\" = [\"MD004\"]\n",
+    )
+    .unwrap();
+
+    let content = "# Title\n\ntext\n- parent\n  * child\n";
+    let (stdout, stderr) = run_with_stdin(
+        temp_dir.path(),
+        content,
+        &["check", "--no-cache", "--stdin", "--stdin-filename", "slides/deck.md"],
+    );
+
+    // The non-ignored MD032 is still reported.
+    assert!(
+        stdout.contains("MD032") || stderr.contains("MD032"),
+        "expected MD032 to be reported via stdin, got stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // MD004 is ignored for slides/**, so it must NOT be reported.
+    assert!(
+        !stdout.contains("MD004") && !stderr.contains("MD004"),
+        "MD004 is in per-file-ignores and must not be reported for stdin content keyed to \
+         slides/deck.md, got stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+/// Regression test for issue #707 (stdin fix path): `rumdl fmt --stdin` writes the
+/// fixed content to stdout and must not apply a per-file-ignored rule.
+#[test]
+fn test_per_file_ignores_honored_by_stdin_fmt() {
+    let temp_dir = tempdir().unwrap();
+    fs::write(
+        temp_dir.path().join(".rumdl.toml"),
+        "[per-file-ignores]\n\"slides/**/*.md\" = [\"MD004\"]\n",
+    )
+    .unwrap();
+
+    let content = "# Title\n\ntext\n- parent\n  * child\n";
+    let (stdout, stderr) = run_with_stdin(
+        temp_dir.path(),
+        content,
+        &["fmt", "--no-cache", "--stdin", "--stdin-filename", "slides/deck.md"],
+    );
+
+    // Only the non-ignored MD032 fix is applied: blank line inserted, `*` preserved.
+    assert_eq!(
+        stdout, "# Title\n\ntext\n\n- parent\n  * child\n",
+        "stdin fmt should apply only the non-ignored fix (MD032) and preserve the ignored \
+         MD004 marker, got stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+/// Test for issue #246: per-file-ignores doesn't work when config is in a subdirectory
+/// and loaded via relative path (e.g., `--config .config/rumdl.toml`)
+#[test]
+fn test_per_file_ignores_config_in_subdirectory() {
+    let temp_dir = tempdir().unwrap();
+
+    // Create .config subdirectory
+    let config_dir = temp_dir.path().join(".config");
+    fs::create_dir(&config_dir).unwrap();
+
+    // Create config file in subdirectory
+    let config_path = config_dir.join("rumdl.toml");
+    let config_content = r#"
+[per-file-ignores]
+"LICENSE.md" = ["MD050"]
+"#;
+    fs::write(&config_path, config_content).unwrap();
+
+    // Create a markdown file that violates MD050
+    let license_path = temp_dir.path().join("LICENSE.md");
+    let license_content = "# License\n\n__Bold text__ with underscore.\n";
+    fs::write(&license_path, license_content).unwrap();
+
+    // Create .git directory to simulate a project root
+    let git_dir = temp_dir.path().join(".git");
+    fs::create_dir(&git_dir).unwrap();
+
+    // Load config using the absolute path (simulating --config .config/rumdl.toml)
+    let sourced = rumdl_lib::config::SourcedConfig::load(Some(config_path.to_str().unwrap()), None).unwrap();
+    let config: Config = sourced.into_validated_unchecked().into();
+
+    // Verify config was loaded with correct project_root
+    assert!(config.project_root.is_some(), "project_root should be set");
+    let project_root = config.project_root.as_ref().unwrap();
+    // The project root should be the directory containing .git, not the .config dir
+    assert!(
+        project_root.ends_with(temp_dir.path().file_name().unwrap()),
+        "project_root should point to temp dir (containing .git), not .config"
+    );
+
+    // Verify per-file-ignores is loaded
+    assert!(
+        config.per_file_ignores.contains_key("LICENSE.md"),
+        "per_file_ignores should contain LICENSE.md"
+    );
+
+    // Test that the rule is actually ignored for LICENSE.md
+    let ignored_rules = config.get_ignored_rules_for_file(&license_path);
+    assert!(
+        ignored_rules.contains("MD050"),
+        "MD050 should be ignored for LICENSE.md, but ignored_rules = {ignored_rules:?}"
+    );
+
+    // Test that other files don't have MD050 ignored
+    let other_path = temp_dir.path().join("README.md");
+    let ignored_rules_other = config.get_ignored_rules_for_file(&other_path);
+    assert!(
+        !ignored_rules_other.contains("MD050"),
+        "MD050 should NOT be ignored for README.md"
+    );
+}
+
+/// Run `rumdl check` in `dir` and return its normalized (stdout, stderr).
+///
+/// The working directory belongs to the subprocess, which is the only way to
+/// exercise a relative `--config` path: changing this process's directory would
+/// leak into every other test sharing the binary.
+fn run_check_output(dir: &Path, args: &[&str]) -> (String, String) {
+    let output = Command::new(rumdl_bin())
+        .current_dir(dir)
+        .arg("check")
+        .arg("--no-cache")
+        .args(args)
+        .output()
+        .unwrap();
+    (
+        String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n"),
+        String::from_utf8_lossy(&output.stderr).replace("\r\n", "\n"),
+    )
+}
+
+/// Run `rumdl check` in `dir` and return its normalized stdout.
+fn run_check(dir: &Path, args: &[&str]) -> String {
+    run_check_output(dir, args).0
+}
+
+/// Whether any reported issue names both this file and this rule.
+fn reports(stdout: &str, file: &str, rule: &str) -> bool {
+    stdout
+        .lines()
+        .any(|line| line.starts_with(file) && line.contains(&format!("[{rule}]")))
+}
+
+/// A relative `--config` path resolves against the working directory, and the
+/// project root derived from it is what per-file-ignores patterns are matched
+/// against. A root that came out empty silently matched nothing.
+#[test]
+fn test_per_file_ignores_with_actual_relative_path() {
+    let temp_dir = tempdir().unwrap();
+
+    // Create .config subdirectory with config file
+    let config_dir = temp_dir.path().join(".config");
+    fs::create_dir(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("rumdl.toml"),
+        r#"
+[per-file-ignores]
+"CHANGELOG.md" = ["MD024"]
+"#,
+    )
+    .unwrap();
+
+    // Create .git directory to mark project root
+    fs::create_dir(temp_dir.path().join(".git")).unwrap();
+
+    // Both files repeat a heading, so MD024 has something to report in each
+    let duplicate_headings = "# Release\n\ntext\n\n## Notes\n\ntext\n\n## Notes\n\ntext\n";
+    fs::write(temp_dir.path().join("CHANGELOG.md"), duplicate_headings).unwrap();
+    fs::write(temp_dir.path().join("NOTES.md"), duplicate_headings).unwrap();
+
+    let stdout = run_check(
+        temp_dir.path(),
+        &["--config", ".config/rumdl.toml", "CHANGELOG.md", "NOTES.md"],
+    );
+
+    assert!(
+        reports(&stdout, "NOTES.md", "MD024"),
+        "MD024 must fire on the file the pattern does not cover. stdout={stdout}"
+    );
+    assert!(
+        !reports(&stdout, "CHANGELOG.md", "MD024"),
+        "MD024 must be ignored for CHANGELOG.md. stdout={stdout}"
+    );
+}
+
+/// The same resolution with a single-component config directory, where the
+/// parent of the relative path is one bare name: walking up from it used to run
+/// out at the empty path instead of reaching the project root.
+#[test]
+fn test_relative_path_with_single_component() {
+    let temp_dir = tempdir().unwrap();
+
+    // Create config directly in a subdirectory (simulating ".config" as the parent)
+    let config_dir = temp_dir.path().join("configs");
+    fs::create_dir(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("lint.toml"),
+        r#"
+[per-file-ignores]
+"docs/*.md" = ["MD013"]
+"#,
+    )
+    .unwrap();
+
+    // Create .git in temp_dir
+    fs::create_dir(temp_dir.path().join(".git")).unwrap();
+
+    // Both files have an over-long line; only the one under docs/ is covered by
+    // the pattern. The duplicate heading is a control: it proves the covered
+    // file was linted rather than skipped.
+    let long_line = "This paragraph is deliberately far longer than the eighty character default so MD013 reports it.";
+    let docs_dir = temp_dir.path().join("docs");
+    fs::create_dir(&docs_dir).unwrap();
+    fs::write(
+        docs_dir.join("README.md"),
+        format!("# Docs\n\n{long_line}\n\n## Notes\n\ntext\n\n## Notes\n\ntext\n"),
+    )
+    .unwrap();
+    fs::write(
+        temp_dir.path().join("TOPLEVEL.md"),
+        format!("# Top level\n\n{long_line}\n"),
+    )
+    .unwrap();
+
+    let stdout = run_check(
+        temp_dir.path(),
+        &["--config", "configs/lint.toml", "docs/README.md", "TOPLEVEL.md"],
+    );
+
+    assert!(
+        reports(&stdout, "TOPLEVEL.md", "MD013"),
+        "MD013 must fire on the file the pattern does not cover. stdout={stdout}"
+    );
+    assert!(
+        reports(&stdout, "docs/README.md", "MD024"),
+        "the covered file must still be linted. stdout={stdout}"
+    );
+    assert!(
+        !reports(&stdout, "docs/README.md", "MD013"),
+        "MD013 must be ignored for docs/README.md via the glob pattern. stdout={stdout}"
+    );
+}
+
+/// An inline `enable` cannot resurrect a rule per-file-ignores excludes: the rule
+/// is dropped before the file is linted. Without a notice that is a silent no-op,
+/// with the reader sent to a config-level `disable` they do not have set.
+#[test]
+fn test_inline_enable_of_per_file_ignored_rule_warns() {
+    let temp_dir = tempdir().unwrap();
+
+    fs::write(
+        temp_dir.path().join("ignored.toml"),
+        r#"
+[per-file-ignores]
+"CHANGELOG.md" = ["MD024"]
+"#,
+    )
+    .unwrap();
+    // The same file under a pattern that does not cover it, as the control.
+    fs::write(
+        temp_dir.path().join("unrelated.toml"),
+        r#"
+[per-file-ignores]
+"OTHER.md" = ["MD024"]
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        temp_dir.path().join("CHANGELOG.md"),
+        "<!-- rumdl-enable MD024 -->\n\n# Release\n\ntext\n\n## Notes\n\ntext\n\n## Notes\n\ntext\n",
+    )
+    .unwrap();
+
+    let (stdout, stderr) = run_check_output(temp_dir.path(), &["--config", "ignored.toml", "CHANGELOG.md"]);
+    assert!(
+        stderr.contains("Rule MD024 is ignored for this file by per-file-ignores"),
+        "the notice must name per-file-ignores. stderr={stderr}"
+    );
+    assert!(
+        !reports(&stdout, "CHANGELOG.md", "MD024"),
+        "the enable must remain a no-op. stdout={stdout}"
+    );
+
+    let (control_stdout, control_stderr) =
+        run_check_output(temp_dir.path(), &["--config", "unrelated.toml", "CHANGELOG.md"]);
+    assert!(
+        !control_stderr.contains("has no effect"),
+        "a pattern that does not cover the file must not warn. stderr={control_stderr}"
+    );
+    assert!(
+        reports(&control_stdout, "CHANGELOG.md", "MD024"),
+        "the control must show MD024 running. stdout={control_stdout}"
+    );
+}
+
+/// The notice is a config problem, so `--deny-config-warnings` must fail the run
+/// on it, the same as for a config-disabled rule.
+#[test]
+fn test_inline_enable_of_per_file_ignored_rule_denies() {
+    let temp_dir = tempdir().unwrap();
+
+    fs::write(
+        temp_dir.path().join("ignored.toml"),
+        r#"
+[per-file-ignores]
+"clean.md" = ["MD024"]
+"#,
+    )
+    .unwrap();
+    fs::write(
+        temp_dir.path().join("clean.md"),
+        "<!-- rumdl-enable MD024 -->\n\n# Release\n\ntext\n",
+    )
+    .unwrap();
+
+    let deny = Command::new(rumdl_bin())
+        .current_dir(temp_dir.path())
+        .args([
+            "check",
+            "--no-cache",
+            "--deny-config-warnings",
+            "--config",
+            "ignored.toml",
+            "clean.md",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        deny.status.code(),
+        Some(2),
+        "a no-effect enable must be a tool error under the flag. stderr={}",
+        String::from_utf8_lossy(&deny.stderr)
+    );
+
+    // Without the flag the same file is clean, so the notice alone does not
+    // decide the exit code.
+    let plain = Command::new(rumdl_bin())
+        .current_dir(temp_dir.path())
+        .args(["check", "--no-cache", "--config", "ignored.toml", "clean.md"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        plain.status.code(),
+        Some(0),
+        "the notice must stay non-fatal by default. stderr={}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+}
+
+/// `per-file-ignores` decides what a file reports, not what the workspace knows
+/// about it. A target that ignores MD051 still has to contribute its headings,
+/// or a link pointing at one of them reports as broken from a file that never
+/// named the rule - a false positive whose cause is written in another file's
+/// configuration.
+#[test]
+fn test_per_file_ignores_on_a_target_keeps_its_headings_indexed() {
+    let temp_dir = tempdir().unwrap();
+
+    fs::write(
+        temp_dir.path().join(".rumdl.toml"),
+        r#"
+[per-file-ignores]
+"target.md" = ["MD051"]
+"#,
+    )
+    .unwrap();
+    fs::write(temp_dir.path().join("target.md"), "# Real\n").unwrap();
+    fs::write(
+        temp_dir.path().join("source.md"),
+        "# Source\n\n[valid](target.md#real)\n\n[broken](target.md#missing)\n",
+    )
+    .unwrap();
+
+    let stdout = run_check(temp_dir.path(), &["."]);
+
+    assert!(
+        !stdout.contains("'real' not found"),
+        "the anchor target.md does have must resolve. stdout={stdout}"
+    );
+    // The positive control: MD051 is still running for source.md, so the absence
+    // above is the fragment resolving rather than the check declining to look.
+    assert!(
+        stdout.contains("'missing' not found"),
+        "a fragment target.md does not have must still report. stdout={stdout}"
+    );
+    // And the ignore itself still holds for the file that named it: target.md's
+    // own MD051 findings stay out of the report.
+    assert!(
+        !reports(&stdout, "target.md", "MD051"),
+        "target.md must report no MD051 of its own. stdout={stdout}"
+    );
+}

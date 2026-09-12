@@ -1,0 +1,1258 @@
+name: Release
+
+on:
+  push:
+    tags:
+      # Only match semver tags like v0.0.191, not major version tags like v0
+      - 'v[0-9]*.[0-9]*.[0-9]*'
+  # Manual trigger for testing and recovery scenarios
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run mode (skip actual publishing)'
+        required: false
+        default: true
+        type: boolean
+      skip_crates_io:
+        description: 'Skip publishing to crates.io (if already published)'
+        required: false
+        default: false
+        type: boolean
+      skip_pypi:
+        description: 'Skip publishing to PyPI (if already published)'
+        required: false
+        default: false
+        type: boolean
+      skip_npm:
+        description: 'Skip publishing to npm (if already published)'
+        required: false
+        default: false
+        type: boolean
+      skip_winget:
+        description: 'Skip submitting the Windows Package Manager manifest update'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Run tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      # Toolchain setup
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.8.14 # upd: github-releases jdx/mise
+          experimental: true
+          install: false
+
+      # Prebuilt cargo-binstall so mise does not compile it from source
+      # before it can binstall anything; see the Test job in ci.yml.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-binstall
+
+      - name: Install mise tools
+        # What `make lint` and `make test-ci` run: the toolchain, nextest,
+        # python for check-versions, actionlint and uv (for zizmor).
+        run: ./scripts/mise-install.sh rust python uv actionlint "cargo:cargo-binstall" "cargo:cargo-nextest"
+
+      - name: Install Rust components
+        run: rustup component add rustfmt clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-test
+
+      - name: Run linting
+        run: make lint
+
+      - name: Run tests
+        run: |
+          # Use fast CI-optimized tests
+          if command -v cargo-nextest >/dev/null 2>&1; then
+            make test-ci
+          else
+            make test
+          fi
+
+  build:
+    name: Build ${{ matrix.target }}
+    # No `needs: test` on purpose: the build matrix runs concurrently with the
+    # test job instead of waiting for it, keeping the ~12m suite off the
+    # critical path. Publishing is still gated on tests via the `release` job's
+    # `needs`, so untested code can never be published. A failing test at most
+    # wastes already-spent build minutes.
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          # Linux glibc targets (manylinux wheels for standard Linux)
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            # Set jemalloc page size explicitly for zig cross-compilation
+            jemalloc_page_size: '12'
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            # Configure jemalloc for 64K pages to support 16K page systems (Asahi Linux, RPi5)
+            # See: https://github.com/rvben/rumdl/issues/256
+            jemalloc_page_size: '16'
+          # Linux musl targets (static binaries for Alpine Linux)
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            # Set jemalloc page size explicitly for zig cross-compilation
+            jemalloc_page_size: '12'
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            jemalloc_page_size: '16'
+          # Windows and macOS targets
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            # Set jemalloc page size explicitly
+            jemalloc_page_size: '12'
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            # Apple Silicon uses 16K pages
+            jemalloc_page_size: '14'
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      # Toolchain setup (mise installs rust, python, maturin, etc.)
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.8.14 # upd: github-releases jdx/mise
+          experimental: false  # Use stable releases only
+          install: false
+
+      # Install only build-required tools (skip nextest, watch, etc.). uv is
+      # required because maturin is a pipx-backend tool (a prebuilt PyPI wheel
+      # installed via `uv tool install`) rather than a compiled cargo: tool.
+      # zig + cargo-zigbuild are only needed for cross-compiled Linux targets;
+      # the mise registry's `core:zig@0.13.0` download is currently broken on
+      # Windows and macOS runners, so we omit it on platforms that never use it.
+      #
+      # The prebuilt cargo-binstall comes first so mise does not compile it
+      # from source before it can binstall cargo-zigbuild; see the Test job
+      # in ci.yml.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-binstall
+
+      - name: Install mise tools
+        shell: bash
+        run: |
+          tools=(rust python uv pipx:maturin)
+          case "${{ matrix.target }}" in
+            # cargo-binstall is the cargo backend's install dependency. mise
+            # resolves it only when it is named in the requested set, and
+            # reports the shortfall as an offline failure, so it travels with
+            # every cargo: tool added here.
+            *-linux-*) tools+=(cargo:cargo-binstall cargo:cargo-zigbuild zig) ;;
+          esac
+          ./scripts/mise-install.sh "${tools[@]}"
+
+      - name: Put the installed tools ahead of the mise shims on PATH
+        # The build steps below call maturin, cargo and zig directly rather
+        # than through `mise exec`, for two reasons. `mise exec` installs
+        # every tool in .mise.toml that is missing before it runs the
+        # command, and with a cargo-binstall on PATH it now does so for real:
+        # seven cargo: tools this job never uses, one of which (cargo-edit)
+        # has no prebuilt binary for the runner and compiles from source,
+        # eight minutes on Windows. And on Windows with mise 2026.8.x,
+        # rust-cache's silent toolchain probes take 16 minutes when rustc,
+        # rustup and cargo resolve to mise shims (5 seconds on mise
+        # 2025.8.18). The tools' real bin directories ahead of the shims
+        # take both out of every later step; rust-toolchain.toml keeps the
+        # toolchain pinned for the bare rustup proxies. See the Windows job
+        # in ci.yml.
+        shell: bash
+        run: mise bin-paths >> "$GITHUB_PATH"
+
+      # Verify zig installation on Linux only
+      - name: Verify zig installation
+        if: matrix.os == 'ubuntu-latest'
+        run: zig version || echo "Zig verification failed"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Install rust target for cross-compilation
+      - name: Install Rust target
+        # Runner images may ship a partially-installed toolchain whose
+        # binaries conflict with rustup when it installs the toolchain
+        # pinned by rust-toolchain.toml. Remove any stale install first so
+        # rustup can lay down the pinned toolchain cleanly alongside the
+        # requested target.
+        shell: bash
+        run: |
+          pinned=$(awk -F '"' '/^channel/ { print $2 }' rust-toolchain.toml)
+          rustup toolchain uninstall "$pinned" >/dev/null 2>&1 || true
+          rustup target add ${{ matrix.target }}
+
+      # Build wheel
+      - name: Build wheel
+        env:
+          # Set jemalloc page size for aarch64-linux to support 16K page systems
+          JEMALLOC_SYS_WITH_LG_PAGE: ${{ matrix.jemalloc_page_size }}
+        run: |
+          case "${{ matrix.target }}" in
+            *-musl)
+              # Use musllinux_1_2 with zig for static Linux binaries (Alpine)
+              maturin build --release --target ${{ matrix.target }} --compatibility musllinux_1_2 --zig
+              ;;
+            *-gnu)
+              # Use manylinux_2_28 for standard glibc Linux distributions
+              # (manylinux2014 doesn't support newer glibc symbols like __cxa_thread_atexit_impl)
+              maturin build --release --target ${{ matrix.target }} --compatibility manylinux_2_28 --zig
+              ;;
+            *)
+              # Native compilation for Windows and macOS
+              maturin build --release --target ${{ matrix.target }}
+              ;;
+          esac
+        shell: bash
+
+      # Build binary
+      - name: Build binary
+        env:
+          # Set jemalloc page size for aarch64-linux to support 16K page systems
+          JEMALLOC_SYS_WITH_LG_PAGE: ${{ matrix.jemalloc_page_size }}
+        run: |
+          case "${{ matrix.target }}" in
+            *-linux-*)
+              # Use cargo-zigbuild for all Linux builds (both musl and gnu).
+              # cargo-zigbuild is already installed via mise above, so there is
+              # no separate `cargo install` here (which would recompile it from
+              # source on every job).
+              cargo zigbuild --release --target ${{ matrix.target }} --bin rumdl
+              ;;
+            *)
+              # Native compilation for Windows and macOS
+              cargo build --release --target ${{ matrix.target }} --bin rumdl
+              ;;
+          esac
+        shell: bash
+
+      # Smoketest: verify binary runs (skip cross-compiled aarch64-linux)
+      - name: Verify binary
+        if: ${{ !contains(matrix.target, 'aarch64-unknown-linux') }}
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            ./target/${{ matrix.target }}/release/rumdl.exe --version
+          else
+            ./target/${{ matrix.target }}/release/rumdl --version
+          fi
+        shell: bash
+
+      # Create release archives
+      - name: Create release archives
+        run: |
+          # Extract version from ref (e.g., refs/tags/v0.0.97 -> v0.0.97)
+          VERSION=${GITHUB_REF#refs/tags/}
+
+          # Create directory structure for archive
+          mkdir -p release-package
+
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            # Windows: Create a zip archive
+            cp "target/${{ matrix.target }}/release/rumdl.exe" release-package/rumdl.exe
+
+            # Create zip archive (using PowerShell via bash)
+            cd release-package
+            powershell -command "Compress-Archive -Path rumdl.exe -DestinationPath ../rumdl-${VERSION}-${{ matrix.target }}.zip"
+            cd ..
+
+            # Calculate SHA256 for zip
+            powershell -command "Get-FileHash -Path 'rumdl-${VERSION}-${{ matrix.target }}.zip' -Algorithm SHA256 | Select-Object -ExpandProperty Hash" > "rumdl-${VERSION}-${{ matrix.target }}.zip.sha256"
+          else
+            # Unix: Create tar.gz archive
+            cp "target/${{ matrix.target }}/release/rumdl" release-package/rumdl
+
+            # Create tar.gz archive
+            tar -czf "rumdl-${VERSION}-${{ matrix.target }}.tar.gz" -C release-package rumdl
+
+            # Calculate SHA256
+            if [[ "${{ runner.os }}" == "macOS" ]]; then
+              shasum -a 256 "rumdl-${VERSION}-${{ matrix.target }}.tar.gz" > "rumdl-${VERSION}-${{ matrix.target }}.tar.gz.sha256"
+            else
+              sha256sum "rumdl-${VERSION}-${{ matrix.target }}.tar.gz" > "rumdl-${VERSION}-${{ matrix.target }}.tar.gz.sha256"
+            fi
+          fi
+
+          # Clean up
+          rm -rf release-package
+        shell: bash
+
+      # Upload artifacts
+      - name: Upload wheel
+        uses: actions/upload-artifact@v6
+        with:
+          path: target/wheels/*
+          name: wheel-${{ matrix.target }}
+
+      - name: Upload release archives
+        uses: actions/upload-artifact@v6
+        with:
+          path: |
+            rumdl-*-${{ matrix.target }}.tar.gz*
+            rumdl-*-${{ matrix.target }}.zip*
+          name: release-${{ matrix.target }}
+
+  sdist:
+    runs-on: ubuntu-latest
+    # Runs concurrently with `test`; publishing stays gated on `test` via `release`.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.8.14 # upd: github-releases jdx/mise
+          experimental: true
+          install: false
+      - name: Install mise tools
+        # uv is required for the pipx-backend maturin (prebuilt wheel) install.
+        run: ./scripts/mise-install.sh rust python uv pipx:maturin
+      - name: Put the installed tools on PATH
+        # Called directly rather than through `mise exec`, which first
+        # installs every tool in .mise.toml that is missing: zig, actionlint
+        # and eight cargo: tools, cargo-binstall compiled from source among
+        # them. Six minutes for a source distribution that takes seconds.
+        run: mise bin-paths >> "$GITHUB_PATH"
+      - name: Build source distribution
+        run: maturin sdist
+      - uses: actions/upload-artifact@v6
+        with:
+          path: target/wheels/*.tar.gz
+          name: sdist
+
+  build-wasm:
+    name: Build WASM
+    # Runs concurrently with `test`; publishing stays gated on `test` via `release`.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@wasm-pack
+
+      - name: Build WASM
+        run: make build-wasm
+
+      - name: Prepare package
+        run: |
+          cp wasm-pkg/README.md pkg/
+          cp LICENSE pkg/
+          jq -s '.[0] * .[1]' pkg/package.json wasm-pkg/package.json.tmpl > pkg/package.json.new
+          mv pkg/package.json.new pkg/package.json
+
+      - name: Upload WASM artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: wasm-pkg
+          path: pkg/
+
+  test-python-package:
+    name: Test Python Package (${{ matrix.os }})
+    needs: build
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            wheel-path: "*wheel-x86_64-unknown-linux-gnu/*.whl"
+          - os: macos-latest
+            wheel-path: "*wheel-aarch64-apple-darwin/*.whl"
+          - os: windows-latest
+            wheel-path: "*wheel-x86_64-pc-windows-*/*.whl"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: false
+
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: wheel-*
+          path: wheels
+
+      - name: Find and install wheel
+        shell: bash
+        run: |
+          # Find the appropriate wheel by matching the artifact directory path
+          WHEEL=$(find wheels -path "${{ matrix.wheel-path }}" -type f | head -1)
+          if [ -z "$WHEEL" ]; then
+            echo "ERROR: No wheel found matching path pattern ${{ matrix.wheel-path }}"
+            echo "Available wheels:"
+            find wheels -name "*.whl" -type f
+            exit 1
+          fi
+          echo "Installing wheel: $WHEEL"
+          # Create and use a virtual environment
+          uv venv .venv
+          uv pip install --python .venv "$WHEEL"
+
+      - name: Test Python import and version
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            source .venv/Scripts/activate
+          else
+            source .venv/bin/activate
+          fi
+          python -c "import rumdl; print(f'Imported rumdl {rumdl.__version__}')"
+
+      - name: Verify version matches Cargo.toml
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            source .venv/Scripts/activate
+          else
+            source .venv/bin/activate
+          fi
+          CARGO_VERSION=$(grep '^version =' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          PYTHON_VERSION=$(python -c "import rumdl; print(rumdl.__version__)")
+          if [ "$CARGO_VERSION" != "$PYTHON_VERSION" ]; then
+            echo "❌ ERROR: Version mismatch! Cargo.toml=$CARGO_VERSION, Python=$PYTHON_VERSION"
+            exit 1
+          fi
+          echo "✅ Versions match: $CARGO_VERSION"
+
+      - name: Test rumdl binary works
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            source .venv/Scripts/activate
+          else
+            source .venv/bin/activate
+          fi
+          echo "# Test" > test.md
+          rumdl --version
+          rumdl check test.md
+          echo "✅ Binary works correctly"
+
+  build-npm-cli:
+    name: Build npm CLI packages
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Download release archives
+        uses: actions/download-artifact@v7
+        with:
+          pattern: release-*
+          path: archives
+
+      - name: Prepare npm packages
+        run: |
+          # Extract version from ref (e.g., refs/tags/v0.0.97 -> 0.0.97)
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "Version: $VERSION"
+
+          # Update versions in all package.json files
+          for pkg in npm/cli-*/package.json npm/rumdl/package.json; do
+            jq --arg v "$VERSION" '.version = $v' "$pkg" > tmp.json && mv tmp.json "$pkg"
+          done
+
+          # Update optionalDependencies in main package
+          jq --arg v "$VERSION" '.optionalDependencies |= with_entries(.value = $v)' \
+            npm/rumdl/package.json > tmp.json && mv tmp.json npm/rumdl/package.json
+
+          # Extract binaries to platform packages
+          # macOS
+          tar -xzf archives/release-x86_64-apple-darwin/rumdl-*.tar.gz -C npm/cli-darwin-x64/
+          tar -xzf archives/release-aarch64-apple-darwin/rumdl-*.tar.gz -C npm/cli-darwin-arm64/
+
+          # Linux glibc
+          tar -xzf archives/release-x86_64-unknown-linux-gnu/rumdl-*.tar.gz -C npm/cli-linux-x64/
+          tar -xzf archives/release-aarch64-unknown-linux-gnu/rumdl-*.tar.gz -C npm/cli-linux-arm64/
+
+          # Linux musl
+          tar -xzf archives/release-x86_64-unknown-linux-musl/rumdl-*.tar.gz -C npm/cli-linux-x64-musl/
+          tar -xzf archives/release-aarch64-unknown-linux-musl/rumdl-*.tar.gz -C npm/cli-linux-arm64-musl/
+
+          # Windows
+          unzip -o archives/release-x86_64-pc-windows-msvc/rumdl-*.zip -d npm/cli-win32-x64/
+
+          # The executable bit is intentionally NOT set here: actions/upload-artifact
+          # strips Unix permission bits, so any chmod in this job is lost on download.
+          # The binaries are made executable in the publish job, after the artifact is
+          # fetched and immediately before `npm publish` (see "Make CLI binaries
+          # executable"). npm publish preserves file modes, so a 0644 binary would ship
+          # non-executable and fail to spawn with EACCES on fresh installs (rumdl-vscode#135).
+
+          # List package contents for verification
+          echo "Package contents:"
+          for dir in npm/cli-*/; do
+            echo "  $dir:"
+            ls -la "$dir"
+          done
+
+      - name: Upload npm packages artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: npm-cli-packages
+          path: npm/
+
+  test-npm-cli:
+    name: Test npm CLI (${{ matrix.os }})
+    needs: build-npm-cli
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform-pkg: cli-linux-x64
+          - os: macos-latest
+            platform-pkg: cli-darwin-arm64
+          - os: macos-15-intel
+            platform-pkg: cli-darwin-x64
+          - os: windows-latest
+            platform-pkg: cli-win32-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Download npm packages
+        uses: actions/download-artifact@v7
+        with:
+          name: npm-cli-packages
+          path: npm
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+
+      - name: Install packages locally
+        shell: bash
+        run: |
+          # Create test directory
+          mkdir test-install
+          cd test-install
+
+          # Initialize package.json
+          npm init -y
+
+          # Install platform package first (local file)
+          npm install ../npm/${{ matrix.platform-pkg }}
+
+          # Install main package (local file)
+          npm install ../npm/rumdl
+
+      - name: Test rumdl binary
+        shell: bash
+        run: |
+          cd test-install
+
+          echo "# Test Heading" > test.md
+          echo "" >> test.md
+          echo "This is a test." >> test.md
+
+          # Test version
+          npx rumdl --version
+          # Test linting
+          npx rumdl check test.md
+
+          echo "✅ npm CLI package works correctly"
+
+  test-npm-cli-musl:
+    name: Test npm CLI (linux-musl)
+    needs: build-npm-cli
+    runs-on: ubuntu-latest
+    container: node:24-alpine
+    permissions:
+      contents: read
+    steps:
+      - name: Download npm packages
+        uses: actions/download-artifact@v7
+        with:
+          name: npm-cli-packages
+          path: npm
+
+      - name: Install packages locally
+        shell: sh
+        run: |
+          mkdir test-install
+          cd test-install
+          npm init -y
+          npm install ../npm/cli-linux-x64-musl
+          npm install ../npm/rumdl
+
+      - name: Test rumdl binary
+        shell: sh
+        run: |
+          cd test-install
+          printf '# Test Heading\n\nThis is a test.\n' > test.md
+          npx rumdl --version
+          npx rumdl check test.md
+          echo "✅ npm CLI package works correctly"
+
+  release:
+    runs-on: ubuntu-latest
+    # `test` is a dependency here (rather than a gate on the build jobs) so the
+    # suite runs in parallel with the build matrix while still blocking every
+    # publish step below.
+    needs: [test, build, sdist, test-python-package, build-wasm, test-npm-cli, test-npm-cli-musl]
+    permissions:
+      contents: write       # Create GitHub release + update major version tag
+      id-token: write       # npm OIDC trusted publishing + Sigstore attestations
+      attestations: write   # Generate build provenance attestations
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.8.14 # upd: github-releases jdx/mise
+          experimental: true
+          install: false
+
+      - name: Install mise tools
+        # The publish job only needs the Rust toolchain (`cargo publish`) and uv
+        # (`uv publish`, for the PyPI upload). Installing the full dev toolchain
+        # here spent ~4 minutes compiling cargo tools (nextest, watch, zigbuild,
+        # lychee, ...) that this job never invokes, so install only what it
+        # uses. node comes from setup-node below, not mise.
+        run: ./scripts/mise-install.sh rust python uv
+
+      # Exchange this job's GitHub OIDC identity for a short-lived crates.io
+      # token. This is the only crates.io credential the release carries: the
+      # crate is registered for Trusted Publishing (rvben/rumdl, release.yml, no
+      # environment) and requires it for every new version, so there is no
+      # long-lived token to expire or rotate between releases and reveal itself
+      # as a 403 after the tag is already pushed. The action's post step revokes
+      # the token when the job ends, and a failure here fails the release at
+      # this step, before anything is uploaded.
+      #
+      # Pinned to an exact tag deliberately: rust-lang/crates-io-auth-action
+      # publishes only v1.0.x tags and has no floating `v1`, so the `@v1` its
+      # README shows does not resolve and fails the release at this step.
+      - name: Authenticate to crates.io via Trusted Publishing
+        id: crates_auth
+        if: ${{ inputs.dry_run != true && inputs.skip_crates_io != true }}
+        uses: rust-lang/crates-io-auth-action@v1.0.5
+
+      - name: Publish to crates.io
+        if: ${{ inputs.dry_run != true && inputs.skip_crates_io != true }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates_auth.outputs.token }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::error::Trusted Publishing produced no crates.io token."
+            exit 1
+          fi
+          if ! output=$(cargo publish --locked 2>&1); then
+            # crates.io rejects a re-upload with "crate version `X` is already
+            # uploaded" (its duplicate_version_error). This used to match on
+            # "already exists", which the registry never emits, so the skip
+            # never fired and re-running a release after a later step failed
+            # died here on a crate that was already published.
+            if echo "$output" | grep -q "already uploaded"; then
+              echo "⏭️ Crate already published to crates.io, skipping"
+            else
+              echo "$output"
+              exit 1
+            fi
+          fi
+
+      - name: Test crates.io publish (dry run)
+        if: ${{ inputs.dry_run == true && inputs.skip_crates_io != true }}
+        run: |
+          echo "DRY RUN: Would publish to crates.io"
+          cargo publish --dry-run --locked
+
+      - name: Skip crates.io publishing
+        if: ${{ inputs.skip_crates_io == true }}
+        run: echo "⏭️ Skipping crates.io publishing as requested"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+
+      - name: Attest build provenance for wheels, sdist, and release archives
+        if: ${{ inputs.dry_run != true }}
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            artifacts/wheel-*/*.whl
+            artifacts/sdist/*.tar.gz
+            artifacts/release-*/rumdl-*.tar.gz
+            artifacts/release-*/rumdl-*.zip
+
+      - name: Publish to PyPI
+        if: ${{ inputs.dry_run != true && inputs.skip_pypi != true }}
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          # Upload only Python packages (wheels and sdist), not Homebrew archives.
+          # --check-url skips a file only when its bytes already exist on PyPI, so
+          # re-running the publish job with the SAME artifacts is idempotent. A
+          # re-run that REBUILT the artifacts produces different bytes (Rust
+          # builds are not reproducible), uv then attempts the upload, and PyPI
+          # rejects the filename collision with "400 File already exists".
+          # Publish per file and tolerate that rejection, the way the crates.io
+          # and npm steps do, so a re-run keeps going and still uploads any file
+          # PyPI does not have yet. PyPI keeps the first upload of a filename.
+          status=0
+          for f in artifacts/wheel-*/*.whl artifacts/sdist/*.tar.gz; do
+            if output=$(uv publish --check-url https://pypi.org/simple/rumdl/ "$f" 2>&1); then
+              echo "$output"
+            elif echo "$output" | grep -qi "already exists"; then
+              echo "⏭️ $(basename "$f") already on PyPI (first upload wins), skipping"
+            else
+              echo "$output"
+              status=1
+            fi
+          done
+          exit $status
+
+      - name: Test PyPI upload (dry run)
+        if: ${{ inputs.dry_run == true && inputs.skip_pypi != true }}
+        run: |
+          echo "DRY RUN: Would upload to PyPI:"
+          find artifacts/wheel-* -name "*.whl" -type f | sort
+          find artifacts/sdist -name "*.tar.gz" -type f | sort
+          echo ""
+          echo "Validating upload (no files are uploaded):"
+          uv publish --dry-run artifacts/wheel-*/*.whl artifacts/sdist/*.tar.gz
+
+      - name: Skip PyPI publishing
+        if: ${{ inputs.skip_pypi == true }}
+        run: echo "⏭️ Skipping PyPI publishing as requested"
+
+      - name: Download WASM artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: wasm-pkg
+          path: wasm-pkg
+
+      - name: Setup Node.js
+        if: ${{ inputs.skip_npm != true }}
+        uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      # Pinned, not @latest: npm 12.0.0 ships a provenance path that fails with
+      # "Cannot find module 'sigstore'", so `npm publish --provenance` aborts.
+      # An unpinned upgrade puts every release at the mercy of the newest npm.
+      # 11.18.0 is the last 11.x and supports the OIDC publishing this needs.
+      - name: Upgrade npm for OIDC support
+        if: ${{ inputs.skip_npm != true }}
+        run: |
+          npm install -g npm@11.18.0
+          echo "npm version: $(npm --version)"
+
+      - name: Publish WASM to npm
+        if: ${{ inputs.dry_run != true && inputs.skip_npm != true }}
+        run: |
+          cd wasm-pkg
+          if ! output=$(npm publish --provenance --access public 2>&1); then
+            if echo "$output" | grep -q "previously published"; then
+              echo "⏭️ WASM package already published, skipping"
+            else
+              echo "$output"
+              exit 1
+            fi
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Test WASM npm publish (dry run)
+        if: ${{ inputs.dry_run == true && inputs.skip_npm != true }}
+        run: |
+          echo "DRY RUN: Would publish WASM to npm:"
+          jq '{name, version}' wasm-pkg/package.json
+
+      - name: Download npm CLI packages
+        if: ${{ inputs.skip_npm != true }}
+        uses: actions/download-artifact@v7
+        with:
+          name: npm-cli-packages
+          path: npm-cli
+
+      - name: Make CLI binaries executable
+        if: ${{ inputs.skip_npm != true }}
+        run: |
+          # actions/upload-artifact strips Unix permission bits, so the platform
+          # binaries arrive here as 0644. npm publish preserves file modes, so the
+          # execute bit must be (re)applied now, after download and before publish,
+          # or the published @rumdl/cli-* binaries spawn with EACCES on fresh
+          # installs (rumdl-vscode#135). The win32 package ships rumdl.exe (no Unix
+          # bit) and is intentionally not matched by this glob.
+          chmod +x npm-cli/cli-*/rumdl
+          ls -la npm-cli/cli-*/rumdl
+
+      - name: Publish CLI platform packages to npm
+        if: ${{ inputs.dry_run != true && inputs.skip_npm != true }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          # Publish platform packages first (they're dependencies of the main package)
+          for pkg in npm-cli/cli-*/; do
+            echo "Publishing $(basename "$pkg")..."
+            cd "$pkg"
+            if ! output=$(npm publish --provenance --access public 2>&1); then
+              if echo "$output" | grep -q "previously published"; then
+                echo "⏭️ $(basename "$pkg") already published, skipping"
+              else
+                echo "$output"
+                exit 1
+              fi
+            fi
+            cd ../..
+          done
+
+      - name: Publish CLI main package to npm
+        if: ${{ inputs.dry_run != true && inputs.skip_npm != true }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          cd npm-cli/rumdl
+          if ! output=$(npm publish --provenance --access public 2>&1); then
+            if echo "$output" | grep -q "previously published"; then
+              echo "⏭️ Main CLI package already published, skipping"
+            else
+              echo "$output"
+              exit 1
+            fi
+          fi
+
+      - name: Test CLI npm publish (dry run)
+        if: ${{ inputs.dry_run == true && inputs.skip_npm != true }}
+        run: |
+          echo "DRY RUN: Would publish CLI packages to npm:"
+          for pkg in npm-cli/cli-*/package.json npm-cli/rumdl/package.json; do
+            echo "  - $(jq -r '.name + "@" + .version' "$pkg")"
+          done
+
+      - name: Skip npm publishing
+        if: ${{ inputs.skip_npm == true }}
+        run: echo "⏭️ Skipping npm publishing as requested"
+
+      - name: Extract release notes
+        run: |
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+          VERSION=${TAG_NAME#v}
+
+          # Extract changelog if available
+          if [ -f scripts/extract-changelog.sh ] && [ -f CHANGELOG.md ]; then
+            chmod +x scripts/extract-changelog.sh
+            ./scripts/extract-changelog.sh "$VERSION" > release-notes.md || echo "No changelog entry found for $VERSION" > release-notes.md
+          else
+            echo "No changelog found" > release-notes.md
+          fi
+
+          # Add downloads table
+          if [ -f scripts/generate-downloads-table.sh ]; then
+            chmod +x scripts/generate-downloads-table.sh
+            echo "" >> release-notes.md
+            ./scripts/generate-downloads-table.sh "$TAG_NAME" >> release-notes.md
+          fi
+
+      - name: Create Release
+        if: ${{ inputs.dry_run != true }}
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          body_path: release-notes.md
+          files: |
+            artifacts/release-*/rumdl-*.tar.gz
+            artifacts/release-*/rumdl-*.tar.gz.sha256
+            artifacts/release-*/rumdl-*.zip
+            artifacts/release-*/rumdl-*.zip.sha256
+
+      - name: Test Release Creation (dry run)
+        if: ${{ inputs.dry_run == true }}
+        run: |
+          echo "DRY RUN: Would create release with:"
+          echo "- Release notes from: release-notes.md"
+          echo "- Archives:"
+          find artifacts/release-* \( -name "*.tar.gz*" -o -name "*.zip*" \) -type f 2>/dev/null | sort
+
+      - name: Dry Run Summary
+        if: ${{ inputs.dry_run == true }}
+        run: |
+          echo "## 🧪 Dry Run Complete!"
+          echo ""
+          echo "The release pipeline executed successfully in dry-run mode."
+          echo "All artifacts were built but nothing was published."
+          echo ""
+          echo "To do an actual release:"
+          echo "1. Uncheck 'Dry run mode' when running manually, OR"
+          echo "2. Create and push a version tag (e.g., v0.0.85)"
+
+  # Fan out repository_dispatch notifications to the downstream repos in a
+  # dedicated job. Kept out of `release` so the asset-propagation sleeps these
+  # notifications carry never sit on the publish critical path: like
+  # update-major-tag, a failure or slow notify here cannot block or delay the
+  # container/winget publishes, which only need `release`. Each notify is
+  # best-effort (continue-on-error); `release` succeeding already implies every
+  # publish step succeeded, so the per-publish gating reduces to the skip flags.
+  notify-downstream:
+    runs-on: ubuntu-latest
+    needs: release
+    if: ${{ inputs.dry_run != true }}
+    steps:
+      - name: Notify obsidian-rumdl
+        if: ${{ inputs.skip_npm != true }}
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.OBSIDIAN_DISPATCH_TOKEN }}
+        run: |
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+          VERSION=${TAG_NAME#v}
+          curl --fail -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            https://api.github.com/repos/rvben/obsidian-rumdl/dispatches \
+            -d "{\"event_type\": \"rumdl_release\", \"client_payload\": {\"version\": \"$VERSION\"}}"
+
+      - name: Notify rumdl-chrome-extension
+        if: ${{ inputs.skip_npm != true }}
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.CHROME_EXT_DISPATCH_TOKEN }}
+        run: |
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+          VERSION=${TAG_NAME#v}
+          curl --fail -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            https://api.github.com/repos/rvben/rumdl-chrome-extension/dispatches \
+            -d "{\"event_type\": \"rumdl_release\", \"client_payload\": {\"version\": \"$VERSION\"}}"
+
+      - name: Notify rumdl-pre-commit
+        if: ${{ inputs.skip_pypi != true }}
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.PRECOMMIT_DISPATCH_TOKEN }}
+        run: |
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+          VERSION=${TAG_NAME#v}
+          curl --fail -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            https://api.github.com/repos/rvben/rumdl-pre-commit/dispatches \
+            -d "{\"event_type\": \"pypi_release\", \"client_payload\": {\"version\": \"$VERSION\"}}"
+
+      - name: Notify rumdl-vscode
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.VSCODE_DISPATCH_TOKEN }}
+        run: |
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+          VERSION=${TAG_NAME#v}
+
+          # The release (and its uploaded assets) is already created by the time
+          # this job starts; give GitHub a brief grace period to make the assets
+          # downloadable before the vscode build pulls them.
+          echo "Waiting for GitHub release assets to be available..."
+          sleep 90
+
+          curl --fail -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            https://api.github.com/repos/rvben/rumdl-vscode/dispatches \
+            -d "{\"event_type\": \"rumdl_release\", \"client_payload\": {\"version\": \"$VERSION\"}}"
+
+      - name: Notify homebrew-rumdl
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.HOMEBREW_DISPATCH_TOKEN }}
+        run: |
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+          VERSION=${TAG_NAME#v}
+
+          echo "Waiting for release archives to be available..."
+          sleep 10
+
+          curl --fail -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            https://api.github.com/repos/rvben/homebrew-rumdl/dispatches \
+            -d "{\"event_type\": \"rumdl_release\", \"client_payload\": {\"version\": \"$VERSION\"}}"
+
+  # In its own job so a failure here (a convenience pointer, not a publish)
+  # can never block publish-container / publish-winget, which need: release.
+  # The v0.2.13 release failed exactly this way: the GITHUB_TOKEN ref update
+  # was rejected with 403 and the still-unpublished container and winget jobs
+  # were skipped over a tag nicety.
+  update-major-tag:
+    runs-on: ubuntu-latest
+    needs: release
+    if: ${{ inputs.dry_run != true }}
+    permissions:
+      contents: write       # Move the major version tag (e.g. v0)
+    steps:
+      - name: Update major version tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
+            echo "Current ref is not a release tag; skipping major tag update."
+            exit 0
+          fi
+
+          # Extract major version (e.g., v0 from v0.1.60)
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+          MAJOR_VERSION=${TAG_NAME%%.*}
+          COMMIT_SHA=${GITHUB_SHA}
+
+          echo "Updating $MAJOR_VERSION tag to point to $TAG_NAME ($COMMIT_SHA)"
+
+          # Use the GitHub API to update the tag ref, avoiding the workflows
+          # permission issue that blocks git push when the repo contains
+          # workflow files.
+          if gh api "repos/${{ github.repository }}/git/refs/tags/$MAJOR_VERSION" \
+            --method PATCH --field sha="$COMMIT_SHA" --field force=true; then
+            echo "Updated existing $MAJOR_VERSION tag"
+          else
+            gh api "repos/${{ github.repository }}/git/refs" \
+              --method POST --field ref="refs/tags/$MAJOR_VERSION" --field sha="$COMMIT_SHA"
+            echo "Created $MAJOR_VERSION tag"
+          fi
+
+          echo "Users can now use: rvben/rumdl@$MAJOR_VERSION"
+
+  publish-container:
+    runs-on: ubuntu-latest
+    needs: release
+    permissions:
+      contents: read
+      packages: write    # Push the image to ghcr.io
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      # The image repacks the already-built static musl binaries; nothing is
+      # compiled here. amd64 + arm64 archives feed the multi-arch manifest.
+      - name: Download Linux musl release archives
+        uses: actions/download-artifact@v7
+        with:
+          pattern: release-*-unknown-linux-musl
+          path: artifacts
+
+      - name: Stage Docker build context
+        run: |
+          mkdir -p target/docker/binaries/amd64 target/docker/binaries/arm64
+          tar -xzf artifacts/release-x86_64-unknown-linux-musl/rumdl-*-x86_64-unknown-linux-musl.tar.gz \
+            -C target/docker/binaries/amd64
+          tar -xzf artifacts/release-aarch64-unknown-linux-musl/rumdl-*-aarch64-unknown-linux-musl.tar.gz \
+            -C target/docker/binaries/arm64
+
+      - name: Resolve image version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$(awk -F '"' '/^version/ { print $2; exit }' Cargo.toml)" >> "$GITHUB_OUTPUT"
+          fi
+
+      # binfmt lets the non-native (arm64) image run under QEMU emulation on
+      # the amd64 runner, so verification executes BOTH published platforms.
+      - name: Register QEMU binfmt handlers
+        run: make docker-binfmt
+
+      # Run every platform's image before anything is published: --version
+      # must work and a check on a known-clean file must exit 0. The make
+      # targets provision their own buildx builder for the multi-arch steps.
+      - name: Verify image on all platforms
+        run: make docker-verify VERSION='${{ steps.version.outputs.version }}'
+
+      - name: Log in to ghcr.io
+        if: ${{ inputs.dry_run != true }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        if: ${{ inputs.dry_run != true }}
+        run: make docker-push VERSION='${{ steps.version.outputs.version }}'
+
+      - name: Test container publish (dry run)
+        if: ${{ inputs.dry_run == true }}
+        run: |
+          echo "DRY RUN: Would push ghcr.io/rvben/rumdl:${{ steps.version.outputs.version }}, :latest, :${{ steps.version.outputs.version }}-alpine, and :alpine"
+          make docker-build VERSION='${{ steps.version.outputs.version }}'
+
+  publish-winget:
+    runs-on: windows-latest
+    needs: release
+    if: ${{ inputs.skip_winget != true }}
+    permissions:
+      contents: read
+    steps:
+      # Two releases in quick succession leave the previous version's
+      # winget-pkgs PR open once the new submission makes it obsolete; the
+      # moderation queue never closes superseded PRs on its own. Close our
+      # own older open submissions before submitting the new manifest.
+      - name: Close superseded winget PRs
+        if: ${{ inputs.dry_run != true }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          if ($env:GITHUB_REF -notmatch '^refs/tags/v\d+\.\d+\.\d+$') {
+            Write-Host "Current ref is not a semver release tag; skipping superseded PR cleanup."
+            exit 0
+          }
+
+          if (-not $env:GH_TOKEN) {
+            Write-Host "WINGET_TOKEN is not configured; skipping superseded PR cleanup."
+            exit 0
+          }
+
+          $newVersion = [version]($env:GITHUB_REF -replace '^refs/tags/v', '')
+          $me = gh api user --jq .login
+          $prs = gh pr list --repo microsoft/winget-pkgs --author $me --state open `
+            --search "rvben.rumdl" --json number,title | ConvertFrom-Json
+
+          foreach ($pr in $prs) {
+            if ($pr.title -match 'rvben\.rumdl version (\d+\.\d+\.\d+)' -and [version]$Matches[1] -lt $newVersion) {
+              gh pr close $pr.number --repo microsoft/winget-pkgs `
+                --comment "Superseded by the rvben.rumdl $newVersion submission."
+              Write-Host "Closed superseded PR #$($pr.number) (version $($Matches[1]))"
+            }
+          }
+
+      # wingetcreate syncs the submission fork itself, but only by fast-forward.
+      # microsoft/winget-pkgs takes hundreds of commits a day, so once our fork's
+      # master has diverged that sync fails with "The forked repository could not
+      # be synced with the upstream commits" and the release dies after the
+      # binaries are already published. Hard-reset master to upstream first so
+      # the submission never depends on that fast-forward succeeding.
+      #
+      # Only the default branch moves. wingetcreate puts each submission on its
+      # own branch, so open PRs are untouched by the reset.
+      - name: Sync the winget-pkgs fork
+        if: ${{ inputs.dry_run != true }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          if ($env:GITHUB_REF -notmatch '^refs/tags/v\d+\.\d+\.\d+$') {
+            Write-Host "Current ref is not a semver release tag; skipping winget fork sync."
+            exit 0
+          }
+
+          if (-not $env:GH_TOKEN) {
+            Write-Host "WINGET_TOKEN is not configured; skipping winget fork sync."
+            exit 0
+          }
+
+          $me = gh api user --jq .login
+          if ($LASTEXITCODE -ne 0 -or -not $me) {
+            throw "could not resolve the WINGET_TOKEN account; cannot locate the winget-pkgs fork"
+          }
+          $fork = "$me/winget-pkgs"
+
+          # A missing fork is not a failure: wingetcreate forks on demand, and a
+          # fresh fork is by definition already in sync. Tolerate either the
+          # native exit code or a thrown terminating error, so the probe does not
+          # depend on the host's $PSNativeCommandUseErrorActionPreference.
+          $exists = $true
+          try {
+            gh repo view $fork --json name 2>$null | Out-Null
+            if ($LASTEXITCODE -ne 0) { $exists = $false }
+          } catch {
+            $exists = $false
+          }
+
+          if (-not $exists) {
+            Write-Host "$fork does not exist yet; wingetcreate will fork it fresh."
+            exit 0
+          }
+
+          gh repo sync $fork --source microsoft/winget-pkgs --force
+          if ($LASTEXITCODE -ne 0) {
+            throw "failed to hard-reset $fork master to microsoft/winget-pkgs"
+          }
+          Write-Host "Reset $fork master to microsoft/winget-pkgs."
+
+      - name: Submit winget manifest update
+        if: ${{ inputs.dry_run != true }}
+        shell: pwsh
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          if ($env:GITHUB_REF -notmatch '^refs/tags/v\d+\.\d+\.\d+$') {
+            Write-Host "Current ref is not a semver release tag; skipping winget manifest submission."
+            exit 0
+          }
+
+          if (-not $env:WINGET_TOKEN) {
+            Write-Host "WINGET_TOKEN is not configured; skipping winget manifest submission."
+            exit 0
+          }
+
+          $tagName = $env:GITHUB_REF -replace '^refs/tags/', ''
+          $version = $tagName -replace '^v', ''
+          $installerUrl = "https://github.com/rvben/rumdl/releases/download/$tagName/rumdl-$tagName-x86_64-pc-windows-msvc.zip"
+
+          Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
+          .\wingetcreate.exe update rvben.rumdl -u $installerUrl -v $version -t $env:WINGET_TOKEN --submit
+
+      - name: Test winget submission (dry run)
+        if: ${{ inputs.dry_run == true }}
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -notmatch '^refs/tags/v\d+\.\d+\.\d+$') {
+            Write-Host "Current ref is not a semver release tag; skipping winget dry-run preview."
+            exit 0
+          }
+
+          $tagName = $env:GITHUB_REF -replace '^refs/tags/', ''
+          $version = $tagName -replace '^v', ''
+          $installerUrl = "https://github.com/rvben/rumdl/releases/download/$tagName/rumdl-$tagName-x86_64-pc-windows-msvc.zip"
+          Write-Host "DRY RUN: Would submit winget update for rvben.rumdl $version"
+          Write-Host "Installer URL: $installerUrl"

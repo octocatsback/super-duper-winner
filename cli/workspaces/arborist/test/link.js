@@ -1,0 +1,359 @@
+// this test depends on debug stuff, so force it on, even if the test env
+// does not enable it.
+process.env.ARBORIST_DEBUG = '1'
+const t = require('tap')
+const Link = require('../lib/link.js')
+const Node = require('../lib/node.js')
+const Shrinkwrap = require('../lib/shrinkwrap.js')
+
+const { resolve } = require('node:path')
+const normalizePath = path => path.replace(/^[A-Z]:/, '').replace(/\\/g, '/')
+const normalizePaths = obj => {
+  obj.path = obj.path && normalizePath(obj.path)
+  obj.realpath = obj.realpath && normalizePath(obj.realpath)
+  for (const key of obj.inventory.keys()) {
+    const member = obj.inventory.get(key)
+    member.path = member.path && normalizePath(member.path)
+    member.realpath = member.realpath && normalizePath(member.realpath)
+  }
+  return obj
+}
+
+const meta = new Shrinkwrap({ path: '/home/user/projects/some/kind/of/path' })
+meta.data = {
+  lockfileVersion: 2,
+  packages: {},
+  dependencies: {},
+}
+
+const root = new Node({
+  pkg: { name: 'root' },
+  path: '/home/user/projects/some/kind/of/path',
+  meta,
+})
+
+const l1 = new Link({
+  pkg: { name: 'root' },
+  path: '/home/user/some/other/path',
+  realpath: '/home/user/projects/some/kind/of/path',
+  meta,
+})
+
+t.matchSnapshot(normalizePaths(l1), 'instantiate without providing target')
+t.equal(l1.isLink, true, 'link is a link')
+t.same(l1.children.size, 0, 'children is empty')
+l1.children = new Map([[1, 2], [3, 4]])
+t.same(l1.children.size, 0, 'children still empty after being assigned')
+l1.children.set('asdf', 'foo')
+t.same(l1.children.size, 0, 'children still empty after setting value')
+
+t.throws(() => new Link({ path: '/x' }), {
+  message: 'must provide realpath for Link node',
+})
+
+const resolver = new Link({
+  path: '/x/y/z',
+  realpath: '/x/z/y/a/b/c',
+})
+t.equal(resolver.resolved,
+  'file:../z/y/a/b/c', 'link resolved is relpath to realpath')
+resolver.path = null
+t.equal(resolver.resolved, null, 'link resolved depends on path')
+resolver.path = '/x/z/y/a/b/d'
+t.equal(resolver.resolved, 'file:c', 'updates when path changes')
+
+t.matchSnapshot(normalizePaths(new Link({
+  path: '/home/user/some/other/path',
+  target: root,
+})), 'instantiate with target specified')
+
+t.test('link.target setter', async t => {
+  const link = new Link({
+    path: '/path/to/link',
+    realpath: '/node-a',
+    pkg: { name: 'node-a', version: '1.2.3' },
+  })
+  const oldTarget = link.target
+  t.equal(oldTarget.linksIn.has(link), true, 'target takes note of link')
+  t.equal(link.package, oldTarget.package, 'link has same package as target')
+
+  const newTarget = new Node({
+    path: '/node-b',
+    realpath: '/node-b',
+    pkg: { name: 'node-b', version: '1.2.3' },
+  })
+  link.target = newTarget
+  t.equal(oldTarget.linksIn.size, 0, 'old target has no links in now')
+  t.equal(link.target, newTarget, 'new target is target')
+  t.equal(newTarget.linksIn.has(link), true, 'new target notes the link')
+  t.equal(link.package, newTarget.package, 'link package is new target package')
+
+  link.target = null
+  t.equal(link.target, null, 'link has no target')
+  t.strictSame(link.package, {}, 'no package without link')
+  t.equal(oldTarget.linksIn.size, 0, 'old target still has no links')
+  t.equal(newTarget.linksIn.size, 0, 'new target has no links in now')
+
+  link.target = null
+  t.equal(link.target, null, 'target is now null')
+  t.strictSame(link.package, {}, 'removed target, package is now empty')
+  // just test the guard that setting to a different falsey value is fine
+  link.target = undefined
+  t.equal(link.target, null, 'target is still null')
+  t.strictSame(link.package, {}, 'removed target, package is now empty')
+})
+
+t.test('get root from various places', t => {
+  const root = new Node({
+    path: '/path/to/root',
+  })
+
+  t.test('get from root', t => {
+    const fromRoot = new Link({
+      pkg: { name: 'from-root' },
+      path: '/path/to/root/from-root',
+      realpath: '/path/to/root/from-root-target',
+      root,
+    })
+    t.equal(fromRoot.root, root)
+    t.equal(fromRoot.fsParent, root)
+    t.equal(fromRoot.parent, null)
+    t.equal(fromRoot.target.root, root)
+    t.equal(fromRoot.target.fsParent, root)
+    t.equal(fromRoot.target.parent, null)
+    t.end()
+  })
+
+  t.test('get from fsParent', t => {
+    const fromFsParent = new Link({
+      pkg: { name: 'from-fs-parent' },
+      path: '/path/to/root/from-fs-parent',
+      realpath: '/path/to/root/from-root-fs-parent',
+      fsParent: root,
+    })
+    t.equal(fromFsParent.root, root)
+    t.equal(fromFsParent.fsParent, root)
+    t.equal(fromFsParent.parent, null)
+    t.equal(fromFsParent.target.root, root)
+    t.equal(fromFsParent.target.fsParent, root)
+    t.equal(fromFsParent.target.parent, null)
+    t.end()
+  })
+
+  t.test('get from parent', t => {
+    const fromParent = new Link({
+      pkg: { name: 'from-parent' },
+      parent: root,
+      realpath: '/path/to/root/from-root-parent',
+    })
+    t.equal(fromParent.root, root)
+    t.equal(fromParent.fsParent, null)
+    t.equal(fromParent.parent, root)
+    t.equal(fromParent.target.root, root)
+    t.equal(fromParent.target.fsParent, root)
+    t.equal(fromParent.target.parent, null)
+    t.end()
+  })
+
+  t.end()
+})
+
+t.test('temporary link node pending attachment to a tree', t => {
+  const root = new Node({ path: '/path/to/node' })
+  const link = new Link({ name: 'foo', realpath: '/this/will/change' })
+  const target = new Node({ path: '/path/to/node/foo' })
+  t.equal(link.root, link)
+  t.equal(target.root, target)
+  t.equal(normalizePath(link.realpath), normalizePath('/this/will/change'))
+  link.target = target
+  t.equal(target.root, link)
+  t.equal(link.realpath, target.path)
+  t.equal(link.path, null)
+  link.parent = root
+  t.equal(normalizePath(link.realpath), normalizePath(target.path))
+  t.equal(normalizePath(link.path), normalizePath(root.path + '/node_modules/foo'))
+  t.equal(link.root, root)
+  t.equal(target.root, root)
+  t.equal(target.fsParent, root)
+
+  const link2 = new Link({ name: 'bar', realpath: '/this/will/change' })
+  const target2 = new Node({ name: 'bar' })
+  link2.target = target2
+  t.equal(normalizePath(target2.path), normalizePath('/this/will/change'))
+  link2.target = null
+  target2.realpath = target2.path = resolve('/path/to/node/bar')
+  link2.target = target2
+  t.equal(normalizePath(link2.realpath), normalizePath(target2.path))
+  link2.parent = root
+  t.equal(target2.fsParent, root)
+
+  t.end()
+})
+
+t.test('link gets version from target', t => {
+  const link = new Link({ realpath: '/some/real/path', path: '/other/path' })
+  t.equal(link.version, '')
+  link.target = null
+  link.package = { name: 'bar', version: '2.3.4' }
+  t.equal(link.version, '2.3.4')
+  link.package = {}
+  t.equal(link.version, '')
+  new Node({
+    pkg: { name: 'foo', version: '1.2.3' },
+    path: '/some/real/path',
+    root: link,
+  })
+  t.equal(link.version, '1.2.3')
+  t.end()
+})
+
+t.test('recalculateOutEdgesOverrides forwards overrides to target', t => {
+  const root = new Node({
+    path: '/path/to/root',
+    pkg: {
+      name: 'root',
+      dependencies: { foo: '1.0.0' },
+      overrides: { bar: '2.0.0' },
+    },
+    loadOverrides: true,
+  })
+
+  const target = new Node({
+    path: '/path/to/store/foo',
+    pkg: {
+      name: 'foo',
+      version: '1.0.0',
+      dependencies: { bar: '1.0.0' },
+    },
+    root,
+  })
+
+  const link = new Link({
+    pkg: { name: 'foo', version: '1.0.0' },
+    path: '/path/to/root/node_modules/foo',
+    realpath: '/path/to/store/foo',
+    target,
+    parent: root,
+  })
+
+  // The root has overrides, and the edge from root -> link should propagate them
+  t.ok(root.overrides, 'root has overrides')
+  t.ok(link.overrides, 'link received overrides from root edge')
+  t.ok(link.target.overrides, 'target received overrides forwarded from link')
+
+  // The target's edge to "bar" should have the override applied
+  const barEdge = link.target.edgesOut.get('bar')
+  t.ok(barEdge, 'target has edge to bar')
+  t.ok(barEdge.overrides, 'bar edge has overrides')
+  t.equal(barEdge.spec, '2.0.0', 'bar edge spec is overridden to 2.0.0')
+  t.equal(barEdge.rawSpec, '1.0.0', 'bar edge rawSpec is original 1.0.0')
+
+  // recalculateOutEdgesOverrides is a no-op when target is null
+  link.target = null
+  t.doesNotThrow(() => link.recalculateOutEdgesOverrides(),
+    'no-op when target is null')
+
+  t.end()
+})
+
+t.test('recalculateOutEdgesOverrides does not forward when no rule matches a target dep — npm/cli#9357', t => {
+  // Regression: prior to the fix, Link.recalculateOutEdgesOverrides forwarded the link's full OverrideSet to the target unconditionally.
+  // For a target whose edges are NOT named in any override rule, that flipped target.overrides from undefined to the root's OverrideSet.
+  // Downstream, that "has overrides" state changed canPlaceDep's KEEP-vs-REPLACE decision and made `npm ci` re-resolve lockfile-pinned edges from the registry.
+  // After the fix, propagation is gated on at least one rule whose name matches an edge in target.edgesOut.
+  const root = new Node({
+    path: '/path/to/root',
+    pkg: {
+      name: 'root',
+      dependencies: { foo: '1.0.0' },
+      // override is for "bar", but the linked target only depends on "baz"
+      overrides: { bar: '2.0.0' },
+    },
+    loadOverrides: true,
+  })
+
+  const target = new Node({
+    path: '/path/to/store/foo',
+    pkg: {
+      name: 'foo',
+      version: '1.0.0',
+      dependencies: { baz: '1.0.0' },
+    },
+    root,
+  })
+
+  // eslint-disable-next-line no-new
+  new Link({
+    pkg: { name: 'foo', version: '1.0.0' },
+    path: '/path/to/root/node_modules/foo',
+    realpath: '/path/to/store/foo',
+    target,
+    parent: root,
+  })
+
+  t.ok(root.overrides, 'root has overrides')
+  t.notOk(target.overrides,
+    'target.overrides stays undefined when no rule matches a target dep')
+  const bazEdge = target.edgesOut.get('baz')
+  t.notOk(bazEdge.overrides,
+    'unrelated edge keeps edge.overrides undefined')
+  t.equal(bazEdge.spec, '1.0.0', 'unrelated edge spec is unchanged')
+  t.end()
+})
+
+t.test('recalculateOutEdgesOverrides does not forward a version-qualified rule that does not apply', t => {
+  // The rule names the target's dep but its keySpec (^3) does not intersect the declared range (^1), so the override does not apply and must not flip the target to "has overrides".
+  const root = new Node({
+    path: '/path/to/root',
+    pkg: {
+      name: 'root',
+      dependencies: { foo: '1.0.0' },
+      overrides: { 'leaf@^3': '3.0.0' },
+    },
+    loadOverrides: true,
+  })
+
+  const target = new Node({
+    path: '/path/to/store/foo',
+    pkg: {
+      name: 'foo',
+      version: '1.0.0',
+      dependencies: { leaf: '^1.0.0' },
+    },
+    root,
+  })
+
+  // eslint-disable-next-line no-new
+  new Link({
+    pkg: { name: 'foo', version: '1.0.0' },
+    path: '/path/to/root/node_modules/foo',
+    realpath: '/path/to/store/foo',
+    target,
+    parent: root,
+  })
+
+  t.notOk(target.overrides, 'target.overrides stays undefined for a non-applicable rule')
+  const leafEdge = target.edgesOut.get('leaf')
+  t.notOk(leafEdge.overrides, 'edge keeps edge.overrides undefined')
+  t.equal(leafEdge.spec, '^1.0.0', 'edge spec is unchanged')
+  t.end()
+})
+
+t.test('link to root path gets root as target', t => {
+  const root = new Node({
+    path: '/project/root',
+    pkg: {
+      name: 'root',
+      dependencies: {
+        root: 'file:.',
+      },
+    },
+  })
+  const link = new Link({
+    parent: root,
+    realpath: root.path,
+    pkg: { ...root.package },
+  })
+  t.equal(link.target, root)
+  t.end()
+})

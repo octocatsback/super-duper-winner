@@ -1,0 +1,1306 @@
+/// Rule MD037: No spaces around emphasis markers
+///
+/// See [docs/md037.md](../../docs/md037.md) for full documentation, configuration, and examples.
+use crate::filtered_lines::FilteredLinesExt;
+use crate::rule::{Fix, LintError, LintResult, LintWarning, Rule, RuleCategory, Severity};
+use crate::utils::emphasis_utils::{
+    EmphasisSpan, find_emphasis_markers, find_emphasis_spans, find_valid_emphasis_ranges, has_doc_patterns,
+    replace_inline_code, replace_inline_math,
+};
+use crate::utils::kramdown_utils::has_span_ial;
+use crate::utils::range_utils::byte_to_char_count;
+use crate::utils::regex_cache::UNORDERED_LIST_MARKER_REGEX;
+use crate::utils::skip_context::{
+    is_in_inline_html_code, is_in_jsx_expression, is_in_math_context, is_in_mdx_comment, is_in_mkdocs_markup,
+};
+use crate::utils::table_utils::TableUtils;
+use std::ops::Range;
+
+/// Check if an emphasis span has spacing issues that should be flagged
+#[inline]
+fn has_spacing_issues(span: &EmphasisSpan) -> bool {
+    span.has_leading_space || span.has_trailing_space
+}
+
+/// Flags marking which lines belong to a GFM table, indexed by 0-based line number.
+/// Empty when the document contains no table.
+fn table_line_flags(ctx: &crate::lint_context::LintContext) -> Vec<bool> {
+    if ctx.table_blocks.is_empty() {
+        return Vec::new();
+    }
+
+    let mut flags = vec![false; ctx.lines.len()];
+    // TableBlock line numbers are 0-indexed, matching this vector.
+    for block in &ctx.table_blocks {
+        for idx in block.start_line..=block.end_line {
+            if let Some(flag) = flags.get_mut(idx) {
+                *flag = true;
+            }
+        }
+    }
+    flags
+}
+
+/// Byte ranges of the cells in a table row.
+///
+/// A row is split on pipes that are neither escaped nor inside a code span, and
+/// every cell is parsed as its own inline context, so a marker in one cell can
+/// never pair with a marker in the next. Scanning cells separately gives the
+/// line-level emphasis finder the boundaries the parser already uses.
+fn table_cell_ranges(line: &str) -> Vec<Range<usize>> {
+    // Only an escape or a code span can hide a pipe from the split, so a row
+    // containing neither is scanned as it stands. Masking copies the row.
+    let masked;
+    let scan = if line.contains('\\') || line.contains('`') {
+        let escaped = TableUtils::mask_pipes_for_table_parsing(line);
+        masked = TableUtils::mask_pipes_in_inline_code(&escaped);
+        debug_assert_eq!(
+            masked.len(),
+            line.len(),
+            "pipe masking must preserve byte offsets for cell slicing"
+        );
+        masked.as_str()
+    } else {
+        line
+    };
+
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    for (pipe_pos, _) in scan.match_indices('|') {
+        ranges.push(start..pipe_pos);
+        start = pipe_pos + 1;
+    }
+    ranges.push(start..line.len());
+    ranges
+}
+
+/// Truncate long text for display in warning messages
+/// Shows first ~30 and last ~30 chars with ellipsis in middle for readability
+#[inline]
+fn truncate_for_display(text: &str, max_len: usize) -> String {
+    if text.len() <= max_len {
+        return text.to_string();
+    }
+
+    let prefix_len = max_len / 2 - 2; // -2 for "..."
+    let suffix_len = max_len / 2 - 2;
+
+    // Use floor_char_boundary to safely find UTF-8 character boundaries
+    let prefix_end = text.floor_char_boundary(prefix_len.min(text.len()));
+    let suffix_start = text.floor_char_boundary(text.len().saturating_sub(suffix_len));
+
+    format!("{}...{}", &text[..prefix_end], &text[suffix_start..])
+}
+
+/// Rule MD037: Spaces inside emphasis markers
+#[derive(Clone)]
+pub struct MD037NoSpaceInEmphasis;
+
+impl Default for MD037NoSpaceInEmphasis {
+    fn default() -> Self {
+        Self
+    }
+}
+
+impl MD037NoSpaceInEmphasis {
+    /// Check if a byte position is within a link (inline links, reference links, or reference definitions)
+    fn is_in_link(&self, ctx: &crate::lint_context::LintContext, byte_pos: usize) -> bool {
+        // Check inline and reference links
+        for link in ctx.links() {
+            if link.byte_offset <= byte_pos && byte_pos < link.byte_end {
+                if link.is_reference && link.url.is_empty() {
+                    continue;
+                }
+                return true;
+            }
+        }
+
+        // Check images (which use similar syntax)
+        for image in ctx.images() {
+            if image.byte_offset <= byte_pos && byte_pos < image.byte_end {
+                return true;
+            }
+        }
+
+        // Check reference definitions [ref]: url "title" using pre-computed data (O(1) vs O(n))
+        ctx.is_in_reference_def(byte_pos)
+    }
+
+    /// Where each emphasis span ends, ascending, paired with where it began.
+    ///
+    /// Ordering by end position is what keeps [`Self::closes_earlier_emphasis`]
+    /// logarithmic: a run only has to consider the spans that close inside it,
+    /// which is a handful, rather than every span in the document.
+    fn emphasis_span_ends(ctx: &crate::lint_context::LintContext) -> Vec<(usize, usize)> {
+        let mut ends: Vec<(usize, usize)> = ctx
+            .emphasis_spans()
+            .iter()
+            .map(|span| (span.byte_end, span.byte_offset))
+            .collect();
+        ends.sort_unstable();
+        ends
+    }
+
+    /// Check whether a flagged run only looks spaced because its opening marker
+    /// is really the closing delimiter of emphasis that began further up.
+    ///
+    /// Markers are paired one line at a time, so on a line that continues a span
+    /// the first marker reads as an opener and every marker after it pairs one
+    /// position off, putting ordinary words between what look like delimiters.
+    /// The document-level parse settles it: a marker already spent closing a
+    /// span cannot also open one.
+    ///
+    /// A span that both starts and ends inside the run is a different thing, and
+    /// stays reported: `* _real_ *` really is emphasis with spaces in it.
+    fn closes_earlier_emphasis(span_ends: &[(usize, usize)], start: usize, end: usize) -> bool {
+        let first_after_start = span_ends.partition_point(|(span_end, _)| *span_end <= start);
+        span_ends[first_after_start..]
+            .iter()
+            .take_while(|(span_end, _)| *span_end < end)
+            .any(|(_, span_start)| *span_start <= start)
+    }
+}
+
+impl Rule for MD037NoSpaceInEmphasis {
+    fn name(&self) -> &'static str {
+        "MD037"
+    }
+
+    fn description(&self) -> &'static str {
+        "Spaces inside emphasis markers"
+    }
+
+    fn check(&self, ctx: &crate::lint_context::LintContext) -> LintResult {
+        let content = ctx.content;
+        let _timer = crate::profiling::ScopedTimer::new("MD037_check");
+
+        // Early return: if no emphasis markers at all, skip processing
+        if !content.contains('*') && !content.contains('_') {
+            return Ok(vec![]);
+        }
+
+        // Source-location queries preserve correct offsets across all line ending types.
+
+        let mut warnings = Vec::new();
+        let table_lines = table_line_flags(ctx);
+
+        // Process content lines, automatically skipping front matter, code blocks, math blocks,
+        // and Obsidian comments (when in Obsidian flavor)
+        // Math blocks contain LaTeX syntax where _ and * have special meaning
+        for line in ctx
+            .filtered_lines()
+            .skip_front_matter()
+            .skip_code_blocks()
+            .skip_math_blocks()
+            .skip_html_blocks()
+            .skip_jsx_expressions()
+            .skip_mdx_comments()
+            .skip_obsidian_comments()
+            .skip_mkdocstrings()
+        {
+            // Skip if the line doesn't contain any emphasis markers
+            if !line.content.contains('*') && !line.content.contains('_') {
+                continue;
+            }
+
+            if table_lines.get(line.line_num - 1).copied().unwrap_or(false) {
+                // Each table cell is its own inline context, so scan cells separately.
+                // A marker in one cell can never pair with a marker in the next, and a
+                // cell holds inline content only (never a list item), so the line-level
+                // list-marker handling does not apply here.
+                for cell in table_cell_ranges(line.content) {
+                    let Some(cell_content) = line.content.get(cell.clone()) else {
+                        continue;
+                    };
+                    if !cell_content.contains('*') && !cell_content.contains('_') {
+                        continue;
+                    }
+                    if has_doc_patterns(cell_content) {
+                        continue;
+                    }
+                    self.check_line_content_for_emphasis_fast(cell_content, line.line_num, cell.start, &mut warnings);
+                }
+                continue;
+            }
+
+            // Check for emphasis issues on the original line
+            self.check_line_for_emphasis_issues_fast(line.content, line.line_num, &mut warnings);
+        }
+
+        // Filter out warnings for emphasis markers that are inside links, HTML comments, math, or MkDocs markup
+        let mut filtered_warnings = Vec::new();
+        let lines = ctx.raw_lines();
+        let span_ends = if warnings.is_empty() {
+            Vec::new()
+        } else {
+            Self::emphasis_span_ends(ctx)
+        };
+
+        for (line_idx, line) in lines.iter().enumerate() {
+            let line_num = line_idx + 1;
+            let line_start_pos = ctx.line_start_byte(line_num).unwrap_or(0);
+
+            // Find warnings for this line
+            for warning in &warnings {
+                if warning.line == line_num {
+                    // `warning.column` is a byte offset within the line at this stage.
+                    // Derive the byte position (for byte-based skip checks) and the
+                    // character column (for char-based checks and the emitted warning).
+                    let byte_pos = line_start_pos + (warning.column - 1);
+                    // Calculate byte position within the line (0-indexed)
+                    let line_pos = warning.column - 1;
+                    let char_col = byte_to_char_count(line, warning.column - 1);
+
+                    // Skip if inside links, HTML comments, math contexts, code spans, MDX constructs, or MkDocs markup
+                    // Note: is_in_code_span uses pulldown-cmark and correctly handles multi-line spans
+                    // Pandoc bracketed spans `[text]{.class}` may contain spaced
+                    // emphasis markers as literal content; suppress MD037 there.
+                    // Subscripts/superscripts cannot contain whitespace per the
+                    // detector grammar, so MD037's spaced-emphasis warnings can
+                    // never land inside one.
+                    // A shortcode tag is an argument list read by a template, so
+                    // `*` and `_` in it are literal characters the template sees;
+                    // closing the spaces around them changes what it receives.
+                    let in_pandoc_construct = ctx.flavor.is_pandoc_compatible() && ctx.is_in_bracketed_span(byte_pos);
+                    let byte_end = line_start_pos + (warning.end_column - 1);
+                    if !in_pandoc_construct
+                        && !Self::closes_earlier_emphasis(&span_ends, byte_pos, byte_end)
+                        && !self.is_in_link(ctx, byte_pos)
+                        && !ctx.is_in_html_comment(byte_pos)
+                        && !ctx.is_in_shortcode(byte_pos)
+                        && !is_in_math_context(ctx, byte_pos)
+                        && !ctx.is_in_code_span(line_num, char_col)
+                        && !is_in_inline_html_code(line, line_pos)
+                        && !is_in_jsx_expression(ctx, byte_pos)
+                        && !is_in_mdx_comment(ctx, byte_pos)
+                        && !is_in_mkdocs_markup(line, line_pos, ctx.flavor)
+                        && !ctx.is_position_in_obsidian_comment(line_num, char_col)
+                    {
+                        let mut adjusted_warning = warning.clone();
+                        // Emit character-based columns (byte-based skip checks done above).
+                        adjusted_warning.column = char_col;
+                        adjusted_warning.end_column = byte_to_char_count(line, warning.end_column - 1);
+                        if let Some(fix) = &mut adjusted_warning.fix {
+                            // Convert line-relative range to absolute range
+                            let abs_start = line_start_pos + fix.range.start;
+                            let abs_end = line_start_pos + fix.range.end;
+                            fix.range = abs_start..abs_end;
+                        }
+                        filtered_warnings.push(adjusted_warning);
+                    }
+                }
+            }
+        }
+
+        Ok(filtered_warnings)
+    }
+
+    fn fix(&self, ctx: &crate::lint_context::LintContext) -> Result<String, LintError> {
+        let content = ctx.content;
+        let _timer = crate::profiling::ScopedTimer::new("MD037_fix");
+
+        // Fast path: if no emphasis markers, return unchanged
+        if !content.contains('*') && !content.contains('_') {
+            return Ok(content.to_string());
+        }
+
+        // First check for issues and get all warnings with fixes
+        let warnings = self.check(ctx)?;
+        let warnings =
+            crate::utils::fix_utils::filter_warnings_by_inline_config(warnings, ctx.inline_config(), self.name());
+
+        // If no warnings, return original content
+        if warnings.is_empty() {
+            return Ok(content.to_string());
+        }
+
+        // Apply fixes
+        let mut result = content.to_string();
+        let mut offset: isize = 0;
+
+        // Sort warnings by position to apply fixes in the correct order
+        let mut sorted_warnings: Vec<_> = warnings.iter().filter(|w| w.fix.is_some()).collect();
+        sorted_warnings.sort_by_key(|w| (w.line, w.column));
+
+        for warning in sorted_warnings {
+            if let Some(fix) = &warning.fix {
+                // Apply fix with offset adjustment
+                let actual_start = (fix.range.start as isize + offset) as usize;
+                let actual_end = (fix.range.end as isize + offset) as usize;
+
+                // Make sure we're not out of bounds
+                if actual_start < result.len() && actual_end <= result.len() {
+                    // Replace the text
+                    result.replace_range(actual_start..actual_end, &fix.replacement);
+                    // Update offset for future replacements
+                    offset += fix.replacement.len() as isize - (fix.range.end - fix.range.start) as isize;
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Get the category of this rule for selective processing
+    fn category(&self) -> RuleCategory {
+        RuleCategory::Emphasis
+    }
+
+    /// Check if this rule should be skipped
+    fn should_skip(&self, ctx: &crate::lint_context::LintContext) -> bool {
+        ctx.content.is_empty() || !ctx.likely_has_emphasis()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn from_config(_config: &crate::config::Config) -> Box<dyn Rule>
+    where
+        Self: Sized,
+    {
+        Box::new(MD037NoSpaceInEmphasis)
+    }
+}
+
+impl MD037NoSpaceInEmphasis {
+    /// Optimized line checking for emphasis spacing issues
+    #[inline]
+    fn check_line_for_emphasis_issues_fast(&self, line: &str, line_num: usize, warnings: &mut Vec<LintWarning>) {
+        // Quick documentation pattern checks
+        if has_doc_patterns(line) {
+            return;
+        }
+
+        // Optimized list detection with fast path
+        // When a list marker is detected, ALWAYS check only the content after the marker,
+        // never the full line. This prevents the list marker (* + -) from being mistaken
+        // for emphasis markers.
+        if (line.starts_with(' ') || line.starts_with('*') || line.starts_with('+') || line.starts_with('-'))
+            && UNORDERED_LIST_MARKER_REGEX.is_match(line)
+        {
+            if let Some(caps) = UNORDERED_LIST_MARKER_REGEX.captures(line)
+                && let Some(full_match) = caps.get(0)
+            {
+                let list_marker_end = full_match.end();
+                if list_marker_end < line.len() {
+                    let remaining_content = &line[list_marker_end..];
+
+                    // Always check just the remaining content (after the list marker).
+                    // The list marker itself is never emphasis.
+                    self.check_line_content_for_emphasis_fast(remaining_content, line_num, list_marker_end, warnings);
+                }
+            }
+            return;
+        }
+
+        // Check the entire line
+        self.check_line_content_for_emphasis_fast(line, line_num, 0, warnings);
+    }
+
+    /// Optimized line content checking for emphasis issues
+    fn check_line_content_for_emphasis_fast(
+        &self,
+        content: &str,
+        line_num: usize,
+        offset: usize,
+        warnings: &mut Vec<LintWarning>,
+    ) {
+        // Replace inline code and inline math to avoid false positives
+        // with emphasis markers inside backticks or dollar signs
+        let processed_content = replace_inline_code(content);
+        let processed_content = replace_inline_math(&processed_content);
+
+        // Find all emphasis markers using optimized parsing
+        let markers = find_emphasis_markers(&processed_content);
+        if markers.is_empty() {
+            return;
+        }
+
+        // Find valid emphasis spans
+        let spans = find_emphasis_spans(&processed_content, &markers);
+
+        // Byte ranges that are genuine CommonMark emphasis. A spaced span that
+        // falls entirely inside one of these is not "spaces inside emphasis
+        // markers" but the interior of valid emphasis containing a literal
+        // marker (e.g. `*foo * bar*`), which the greedy finder above mispairs.
+        let valid_ranges = find_valid_emphasis_ranges(&processed_content, &markers);
+
+        // Check each span for spacing issues
+        for span in spans {
+            if has_spacing_issues(&span) {
+                let full_start = span.opening.start_pos;
+                let full_end = span.closing.end_pos();
+
+                // Suppress when the spaced run is contained in valid emphasis.
+                if valid_ranges
+                    .iter()
+                    .any(|&(start, end)| start <= full_start && full_end <= end)
+                {
+                    continue;
+                }
+
+                let full_text = &content[full_start..full_end];
+
+                // Skip if this emphasis has a Kramdown span IAL immediately after it
+                // (no space between emphasis and IAL)
+                if full_end < content.len() {
+                    let remaining = &content[full_end..];
+                    // Check if IAL starts immediately after the emphasis (no whitespace)
+                    if remaining.starts_with('{') && has_span_ial(remaining.split_whitespace().next().unwrap_or("")) {
+                        continue;
+                    }
+                }
+
+                // Create the marker string efficiently
+                let marker_char = span.opening.as_char();
+                let marker_str = if span.opening.count == 1 {
+                    marker_char.to_string()
+                } else {
+                    format!("{marker_char}{marker_char}")
+                };
+
+                // Create the fixed version by trimming spaces from content.
+                // Slice the content from the *original* line, not from the
+                // code/math-masked copy: `span.content` would contain the 'X'/'M'
+                // placeholders, which must never leak into the generated fix.
+                // Masking is length-preserving, so the span byte offsets are
+                // valid in `content`.
+                let original_content = &content[span.opening.end_pos()..span.closing.start_pos];
+                let trimmed_content = original_content.trim();
+                let fixed_text = format!("{marker_str}{trimmed_content}{marker_str}");
+
+                // Truncate long emphasis spans for readable warning messages
+                let display_text = truncate_for_display(full_text, 60);
+
+                let warning = LintWarning {
+                    rule_name: Some(self.name().to_string()),
+                    message: format!("Spaces inside emphasis markers: {display_text:?}"),
+                    // Byte-based columns within the line. The filter pass below relies
+                    // on `column` being a byte offset for its skip checks, then converts
+                    // the emitted columns to character offsets.
+                    line: line_num,
+                    column: offset + full_start + 1,
+                    end_line: line_num,
+                    end_column: offset + full_end + 1,
+                    severity: Severity::Warning,
+                    fix: Some(Fix::new((offset + full_start)..(offset + full_end), fixed_text)),
+                };
+
+                warnings.push(warning);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lint_context::LintContext;
+
+    #[test]
+    fn table_cell_ranges_unmasked_scan_matches_masked_scan() {
+        // Rows without an escape or a code span skip the masking copy. Both
+        // paths must split a row into the same cells.
+        fn always_masked(line: &str) -> Vec<Range<usize>> {
+            let escaped = TableUtils::mask_pipes_for_table_parsing(line);
+            let masked = TableUtils::mask_pipes_in_inline_code(&escaped);
+            let mut ranges = Vec::new();
+            let mut start = 0;
+            for (pipe_pos, _) in masked.match_indices('|') {
+                ranges.push(start..pipe_pos);
+                start = pipe_pos + 1;
+            }
+            ranges.push(start..line.len());
+            ranges
+        }
+
+        for line in [
+            "| a | b |",
+            "| a * x * | b |",
+            "a | b",
+            "no pipes at all",
+            "",
+            "|||",
+            "| naïve ünïcode | 日本語 |",
+            r"| a \| b | c |",
+            "| `a | b` | c |",
+            r"| `a \| b` | c |",
+            r"| a \\ | b |",
+            "> | a * x * | b |",
+        ] {
+            assert_eq!(table_cell_ranges(line), always_masked(line), "line: {line:?}");
+        }
+    }
+
+    #[test]
+    fn test_emphasis_marker_parsing() {
+        let markers = find_emphasis_markers("This has *single* and **double** emphasis");
+        assert_eq!(markers.len(), 4); // *, *, **, **
+
+        let markers = find_emphasis_markers("*start* and *end*");
+        assert_eq!(markers.len(), 4); // *, *, *, *
+    }
+
+    #[test]
+    fn test_emphasis_span_detection() {
+        let markers = find_emphasis_markers("This has *valid* emphasis");
+        let spans = find_emphasis_spans("This has *valid* emphasis", &markers);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content, "valid");
+        assert!(!spans[0].has_leading_space);
+        assert!(!spans[0].has_trailing_space);
+
+        let markers = find_emphasis_markers("This has * invalid * emphasis");
+        let spans = find_emphasis_spans("This has * invalid * emphasis", &markers);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content, " invalid ");
+        assert!(spans[0].has_leading_space);
+        assert!(spans[0].has_trailing_space);
+    }
+
+    #[test]
+    fn test_with_document_structure() {
+        let rule = MD037NoSpaceInEmphasis;
+
+        // Test with no spaces inside emphasis - should pass
+        let content = "This is *correct* emphasis and **strong emphasis**";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(result.is_empty(), "No warnings expected for correct emphasis");
+
+        // Test with actual spaces inside emphasis - use content that should warn
+        let content = "This is * text with spaces * and more content";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(!result.is_empty(), "Expected warnings for spaces in emphasis");
+
+        // Test with code blocks - emphasis in code should be ignored
+        let content = "This is *correct* emphasis\n```\n* incorrect * in code block\n```\nOutside block with * spaces in emphasis *";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            !result.is_empty(),
+            "Expected warnings for spaces in emphasis outside code block"
+        );
+    }
+
+    #[test]
+    fn test_inline_code_inside_spaced_emphasis_preserved_on_fix() {
+        // Regression test: inline code inside a spaced emphasis span must survive the
+        // space-trimming fix. Previously the 'X' masking placeholder leaked into
+        // the fix output, destroying the code span.
+        let rule = MD037NoSpaceInEmphasis;
+        let content = "Set * the `id` field * below.";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let fixed = rule.fix(&ctx).unwrap();
+        assert_eq!(fixed, "Set *the `id` field* below.");
+        assert!(!fixed.contains('X'), "masking placeholder leaked into fix: {fixed}");
+    }
+
+    #[test]
+    fn test_emphasis_in_links_not_flagged() {
+        let rule = MD037NoSpaceInEmphasis;
+        let content = r#"Check this [* spaced asterisk *](https://example.com/*test*) link.
+
+This has * real spaced emphasis * that should be flagged."#;
+        let ctx = crate::lint_context::LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+
+        // Test passed - emphasis inside links are filtered out correctly
+
+        // Only the real emphasis outside links should be flagged
+        assert_eq!(
+            result.len(),
+            1,
+            "Expected exactly 1 warning, but got: {:?}",
+            result.len()
+        );
+        assert!(result[0].message.contains("Spaces inside emphasis markers"));
+        // Should flag "* real spaced emphasis *" but not emphasis patterns inside links
+        assert!(result[0].line == 3); // Line with "* real spaced emphasis *"
+    }
+
+    #[test]
+    fn test_emphasis_in_links_vs_outside_links() {
+        let rule = MD037NoSpaceInEmphasis;
+        let content = r#"Check [* spaced *](https://example.com/*test*) and inline * real spaced * text.
+
+[* link *]: https://example.com/*path*"#;
+        let ctx = crate::lint_context::LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+
+        // Only the actual emphasis outside links should be flagged
+        assert_eq!(result.len(), 1);
+        assert!(result[0].message.contains("Spaces inside emphasis markers"));
+        // Should be the "* real spaced *" text on line 1
+        assert!(result[0].line == 1);
+    }
+
+    #[test]
+    fn test_issue_49_asterisk_in_inline_code() {
+        // Test for issue #49 - Asterisk within backticks identified as for emphasis
+        let rule = MD037NoSpaceInEmphasis;
+
+        // Test case from issue #49
+        let content = "The `__mul__` method is needed for left-hand multiplication (`vector * 3`) and `__rmul__` is needed for right-hand multiplication (`3 * vector`).";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not flag asterisks inside inline code as emphasis (issue #49). Got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_issue_28_inline_code_in_emphasis() {
+        // Test for issue #28 - MD037 should not flag inline code inside emphasis as spaces
+        let rule = MD037NoSpaceInEmphasis;
+
+        // Test case 1: inline code with single backticks inside bold emphasis
+        let content = "Though, we often call this an **inline `if`** because it looks sort of like an `if`-`else` statement all in *one line* of code.";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not flag inline code inside emphasis as spaces (issue #28). Got: {result:?}"
+        );
+
+        // Test case 2: multiple inline code snippets inside emphasis
+        let content2 = "The **`foo` and `bar`** methods are important.";
+        let ctx2 = LintContext::new(content2, crate::config::MarkdownFlavor::Standard, None);
+        let result2 = rule.check(&ctx2).unwrap();
+        assert!(
+            result2.is_empty(),
+            "Should not flag multiple inline code snippets inside emphasis. Got: {result2:?}"
+        );
+
+        // Test case 3: inline code with underscores for emphasis
+        let content3 = "This is __inline `code`__ with underscores.";
+        let ctx3 = LintContext::new(content3, crate::config::MarkdownFlavor::Standard, None);
+        let result3 = rule.check(&ctx3).unwrap();
+        assert!(
+            result3.is_empty(),
+            "Should not flag inline code with underscore emphasis. Got: {result3:?}"
+        );
+
+        // Test case 4: single asterisk emphasis with inline code
+        let content4 = "This is *inline `test`* with single asterisks.";
+        let ctx4 = LintContext::new(content4, crate::config::MarkdownFlavor::Standard, None);
+        let result4 = rule.check(&ctx4).unwrap();
+        assert!(
+            result4.is_empty(),
+            "Should not flag inline code with single asterisk emphasis. Got: {result4:?}"
+        );
+
+        // Test case 5: actual spaces that should be flagged
+        let content5 = "This has * real spaces * that should be flagged.";
+        let ctx5 = LintContext::new(content5, crate::config::MarkdownFlavor::Standard, None);
+        let result5 = rule.check(&ctx5).unwrap();
+        assert!(!result5.is_empty(), "Should still flag actual spaces in emphasis");
+        assert!(result5[0].message.contains("Spaces inside emphasis markers"));
+    }
+
+    #[test]
+    fn test_multibyte_utf8_no_panic() {
+        // Regression test: ensure multi-byte UTF-8 characters don't cause panics
+        // in the truncate_for_display function when handling long emphasis spans.
+        // These test cases include various scripts that could trigger boundary issues.
+        let rule = MD037NoSpaceInEmphasis;
+
+        // Greek text with emphasis
+        let greek = "Αυτό είναι ένα * τεστ με ελληνικά * και πολύ μεγάλο κείμενο που θα πρέπει να περικοπεί σωστά.";
+        let ctx = LintContext::new(greek, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx);
+        assert!(result.is_ok(), "Greek text should not panic");
+
+        // Chinese text with emphasis
+        let chinese = "这是一个 * 测试文本 * 包含中文字符，需要正确处理多字节边界。";
+        let ctx = LintContext::new(chinese, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx);
+        assert!(result.is_ok(), "Chinese text should not panic");
+
+        // Cyrillic/Russian text with emphasis
+        let cyrillic = "Это * тест с кириллицей * и очень длинным текстом для проверки обрезки.";
+        let ctx = LintContext::new(cyrillic, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx);
+        assert!(result.is_ok(), "Cyrillic text should not panic");
+
+        // Mixed multi-byte characters in a long emphasis span that triggers truncation
+        let mixed =
+            "日本語と * 中文と한국어が混在する非常に長いテキストでtruncate_for_displayの境界処理をテスト * します。";
+        let ctx = LintContext::new(mixed, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx);
+        assert!(result.is_ok(), "Mixed CJK text should not panic");
+
+        // Arabic text (right-to-left) with emphasis
+        let arabic = "هذا * اختبار بالعربية * مع نص طويل جداً لاختبار معالجة حدود الأحرف.";
+        let ctx = LintContext::new(arabic, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx);
+        assert!(result.is_ok(), "Arabic text should not panic");
+
+        // Emoji with emphasis
+        let emoji = "This has * 🎉 party 🎊 celebration 🥳 emojis * that use multi-byte sequences.";
+        let ctx = LintContext::new(emoji, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx);
+        assert!(result.is_ok(), "Emoji text should not panic");
+    }
+
+    #[test]
+    fn test_template_shortcode_syntax_not_flagged() {
+        // Test for FastAPI/MkDocs style template syntax {* ... *}
+        // These should NOT be flagged as emphasis with spaces
+        let rule = MD037NoSpaceInEmphasis;
+
+        // FastAPI style code inclusion
+        let content = "{* ../../docs_src/cookie_param_models/tutorial001.py hl[9:12,16] *}";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Template shortcode syntax should not be flagged. Got: {result:?}"
+        );
+
+        // Another FastAPI example
+        let content = "{* ../../docs_src/conditional_openapi/tutorial001.py hl[6,11] *}";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Template shortcode syntax should not be flagged. Got: {result:?}"
+        );
+
+        // Multiple shortcodes on different lines
+        let content = "# Header\n\n{* file1.py *}\n\nSome text.\n\n{* file2.py hl[1-5] *}";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Multiple template shortcodes should not be flagged. Got: {result:?}"
+        );
+
+        // But actual emphasis with spaces should still be flagged
+        let content = "This has * real spaced emphasis * here.";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(!result.is_empty(), "Real spaced emphasis should still be flagged");
+    }
+
+    #[test]
+    fn test_multiline_code_span_not_flagged() {
+        // Test for multi-line code spans - asterisks inside should not be flagged
+        // This tests the case where a code span starts on one line and ends on another
+        let rule = MD037NoSpaceInEmphasis;
+
+        // Code span spanning multiple lines with asterisks inside
+        let content = "# Test\n\naffects the structure. `1 + 0 + 0` is parsed as `(1 + 0) +\n0` while `1 + 0 * 0` is parsed as `1 + (0 * 0)`. Since the pattern";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not flag asterisks inside multi-line code spans. Got: {result:?}"
+        );
+
+        // Another multi-line code span case
+        let content2 = "Text with `code that\nspans * multiple * lines` here.";
+        let ctx2 = LintContext::new(content2, crate::config::MarkdownFlavor::Standard, None);
+        let result2 = rule.check(&ctx2).unwrap();
+        assert!(
+            result2.is_empty(),
+            "Should not flag asterisks inside multi-line code spans. Got: {result2:?}"
+        );
+    }
+
+    #[test]
+    fn test_html_block_asterisks_not_flagged() {
+        let rule = MD037NoSpaceInEmphasis;
+
+        // Asterisks used as multiplication inside HTML <code> tags within an HTML table
+        let content = r#"<table>
+<tr><td>Format</td><td>Size</td></tr>
+<tr><td>BC1</td><td><code>floor((width + 3) / 4) * floor((height + 3) / 4) * 8</code></td></tr>
+<tr><td>BC2</td><td><code>floor((width + 3) / 4) * floor((height + 3) / 4) * 16</code></td></tr>
+</table>"#;
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not flag asterisks inside HTML blocks. Got: {result:?}"
+        );
+
+        // Standalone HTML block with emphasis-like patterns
+        let content2 = "<div>\n<p>Value is * something * here</p>\n</div>";
+        let ctx2 = LintContext::new(content2, crate::config::MarkdownFlavor::Standard, None);
+        let result2 = rule.check(&ctx2).unwrap();
+        assert!(
+            result2.is_empty(),
+            "Should not flag emphasis-like patterns inside HTML div blocks. Got: {result2:?}"
+        );
+
+        // Regular markdown with spaced emphasis should still be flagged
+        let content3 = "Regular * spaced emphasis * text\n\n<div>* not emphasis *</div>";
+        let ctx3 = LintContext::new(content3, crate::config::MarkdownFlavor::Standard, None);
+        let result3 = rule.check(&ctx3).unwrap();
+        assert_eq!(
+            result3.len(),
+            1,
+            "Should flag spaced emphasis in regular markdown but not inside HTML blocks. Got: {result3:?}"
+        );
+        assert_eq!(result3[0].line, 1, "Warning should be on line 1 (regular markdown)");
+    }
+
+    #[test]
+    fn test_mkdocs_icon_shortcode_not_flagged() {
+        // Test that MkDocs icon shortcodes with asterisks inside are not flagged
+        let rule = MD037NoSpaceInEmphasis;
+
+        // Icon shortcode syntax like :material-star: should not trigger MD037
+        // because it's valid MkDocs Material syntax
+        let content = "Click :material-check: to confirm and :fontawesome-solid-star: for favorites.";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::MkDocs, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not flag MkDocs icon shortcodes. Got: {result:?}"
+        );
+
+        // Actual emphasis with spaces should still be flagged even in MkDocs mode
+        let content2 = "This has * real spaced emphasis * but also :material-check: icon.";
+        let ctx2 = LintContext::new(content2, crate::config::MarkdownFlavor::MkDocs, None);
+        let result2 = rule.check(&ctx2).unwrap();
+        assert!(
+            !result2.is_empty(),
+            "Should still flag real spaced emphasis in MkDocs mode"
+        );
+    }
+
+    #[test]
+    fn test_mkdocs_pymdown_markup_not_flagged() {
+        // Test that PyMdown extension markup is not flagged as emphasis issues
+        let rule = MD037NoSpaceInEmphasis;
+
+        // Keys notation (++ctrl+alt+delete++)
+        let content = "Press ++ctrl+c++ to copy.";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::MkDocs, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not flag PyMdown Keys notation. Got: {result:?}"
+        );
+
+        // Mark notation (==highlighted==)
+        let content2 = "This is ==highlighted text== for emphasis.";
+        let ctx2 = LintContext::new(content2, crate::config::MarkdownFlavor::MkDocs, None);
+        let result2 = rule.check(&ctx2).unwrap();
+        assert!(
+            result2.is_empty(),
+            "Should not flag PyMdown Mark notation. Got: {result2:?}"
+        );
+
+        // Insert notation (^^inserted^^)
+        let content3 = "This is ^^inserted text^^ here.";
+        let ctx3 = LintContext::new(content3, crate::config::MarkdownFlavor::MkDocs, None);
+        let result3 = rule.check(&ctx3).unwrap();
+        assert!(
+            result3.is_empty(),
+            "Should not flag PyMdown Insert notation. Got: {result3:?}"
+        );
+
+        // Mixed content with real emphasis issue and PyMdown markup
+        let content4 = "Press ++ctrl++ then * spaced emphasis * here.";
+        let ctx4 = LintContext::new(content4, crate::config::MarkdownFlavor::MkDocs, None);
+        let result4 = rule.check(&ctx4).unwrap();
+        assert!(
+            !result4.is_empty(),
+            "Should still flag real spaced emphasis alongside PyMdown markup"
+        );
+    }
+
+    // ==================== Obsidian highlight tests ====================
+
+    #[test]
+    fn test_obsidian_highlight_not_flagged() {
+        // Test that Obsidian highlight syntax (==text==) is not flagged as emphasis
+        let rule = MD037NoSpaceInEmphasis;
+
+        // Simple highlight
+        let content = "This is ==highlighted text== here.";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Obsidian, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not flag Obsidian highlight syntax. Got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_obsidian_highlight_multiple_on_line() {
+        // Multiple highlights on one line
+        let rule = MD037NoSpaceInEmphasis;
+
+        let content = "Both ==one== and ==two== are highlighted.";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Obsidian, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not flag multiple Obsidian highlights. Got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_obsidian_highlight_entire_paragraph() {
+        // Entire paragraph highlighted
+        let rule = MD037NoSpaceInEmphasis;
+
+        let content = "==Entire paragraph highlighted==";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Obsidian, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not flag entire highlighted paragraph. Got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_obsidian_highlight_with_emphasis() {
+        // Highlights nested with other emphasis
+        let rule = MD037NoSpaceInEmphasis;
+
+        // Bold highlight
+        let content = "**==bold highlight==**";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Obsidian, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not flag bold highlight combination. Got: {result:?}"
+        );
+
+        // Italic highlight
+        let content2 = "*==italic highlight==*";
+        let ctx2 = LintContext::new(content2, crate::config::MarkdownFlavor::Obsidian, None);
+        let result2 = rule.check(&ctx2).unwrap();
+        assert!(
+            result2.is_empty(),
+            "Should not flag italic highlight combination. Got: {result2:?}"
+        );
+    }
+
+    #[test]
+    fn test_obsidian_highlight_in_lists() {
+        // Highlights in list items
+        let rule = MD037NoSpaceInEmphasis;
+
+        let content = "- Item with ==highlight== text\n- Another ==highlighted== item";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Obsidian, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not flag highlights in list items. Got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_obsidian_highlight_in_blockquote() {
+        // Highlights in blockquotes
+        let rule = MD037NoSpaceInEmphasis;
+
+        let content = "> This quote has ==highlighted== text.";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Obsidian, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not flag highlights in blockquotes. Got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_obsidian_highlight_in_tables() {
+        // Highlights in tables
+        let rule = MD037NoSpaceInEmphasis;
+
+        let content = "| Header | Column |\n|--------|--------|\n| ==highlighted== | text |";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Obsidian, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not flag highlights in tables. Got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_obsidian_highlight_in_code_blocks_ignored() {
+        // Highlights inside code blocks should be ignored (they're in code)
+        let rule = MD037NoSpaceInEmphasis;
+
+        let content = "```\n==not highlight in code==\n```";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Obsidian, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should ignore highlights in code blocks. Got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_obsidian_highlight_edge_case_three_equals() {
+        // Three equals signs (===) should not be treated as highlight
+        let rule = MD037NoSpaceInEmphasis;
+
+        // This is not valid highlight syntax
+        let content = "Test === something === here";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Obsidian, None);
+        let result = rule.check(&ctx).unwrap();
+        // This may or may not generate warnings depending on if it looks like emphasis
+        // The key is it shouldn't crash and should be handled gracefully
+        let _ = result;
+    }
+
+    #[test]
+    fn test_obsidian_highlight_edge_case_four_equals() {
+        // Four equals signs (====) - empty highlight
+        let rule = MD037NoSpaceInEmphasis;
+
+        let content = "Test ==== here";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Obsidian, None);
+        let result = rule.check(&ctx).unwrap();
+        // Empty highlights should not match as valid highlights
+        let _ = result;
+    }
+
+    #[test]
+    fn test_obsidian_highlight_adjacent() {
+        // Adjacent highlights
+        let rule = MD037NoSpaceInEmphasis;
+
+        let content = "==one====two==";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Obsidian, None);
+        let result = rule.check(&ctx).unwrap();
+        // Should handle adjacent highlights gracefully
+        let _ = result;
+    }
+
+    #[test]
+    fn test_obsidian_highlight_with_special_chars() {
+        // Highlights with special characters inside
+        let rule = MD037NoSpaceInEmphasis;
+
+        // Highlight with backtick inside
+        let content = "Test ==code: `test`== here";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Obsidian, None);
+        let result = rule.check(&ctx).unwrap();
+        // Should handle gracefully
+        let _ = result;
+    }
+
+    #[test]
+    fn test_obsidian_highlight_unclosed() {
+        // Unclosed highlight should not cause issues
+        let rule = MD037NoSpaceInEmphasis;
+
+        let content = "This ==starts but never ends";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Obsidian, None);
+        let result = rule.check(&ctx).unwrap();
+        // Unclosed highlight should not match anything special
+        let _ = result;
+    }
+
+    #[test]
+    fn test_obsidian_highlight_still_flags_real_emphasis_issues() {
+        // Real emphasis issues should still be flagged in Obsidian mode
+        let rule = MD037NoSpaceInEmphasis;
+
+        let content = "This has * spaced emphasis * and ==valid highlight==";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Obsidian, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            !result.is_empty(),
+            "Should still flag real spaced emphasis in Obsidian mode"
+        );
+        assert!(
+            result.len() == 1,
+            "Should flag exactly one issue (the spaced emphasis). Got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_standard_flavor_does_not_recognize_highlight() {
+        // Standard flavor should NOT recognize ==highlight== as special
+        // It may or may not flag it as emphasis depending on context
+        let rule = MD037NoSpaceInEmphasis;
+
+        let content = "This is ==highlighted text== here.";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        // In standard flavor, == is not recognized as highlight syntax
+        // It won't be flagged as "spaces in emphasis" because == is not * or _
+        // The key is that standard flavor doesn't give special treatment to ==
+        let _ = result; // Just ensure it runs without error
+    }
+
+    #[test]
+    fn test_obsidian_highlight_mixed_with_regular_emphasis() {
+        // Mix of highlights and regular emphasis
+        let rule = MD037NoSpaceInEmphasis;
+
+        let content = "==highlighted== and *italic* and **bold** text";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Obsidian, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not flag valid highlight and emphasis. Got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_obsidian_highlight_unicode() {
+        // Highlights with Unicode content
+        let rule = MD037NoSpaceInEmphasis;
+
+        let content = "Text ==日本語 highlighted== here";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Obsidian, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should handle Unicode in highlights. Got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_obsidian_highlight_with_html() {
+        // Highlights inside HTML should be handled
+        let rule = MD037NoSpaceInEmphasis;
+
+        let content = "<!-- ==not highlight in comment== --> ==actual highlight==";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Obsidian, None);
+        let result = rule.check(&ctx).unwrap();
+        // The highlight in HTML comment should be ignored, only the actual highlight is processed
+        let _ = result;
+    }
+
+    #[test]
+    fn test_obsidian_inline_comment_emphasis_ignored() {
+        // Emphasis inside Obsidian comments should be ignored
+        let rule = MD037NoSpaceInEmphasis;
+
+        let content = "Visible %%* spaced emphasis *%% still visible.";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Obsidian, None);
+        let result = rule.check(&ctx).unwrap();
+
+        assert!(
+            result.is_empty(),
+            "Should ignore emphasis inside Obsidian comments. Got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_inline_html_code_not_flagged() {
+        let rule = MD037NoSpaceInEmphasis;
+
+        // Asterisks used as multiplication inside inline <code> tags
+        let content = "The formula is <code>a * b * c</code> in math.";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "Should not flag asterisks inside inline <code> tags. Got: {result:?}"
+        );
+
+        // Multiple inline code-like tags on the same line
+        let content2 = "Use <kbd>Ctrl * A</kbd> and <samp>x * y</samp> here.";
+        let ctx2 = LintContext::new(content2, crate::config::MarkdownFlavor::Standard, None);
+        let result2 = rule.check(&ctx2).unwrap();
+        assert!(
+            result2.is_empty(),
+            "Should not flag asterisks inside inline <kbd> and <samp> tags. Got: {result2:?}"
+        );
+
+        // Code tag with attributes
+        let content3 = r#"Result: <code class="math">a * b</code> done."#;
+        let ctx3 = LintContext::new(content3, crate::config::MarkdownFlavor::Standard, None);
+        let result3 = rule.check(&ctx3).unwrap();
+        assert!(
+            result3.is_empty(),
+            "Should not flag asterisks inside <code> with attributes. Got: {result3:?}"
+        );
+
+        // Real emphasis on the same line as inline code should still be flagged
+        let content4 = "Text * spaced * and <code>a * b</code>.";
+        let ctx4 = LintContext::new(content4, crate::config::MarkdownFlavor::Standard, None);
+        let result4 = rule.check(&ctx4).unwrap();
+        assert_eq!(
+            result4.len(),
+            1,
+            "Should flag real spaced emphasis but not code content. Got: {result4:?}"
+        );
+        assert_eq!(result4[0].column, 6);
+    }
+
+    /// Emphasis with spaces inside Pandoc bracketed spans should be suppressed under Pandoc,
+    /// but regular emphasis-with-spaces outside bracketed spans must still be flagged.
+    #[test]
+    fn test_pandoc_bracketed_span_guard() {
+        use crate::config::MarkdownFlavor;
+        let rule = MD037NoSpaceInEmphasis;
+        // Emphasis-like pattern inside a bracketed span (Pandoc construct)
+        let content = "See [* important *]{.highlight} for details.\n";
+        let ctx = LintContext::new(content, MarkdownFlavor::Pandoc, None);
+        let result = rule.check(&ctx).unwrap();
+        assert!(
+            result.is_empty(),
+            "MD037 should not flag emphasis-like patterns inside Pandoc bracketed spans: {result:?}"
+        );
+
+        // Outside Pandoc flavor, the same text should still be flagged
+        let ctx_std = LintContext::new(content, MarkdownFlavor::Standard, None);
+        let result_std = rule.check(&ctx_std).unwrap();
+        assert!(
+            !result_std.is_empty(),
+            "MD037 should still flag spaces in emphasis under Standard flavor: {result_std:?}"
+        );
+    }
+
+    #[test]
+    fn test_spaced_bold_metadata_pattern_detected() {
+        let rule = MD037NoSpaceInEmphasis;
+
+        // Broken bold metadata — leading space after opening **
+        let content = "# Test\n\n** Explicit Import**: Convert markdownlint configs to rumdl format:";
+        let ctx = LintContext::new(content, crate::config::MarkdownFlavor::Standard, None);
+        let result = rule.check(&ctx).unwrap();
+        assert_eq!(
+            result.len(),
+            1,
+            "Should flag '** Explicit Import**' as spaced emphasis. Got: {result:?}"
+        );
+        assert_eq!(result[0].line, 3);
+
+        // Trailing space before closing **
+        let content2 = "# Test\n\n**trailing only **: some text";
+        let ctx2 = LintContext::new(content2, crate::config::MarkdownFlavor::Standard, None);
+        let result2 = rule.check(&ctx2).unwrap();
+        assert_eq!(
+            result2.len(),
+            1,
+            "Should flag '**trailing only **' as spaced emphasis. Got: {result2:?}"
+        );
+
+        // Both leading and trailing spaces with colon
+        let content3 = "# Test\n\n** both spaces **: some text";
+        let ctx3 = LintContext::new(content3, crate::config::MarkdownFlavor::Standard, None);
+        let result3 = rule.check(&ctx3).unwrap();
+        assert_eq!(
+            result3.len(),
+            1,
+            "Should flag '** both spaces **' as spaced emphasis. Got: {result3:?}"
+        );
+
+        // Valid bold metadata — should NOT be flagged
+        let content4 = "# Test\n\n**Key**: value";
+        let ctx4 = LintContext::new(content4, crate::config::MarkdownFlavor::Standard, None);
+        let result4 = rule.check(&ctx4).unwrap();
+        assert!(
+            result4.is_empty(),
+            "Should not flag valid bold metadata '**Key**: value'. Got: {result4:?}"
+        );
+    }
+}
