@@ -1,0 +1,2 @@
+Source: https://github.com/SpaceExplorationTechnologies/enterprise-api/blob/master/device-api/device.proto
+Retrieved: 2026-09-12

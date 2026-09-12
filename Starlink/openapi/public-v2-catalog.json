@@ -1,0 +1,416 @@
+{
+  "source": "https://starlink.com/api/public/swagger/v2/swagger.json",
+  "retrieved": "2026-09-12",
+  "title": "Starlink Public API",
+  "version": "2",
+  "servers": [
+    {
+      "url": "/api"
+    }
+  ],
+  "auth": {
+    "type": "OIDC client credentials",
+    "well_known": "https://starlink.com/api/auth/.well-known/openid-configuration",
+    "token": "https://starlink.com/api/auth/connect/token",
+    "base": "https://starlink.com/api",
+    "requires": "Starlink Business/enterprise V2 service account (client id + secret). Consumer residential accounts cannot mint this."
+  },
+  "paths": [
+    {
+      "method": "GET",
+      "path": "/public/v2/account",
+      "summary": "Get account information",
+      "permission": "Required permission: Account information, View."
+    },
+    {
+      "method": "GET",
+      "path": "/public/v2/addresses",
+      "summary": "Get all addresses",
+      "permission": "Required permission: Account information, View.<br/>Returns all addresses on the account in paginated form."
+    },
+    {
+      "method": "POST",
+      "path": "/public/v2/addresses",
+      "summary": "Create address",
+      "permission": "Required permission: Account information, Edit."
+    },
+    {
+      "method": "GET",
+      "path": "/public/v2/addresses/{addressReferenceId}",
+      "summary": "Get address",
+      "permission": "Required permission: Account information, View."
+    },
+    {
+      "method": "PUT",
+      "path": "/public/v2/addresses/{addressReferenceId}",
+      "summary": "Update address",
+      "permission": "Required permission: Account information, Edit."
+    },
+    {
+      "method": "GET",
+      "path": "/public/v2/billing/balance",
+      "summary": "Get account balance",
+      "permission": "Required permission: Financial, View.<br/>Response contains one balance for each currency. If all balances are 0 then response will contain a single entry with 0 balance and currency matching the defa"
+    },
+    {
+      "method": "GET",
+      "path": "/public/v2/billing/invoices",
+      "summary": "Get invoice summaries",
+      "permission": "Required permission: Financial, View."
+    },
+    {
+      "method": "GET",
+      "path": "/public/v2/billing/invoices/{invoiceId}",
+      "summary": "Get invoice details",
+      "permission": "Required permission: Financial, View."
+    },
+    {
+      "method": "GET",
+      "path": "/public/v2/contacts",
+      "summary": "Get contacts",
+      "permission": "Required permission: User management, Edit.<br/>Get list of contacts on the authenticated user's account."
+    },
+    {
+      "method": "POST",
+      "path": "/public/v2/contacts",
+      "summary": "Create contact",
+      "permission": "Required permission: Admin Only - API User Management, Edit.<br/>Creates the contact if it is new, and adds the contact to the authenticated account."
+    },
+    {
+      "method": "DELETE",
+      "path": "/public/v2/contacts/{subjectId}",
+      "summary": "Delete contact",
+      "permission": "Required permission: Admin Only - API User Management, Edit.<br/>Deletes contact based on specified subject Id on the authenticated account."
+    },
+    {
+      "method": "PUT",
+      "path": "/public/v2/contacts/{subjectId}",
+      "summary": "Update contact",
+      "permission": "Required permission: Admin Only - API User Management, Edit.<br/>Update contact on the authenticated account."
+    },
+    {
+      "method": "GET",
+      "path": "/public/v2/data-pools",
+      "summary": "Get all multi-service line enabled data pools.",
+      "permission": "Required permission: Service plan, View.<br/>Use this endpoint to see all data pools on your account, including:"
+    },
+    {
+      "method": "GET",
+      "path": "/public/v2/data-pools/usage",
+      "summary": "Query data pool usage with service line and monthly breakdowns.",
+      "permission": "Required permission: Service plan, View.<br/>Use this endpoint to track:"
+    },
+    {
+      "method": "POST",
+      "path": "/public/v2/data-pools/{dataPoolId}/set-automatic-top-up",
+      "summary": "Enable or disable automatic top-up for a data pool.",
+      "permission": "Required permission: Service plan, Edit.<br/>This endpoint is available for select audiences only."
+    },
+    {
+      "method": "POST",
+      "path": "/public/v2/data-usage/query",
+      "summary": "Query data usage",
+      "permission": "Required permission: Service plan, View.<br/>Retrieve the real-time data tracking info for this account's data usage. For detailed instructions, please refer to the API documentation: https://starlink"
+    },
+    {
+      "method": "POST",
+      "path": "/public/v2/flights/status",
+      "summary": "Post a flight event",
+      "permission": "Required permission: Aviation flight status management, Edit.<br/>Post a real-time flight event on a Starlink-enabled plane. This endpoint is only accessible from an aviation account."
+    },
+    {
+      "method": "POST",
+      "path": "/public/v2/managed/accounts",
+      "summary": "Create managed account",
+      "permission": "Required permission: Managed Account Creation, Edit.<br/>Creates a managed account with connection under the specified parent account."
+    },
+    {
+      "method": "GET",
+      "path": "/public/v2/managed/accounts",
+      "summary": "Get managed accounts",
+      "permission": "Required permission: Managed Account Information, View.<br/>Get managed accounts within your account hierarchy with filtering and pagination support."
+    },
+    {
+      "method": "GET",
+      "path": "/public/v2/managed/accounts/service-lines",
+      "summary": "Get service lines across managed accounts",
+      "permission": "Required permission: Managed Accounts Inventory Management, View.<br/>Get service lines within your managed account hierarchy with filtering and pagination support."
+    },
+    {
+      "method": "GET",
+      "path": "/public/v2/managed/accounts/tree",
+      "summary": "Get managed account tree",
+      "permission": "Required permission: Managed Account Information, View.<br/>Gets the entire managed account hierarchy beneath the calling account."
+    },
+    {
+      "method": "GET",
+      "path": "/public/v2/managed/accounts/user-terminals",
+      "summary": "Get user terminals across managed accounts",
+      "permission": "Required permission: Managed Accounts Inventory Management, View.<br/>Get user terminals within your managed account hierarchy with filtering and pagination support."
+    },
+    {
+      "method": "POST",
+      "path": "/public/v2/managed/customers",
+      "summary": "Create a managed customer account",
+      "permission": "This endpoint is only callable with an authorized provider account."
+    },
+    {
+      "method": "GET",
+      "path": "/public/v2/mobile/map/{timestamp}",
+      "summary": "Get Map Data",
+      "permission": "Required permission: Gated Feature - Starlink Mobile Data, View.<br/>Gets Map data. Data is partitioned by timestamp_date, timestamp_hour. Only able to get data from one hour per request. Data from th"
+    },
+    {
+      "method": "GET",
+      "path": "/public/v2/mobile/radio-access-network/{timestamp}",
+      "summary": "Get Radio Access Network Data",
+      "permission": "Required permission: Gated Feature - Starlink Mobile Data, View.<br/>Gets Radio Access Network (RAN) data. Data is partitioned by timestamp_date, timestamp_hour. Only able to get data from one hour pe"
+    },
+    {
+      "method": "GET",
+      "path": "/public/v2/mobile/timeseries/{timestamp}",
+      "summary": "Get Timeseries Data of Starlink Mobile Usage and Beam Reliability",
+      "permission": "Required permission: Gated Feature - Starlink Mobile Data, View.<br/>Gets Timeseries data. Data is partitioned by timestamp_date, timestamp_hour. Only able to get data from one hour per request. Data "
+    },
+    {
+      "method": "GET",
+      "path": "/public/v2/products",
+      "summary": "Get products",
+      "permission": "Required permission: Service plan, View.<br/>Gets all products available to this account that could be assigned to service lines. Each product includes data block product info if compatible."
+    },
+    {
+      "method": "GET",
+      "path": "/public/v2/routers/configs",
+      "summary": "Get all router configs",
+      "permission": "Required permission: Device command and configuration, View.<br/>Return all router configs on this account in paginated form"
+    },
+    {
+      "method": "POST",
+      "path": "/public/v2/routers/configs",
+      "summary": "Create router config",
+      "permission": "Required permission: Device command and configuration, Edit."
+    },
+    {
+      "method": "PUT",
+      "path": "/public/v2/routers/configs/assign",
+      "summary": "Router config assignment",
+      "permission": "Required permission: Device configuration assignment, Edit.<br/>Assign the config (or none) to the routers. For each router if it is currently online, the config will immediately be sent to the router"
+    },
+    {
+      "method": "GET",
+      "path": "/public/v2/routers/configs/default",
+      "summary": "Get default router config",
+      "permission": "Required permission: Device command and configuration, View.<br/>Gets the router config id that will be assigned to any routers when they are first added to this account."
+    },
+    {
+      "method": "PUT",
+      "path": "/public/v2/routers/configs/default",
+      "summary": "Set default router config",
+      "permission": "Required permission: Device configuration assignment, Edit.<br/>Set the default router config on the account. Use an empty string to remove the default config from the account. Any NEW routers on this"
+    },
+    {
+      "method": "GET",
+      "path": "/public/v2/routers/configs/tls",
+      "summary": "Get TLS configs",
+      "permission": "Required permission: Device command and configuration, View.<br/>Gets a paginated list of TLS configs on this account."
+    },
+    {
+      "method": "POST",
+      "path": "/public/v2/routers/configs/tls",
+      "summary": "Create TLS config",
+      "permission": "Required permission: Device command and configuration, Edit.<br/>Creates a TLS config that allows this certificate and key to be used in router configs when a certificate and key are required by only "
+    },
+    {
+      "method": "DELETE",
+      "path": "/public/v2/routers/configs/tls",
+      "summary": "Delete TLS config",
+      "permission": "Required permission: Device command and configuration, Edit.<br/>Deletes a TLS certificate and key pair from the set of TLS configs that can be reused when saving router configs and only specifying th"
+    },
+    {
+      "method": "GET",
+      "path": "/public/v2/routers/configs/{configId}",
+      "summary": "Get router config",
+      "permission": "Required permission: Device command and configuration, View."
+    },
+    {
+      "method": "PUT",
+      "path": "/public/v2/routers/configs/{configId}",
+      "summary": "Update router config",
+      "permission": "Required permission: Device command and configuration, Edit.<br/>Update a given router config. Any router assigned to this config will immediately receive the update if it is online. Otherwise, the ro"
+    },
+    {
+      "method": "POST",
+      "path": "/public/v2/routers/local-content",
+      "summary": "Upload router local content file",
+      "permission": "Required permission: Device command and configuration, Edit.<br/>Upload html file to allow it to be configured as the HTTPS server local content file for router configs. File must be HTML, under 4MB, "
+    },
+    {
+      "method": "GET",
+      "path": "/public/v2/routers/local-content",
+      "summary": "Get list of router local content files",
+      "permission": "Required permission: Device command and configuration, View."
+    },
+    {
+      "method": "GET",
+      "path": "/public/v2/routers/sandbox/clients",
+      "summary": "Get sandbox clients",
+      "permission": "Required permission: Device command and configuration, View.<br/>Returns clients that were unsandboxed through the management API and have access that has not yet expired, paginated 1000 at a time. Cl"
+    },
+    {
+      "method": "POST",
+      "path": "/public/v2/routers/sandbox/clients",
+      "summary": "Batch update sandbox clients",
+      "permission": "Required permission: Device command and configuration, Edit.<br/>Update the sandbox state for multiple clients. If sandboxing is enabled, sandboxed clients will only have access to domains in the sand"
+    },
+    {
+      "method": "PUT",
+      "path": "/public/v2/routers/sandbox/heartbeat",
+      "summary": "Update sandbox heartbeat",
+      "permission": "Required permission: Device command and configuration, Edit.<br/>Heartbeats verify the health of enterprise systems that manage router sandboxing. If heartbeats are not received for an account, Starli"
+    },
+    {
+      "method": "GET",
+      "path": "/public/v2/routers/{routerId}",
+      "summary": "Get router",
+      "permission": "Required permission: Device management, View."
+    },
+    {
+      "method": "POST",
+      "path": "/public/v2/routers/{routerId}/reboot",
+      "summary": "Reboot router",
+      "permission": "Required permission: Device command and configuration, Edit."
+    },
+    {
+      "method": "GET",
+      "path": "/public/v2/service-lines",
+      "summary": "Get all service lines",
+      "permission": "Required permission: Service plan, View."
+    },
+    {
+      "method": "POST",
+      "path": "/public/v2/service-lines",
+      "summary": "Create service line",
+      "permission": "Required permission: Service plan, Edit.<br/>Service line must be linked to an address and a subscription/product-ID, and can optionally be immediately configured with data blocks."
+    },
+    {
+      "method": "GET",
+      "path": "/public/v2/service-lines/{serviceLineNumber}",
+      "summary": "Get service line",
+      "permission": "Required permission: Service plan, View."
+    },
+    {
+      "method": "DELETE",
+      "path": "/public/v2/service-lines/{serviceLineNumber}",
+      "summary": "Deactivate a service line",
+      "permission": "Required permission: Service plan, Edit."
+    },
+    {
+      "method": "GET",
+      "path": "/public/v2/service-lines/{serviceLineNumber}/billing-cycles/partial-periods",
+      "summary": "Get billing partial periods",
+      "permission": "Required permission: Service plan, View.<br/>Get the previous billing partial periods for this service line. For more information about this endpoint, see https://starlink.readme.io/docs/understanding"
+    },
+    {
+      "method": "PATCH",
+      "path": "/public/v2/service-lines/{serviceLineNumber}/consume-from-pool",
+      "summary": "Set whether a service line should consume from a data pool.",
+      "permission": "Required permission: Service plan, Edit.<br/>This endpoint is available for select audiences only."
+    },
+    {
+      "method": "POST",
+      "path": "/public/v2/service-lines/{serviceLineNumber}/data/opt-in",
+      "summary": "Opt in priority data",
+      "permission": "Required permission: Service plan, Edit.<br/>Opt in the service line to continue using priority data after reaching the plan capacity. Only applies to some products."
+    },
+    {
+      "method": "POST",
+      "path": "/public/v2/service-lines/{serviceLineNumber}/data/opt-out",
+      "summary": "Opt out priority data",
+      "permission": "Required permission: Service plan, Edit.<br/>Opt out the service line from continuing to use priority data even when plan capacity is exceeded. If the service line reaches the plan capacity, it will s"
+    },
+    {
+      "method": "PUT",
+      "path": "/public/v2/service-lines/{serviceLineNumber}/data/recurring",
+      "summary": "Set recurring data blocks on service line",
+      "permission": "Required permission: Service plan, Edit.<br/>Service line must be on a top up plan"
+    },
+    {
+      "method": "POST",
+      "path": "/public/v2/service-lines/{serviceLineNumber}/data/top-up",
+      "summary": "Adds one-time top up data block to service line",
+      "permission": "Required permission: Service plan, Edit.<br/>Service line must be on a top up plan"
+    },
+    {
+      "method": "PUT",
+      "path": "/public/v2/service-lines/{serviceLineNumber}/nickname",
+      "summary": "Set service line nickname",
+      "permission": "Required permission: Service plan, Edit."
+    },
+    {
+      "method": "PUT",
+      "path": "/public/v2/service-lines/{serviceLineNumber}/product",
+      "summary": "Update service line product",
+      "permission": "Required permission: Service plan, Edit."
+    },
+    {
+      "method": "PUT",
+      "path": "/public/v2/service-lines/{serviceLineNumber}/public-ip",
+      "summary": "Set service line public IP setting",
+      "permission": "Required permission: Device command and configuration, Edit.<br/>Enable or disable public ip setting on a service line"
+    },
+    {
+      "method": "POST",
+      "path": "/public/v2/service-lines/{serviceLineNumber}/user-terminals",
+      "summary": "Add user terminal to service line",
+      "permission": "Required permission: Service plan, Edit.<br/>User terminal must already be on the account. See POST /v2/user-terminals to add user terminal to account."
+    },
+    {
+      "method": "DELETE",
+      "path": "/public/v2/service-lines/{serviceLineNumber}/user-terminals/{deviceId}",
+      "summary": "Remove user terminal from service line",
+      "permission": "Required permission: Service plan, Edit.<br/>This removes the user terminal from the service line, but it remains on the account and can be added to another service line. This clears any L2VPN circuit"
+    },
+    {
+      "method": "GET",
+      "path": "/public/v2/user-terminals",
+      "summary": "Get all user terminals",
+      "permission": "Required permission: Device management, View.<br/>Gets all user terminals on the account, filtered by the optional filter parameters, in paginated form"
+    },
+    {
+      "method": "POST",
+      "path": "/public/v2/user-terminals",
+      "summary": "Add user terminal to account",
+      "permission": "Required permission: Device management, Edit.<br/>This will add the user terminal to the account, but won't start service. User terminals must be present on the account before adding to a service line"
+    },
+    {
+      "method": "PUT",
+      "path": "/public/v2/user-terminals/configs/assign",
+      "summary": "User terminal config assignment",
+      "permission": "Required permission: Device configuration assignment, Edit.<br/>Assign the config (or none) to the user terminals. For each terminal if it is currently online, the config will immediately be sent. Els"
+    },
+    {
+      "method": "GET",
+      "path": "/public/v2/user-terminals/l2vpn",
+      "summary": "Get L2VPN circuits available for this account",
+      "permission": "Required permission: Device command and configuration, View."
+    },
+    {
+      "method": "DELETE",
+      "path": "/public/v2/user-terminals/{deviceId}",
+      "summary": "Remove user terminal from account",
+      "permission": "Required permission: Device management, Edit.<br/>User terminal must already be removed from service lines before it can be removed from the account. See /v2/service-lines/{serviceLineNumber}/user-ter"
+    },
+    {
+      "method": "PUT",
+      "path": "/public/v2/user-terminals/{deviceId}/l2vpn",
+      "summary": "Set L2VPN VLANs for user terminal",
+      "permission": "Required permission: Device configuration assignment, Edit.<br/>Terminal must be on subscription that allows L2VPN. Maximum 2 circuits per Starlink PoP. Use null or empty circuit list to clear all L2V"
+    },
+    {
+      "method": "POST",
+      "path": "/public/v2/user-terminals/{deviceId}/reboot",
+      "summary": "Reboot user terminal",
+      "permission": "Required permission: Device command and configuration, Edit."
+    }
+  ]
+}

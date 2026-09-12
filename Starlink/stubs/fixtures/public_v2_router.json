@@ -1,0 +1,6 @@
+{
+  "routerId": "Router-010000000000000001F29264",
+  "ssid": "Wanjer",
+  "source": "offline fixture — not a live Starlink v2 response",
+  "requires": "Business V2 service account to replace this with GET /public/v2/routers/{routerId}"
+}

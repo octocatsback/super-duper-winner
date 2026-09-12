@@ -1,6 +1,6 @@
 # Super Duper Winner
 
-Umbrella repository that collects every **public** GitHub project under [octocatsback](https://github.com/octocatsback) into one multi-folder tree (one subdirectory per source repo).
+Umbrella repository that collects every **public** GitHub project under [octocatsback](https://github.com/octocatsback) into one multi-folder tree (one subdirectory per source repo), plus umbrella-owned [Starlink](Starlink/) API docs and stubs.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Security Policy](https://img.shields.io/badge/Security-Policy-green.svg)](SECURITY.md)
@@ -36,13 +36,14 @@ git subtree pull --prefix=<Directory> https://github.com/octocatsback/<repo>.git
 
 ## Included projects
 
-Public `octocatsback` repositories from the PR #8 inventory, refreshed in place where the source HEAD moved.
+Every public `octocatsback` repository (PR #8 inventory plus later public repos), refreshed in place where the source HEAD moved.
 
 | Directory | Source | Import | Ref |
 | --------- | ------ | ------ | --- |
 | [`About-Us/`](About-Us/) | [octocatsback/About-Us](https://github.com/octocatsback/About-Us) | squash subtree | `main` @ `7d4c49c` |
 | [`adk-docs/`](adk-docs/) | [octocatsback/adk-docs](https://github.com/octocatsback/adk-docs) | squash subtree | `main` @ `1203686` |
 | [`camo/`](camo/) | [octocatsback/camo](https://github.com/octocatsback/camo) | squash subtree | `master` @ `e59df56` |
+| [`Cunts-/`](Cunts-/) | [octocatsback/Cunts-](https://github.com/octocatsback/Cunts-) | squash subtree | `main` @ `3aad561` |
 | [`cli/`](cli/) | [octocatsback/cli](https://github.com/octocatsback/cli) | squash subtree | `latest` @ `c9876d7` |
 | [`distributed-uncensorable-frontend/`](distributed-uncensorable-frontend/) | [octocatsback/distributed-uncensorable-frontend](https://github.com/octocatsback/distributed-uncensorable-frontend) | squash subtree | `main` @ `60938e3` |
 | [`docs/`](docs/) | [octocatsback/docs](https://github.com/octocatsback/docs) | shallow submodule | `main` @ `8ace643` |
@@ -54,6 +55,7 @@ Public `octocatsback` repositories from the PR #8 inventory, refreshed in place 
 | [`plugins/`](plugins/) | [octocatsback/plugins](https://github.com/octocatsback/plugins) | squash subtree | `main` @ `9bd4a82` |
 | [`potential-octo-doodle/`](potential-octo-doodle/) | [octocatsback/potential-octo-doodle](https://github.com/octocatsback/potential-octo-doodle) | squash subtree | `main` @ `58a3ee1` |
 | [`rumdl/`](rumdl/) | [octocatsback/rumdl](https://github.com/octocatsback/rumdl) | squash subtree | `main` @ `fd83c4b` |
+| [`Starlink/`](Starlink/) | umbrella-owned (not a GitHub import) | docs + stubs | consumer LAN Device API + public v2 catalog |
 | [`threat-finder/`](threat-finder/) | [octocatsback/threat-finder](https://github.com/octocatsback/threat-finder) | squash subtree | `main` @ `a81e069` |
 | [`tryhackme/`](tryhackme/) | [octocatsback/tryhackme](https://github.com/octocatsback/tryhackme) | shallow submodule | `main` @ `3949051` |
 
@@ -64,7 +66,7 @@ Public `octocatsback` repositories from the PR #8 inventory, refreshed in place 
 | Repository | Reason |
 | ---------- | ------ |
 | [octocatsback/super-duper-winner](https://github.com/octocatsback/super-duper-winner) | This umbrella repository |
-| [octocatsback/skills-agentic-workflows-that-read-the-room](https://github.com/octocatsback/skills-agentic-workflows-that-read-the-room) | Private; not part of the public-repo import |
+| [octocatsback/skills-agentic-workflows-that-read-the-room](https://github.com/octocatsback/skills-agentic-workflows-that-read-the-room) | Private. Vendoring it here would publish the exercise tree into a public repo — needs Gareth's decision |
 
 ## Fallback notes
 
@@ -72,6 +74,7 @@ Public `octocatsback` repositories from the PR #8 inventory, refreshed in place 
 - **`cli`**: Large (~179 MB git / ~334 MB working tree) but imported as a squash subtree of `latest`.
 - **`tryhackme`**: Included as a submodule instead of a subtree because room notes contain AWS access-key-shaped strings (`AKIA…`) that GitHub push protection rejects when those blobs are committed here. Initialize the submodule to read the notes locally.
 - **`adk-docs` tutorial `.env` files**: Upstream examples use placeholder values such as `paste-your-actual-key-here`. The umbrella [security hygiene](.github/workflows/security-hygiene.yml) check applies to umbrella-owned paths only (`LICENSE`, `README.md`, `.github/`, `.cursor/`, and other root files), not vendored trees.
+- **`Starlink/`**: Consumer session APIs are the official LAN `Device/Handle` `get_diagnostics` RPCs for router `Router-010000000000000001F29264` / SSID `Wanjer`. Public v2 stays stubbed until a Business service account exists. No cookies or passwords are stored.
 
 Umbrella build/docs are not required for every vendored tree. Open the subdirectory (or initialize the submodule) for the project you want.
 
@@ -90,6 +93,6 @@ If you believe you have found a security vulnerability, follow [SECURITY.md](SEC
 
 ## License
 
-The umbrella files in this repository (`LICENSE`, `README.md`, `SECURITY.md`) are under the [MIT License](LICENSE). Copyright (c) 2026 Gareth Kirman.
+The umbrella files in this repository (`LICENSE`, `README.md`, `SECURITY.md`, `Starlink/`) are under the [MIT License](LICENSE). Copyright (c) 2026 Gareth Lee Douglas Kirman.
 
 Project subdirectories remain under the licenses shipped with those projects.

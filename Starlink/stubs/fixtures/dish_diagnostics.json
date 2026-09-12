@@ -1,0 +1,10 @@
+{
+  "dish_get_diagnostics": {
+    "id": "fixture-user-terminal",
+    "hardware_version": "fixture",
+    "software_version": "fixture",
+    "disablement_code": "OKAY",
+    "stowed": false
+  },
+  "note": "Offline fixture. Dish serial is unknown until a LAN get_diagnostics call."
+}

@@ -1,7 +1,7 @@
 # Public octocatsback inventory for this umbrella.
-# Copyright (c) 2026 Gareth Kirman
+# Copyright (c) 2026 Gareth Lee Douglas Kirman
 umbrella: super-duper-winner
-copyright: Copyright (c) 2026 Gareth Kirman
+copyright: Copyright (c) 2026 Gareth Lee Douglas Kirman
 source_org: octocatsback
 packages:
   - name: About-Us
@@ -16,6 +16,13 @@ packages:
     method: squash-subtree
     ref: main
     sha: 1203686bb4a30351393d3bccea06abd91f008e19
+  - name: Cunts-
+    path: Cunts-/
+    source: https://github.com/octocatsback/Cunts-
+    method: squash-subtree
+    ref: main
+    sha: 3aad56128e88c9b4f3a306e6d26b7bbe975017ac
+    note: Remaining public octocatsback repo (not in the original PR #8 inventory).
   - name: camo
     path: camo/
     source: https://github.com/octocatsback/camo
@@ -87,6 +94,12 @@ packages:
     method: squash-subtree
     ref: main
     sha: 58a3ee1a7923e7bdf7e1b6e2998de4e838fa6efd
+  - name: Starlink
+    path: Starlink/
+    source: umbrella-owned
+    method: docs-and-stubs
+    ref: n/a
+    note: Consumer LAN Device API docs/stubs plus public v2 catalog. Not an octocatsback GitHub repo.
   - name: rumdl
     path: rumdl/
     source: https://github.com/octocatsback/rumdl
@@ -112,4 +125,4 @@ skipped:
     reason: This umbrella repository; not nested inside itself.
   - name: skills-agentic-workflows-that-read-the-room
     source: https://github.com/octocatsback/skills-agentic-workflows-that-read-the-room
-    reason: Private; not part of the public-repo import.
+    reason: Private. Copying it into this public umbrella would publish the exercise tree. Needs Gareth's decision.

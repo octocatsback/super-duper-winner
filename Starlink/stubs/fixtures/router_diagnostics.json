@@ -1,0 +1,18 @@
+{
+  "wifi_get_diagnostics": {
+    "id": "Router-010000000000000001F29264",
+    "hardware_version": "fixture",
+    "software_version": "fixture",
+    "networks": [
+      {
+        "domain": "lan",
+        "ipv4": "192.168.1.1/24",
+        "ssid": "Wanjer",
+        "clients_ethernet": 0,
+        "clients_2ghz": 0,
+        "clients_5ghz": 0
+      }
+    ]
+  },
+  "note": "Offline fixture. ssid is the public network name only."
+}

@@ -1,0 +1,25 @@
+# Local site identity for consumer LAN stubs.
+# Copyright (c) 2026 Gareth Lee Douglas Kirman
+#
+# Public identifiers only. Do not store Wi-Fi passwords, account
+# cookies, session tokens, or Starlink client secrets in this file.
+
+router:
+  id: Router-010000000000000001F29264
+  ssid: Wanjer
+  # Default Starlink router LAN. Override with STARLINK_ROUTER_HOST.
+  grpc_host: 192.168.1.1
+  grpc_port: 9000
+  grpc_web_port: 9001
+
+dish:
+  # Starlink user terminal is always at this address on the service LAN.
+  grpc_host: 192.168.100.1
+  grpc_port: 9200
+  grpc_web_port: 9201
+
+forbidden_in_repo:
+  - wifi_password
+  - cookies
+  - session_token
+  - client_secret
