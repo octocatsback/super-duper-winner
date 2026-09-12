@@ -54,6 +54,16 @@ def main() -> int:
     assert "rpc Handle" in proto
     assert "get_diagnostics" in proto
 
+    assert not (ROOT / "publish ").exists(), "trailing-space Starlink/publish path must be gone"
+    publish = (ROOT / "publish.md").read_text(encoding="utf-8")
+    assert "wifi_set_config" in publish
+    assert "Router-010000000000000001F29264" in publish
+    assert "Wanjer" in publish
+    assert "192.168.100.1:9200" in publish
+    assert "#10" in publish and "#11" in publish
+    assert "wifi_password:" not in publish.lower()
+    assert "client_secret:" not in publish.lower()
+
     catalog = json.loads((ROOT / "openapi" / "public-v2-catalog.json").read_text(encoding="utf-8"))
     paths = {f"{p['method']} {p['path']}" for p in catalog["paths"]}
     assert "GET /public/v2/routers/{routerId}" in paths
