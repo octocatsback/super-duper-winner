@@ -1,6 +1,16 @@
 {
-  "name": "Gareth",
+  "name": "Gareth locked-down",
   "install": "if [ -f .cursor/install.sh ]; then bash .cursor/install.sh; elif [ -f Gareth/.cursor/install.sh ]; then bash Gareth/.cursor/install.sh; elif [ -f repos/Gareth/.cursor/install.sh ]; then bash repos/Gareth/.cursor/install.sh; elif [ -f /agent/repos/Gareth/.cursor/install.sh ]; then bash /agent/repos/Gareth/.cursor/install.sh; else echo 'Gareth .cursor/install.sh not found' >&2; exit 1; fi",
+  "repositoryDependencies": [
+    "github.com/octocatsback/Gareth",
+    "github.com/octocatsback/GitGoat",
+    "github.com/octocatsback/OriginTrials",
+    "github.com/octocatsback/docs",
+    "github.com/octocatsback/node",
+    "github.com/octocatsback/skills-agentic-workflows-that-read-the-room",
+    "github.com/octocatsback/super-duper-winner",
+    "github.com/octocatsback/tryhackme"
+  ],
   "terminals": [
     {
       "name": "Mona Astro",
