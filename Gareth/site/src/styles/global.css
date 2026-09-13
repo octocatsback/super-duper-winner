@@ -38,7 +38,7 @@ body::before {
   content: '';
   position: fixed;
   inset: 0;
-  background: var(--grid-url) center/cover no-repeat;
+  background: url('/graphics/grid.svg') center/cover no-repeat;
   opacity: 0.35;
   pointer-events: none;
 }

@@ -17,12 +17,7 @@ jobs:
       - name: Fail if secret-like files are tracked
         run: |
           set -euo pipefail
-          # When this workflow runs from the umbrella monorepo, only scan Gareth/.
-          scope=()
-          if [ -d Gareth ] && [ -f Gareth/.github/workflows/security-hygiene.yml ]; then
-            scope=(Gareth)
-          fi
-          tracked="$(git ls-files "${scope[@]}" | grep -E '(^|/)\.env$|(^|/)\.env\.[^/]+$|\.pem$|(^|/)id_rsa$|(^|/)id_ed25519$|(^|/)id_ecdsa$' | grep -vE '\.example$' || true)"
+          tracked="$(git ls-files | grep -E '(^|/)\.env$|(^|/)\.env\.[^/]+$|\.pem$|(^|/)id_rsa$|(^|/)id_ed25519$|(^|/)id_ecdsa$' | grep -vE '\.example$' || true)"
           if [ -n "$tracked" ]; then
             echo "Secret-like files must not be tracked:" >&2
             echo "$tracked" >&2

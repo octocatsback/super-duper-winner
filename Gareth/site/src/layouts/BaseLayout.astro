@@ -10,9 +10,6 @@ const {
   title = 'Mona\'s GitHub Info',
   description = 'A bright Astro website that highlights GitHub docs, blog stories, and changelog updates.',
 } = Astro.props;
-const base = import.meta.env.BASE_URL;
-const faviconHref = `${base}favicon.svg`;
-const gridUrl = `${base}graphics/grid.svg`;
 ---
 
 <!doctype html>
@@ -20,11 +17,11 @@ const gridUrl = `${base}graphics/grid.svg`;
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <link rel="icon" type="image/svg+xml" href={faviconHref} />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <title>{title}</title>
     <meta name="description" content={description} />
   </head>
-  <body style={`--grid-url: url('${gridUrl}')`}>
+  <body>
     <slot />
   </body>
 </html>

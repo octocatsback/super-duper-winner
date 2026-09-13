@@ -74,7 +74,7 @@ Every public `octocatsback` repository (PR #8 inventory plus later public repos)
 - **`cli`**: Large (~179 MB git / ~334 MB working tree) but imported as a squash subtree of `latest`.
 - **`tryhackme`**: Included as a submodule instead of a subtree because room notes contain AWS access-key-shaped strings (`AKIA…`) that GitHub push protection rejects when those blobs are committed here. Initialize the submodule to read the notes locally.
 - **`adk-docs` tutorial `.env` files**: Upstream examples use placeholder values such as `paste-your-actual-key-here`. The umbrella [security hygiene](.github/workflows/security-hygiene.yml) check applies to umbrella-owned paths only (`LICENSE`, `README.md`, `.github/`, `.cursor/`, and other root files), not vendored trees.
-- **`Starlink/`**: Consumer dish grpcurl on `192.168.100.1:9200` is `get_status` / `reboot` / `dish_stow` / unstow. Router notes keep `get_diagnostics` for `Router-010000000000000001F29264` / SSID `Wanjer`. Public v2 stays stubbed until a Business service account exists. No cookies or passwords are stored.
+- **`Starlink/`**: Consumer session APIs are the official LAN `Device/Handle` `get_diagnostics` RPCs for router `Router-010000000000000001F29264` / SSID `Wanjer`. Public v2 stays stubbed until a Business service account exists. No cookies or passwords are stored.
 
 Umbrella build/docs are not required for every vendored tree. Open the subdirectory (or initialize the submodule) for the project you want.
 
