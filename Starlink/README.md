@@ -68,6 +68,6 @@ STARLINK_LIVE=1 python3 consumer_session.py   # optional LAN call; no secrets
 
 Fixtures live in [`stubs/fixtures/`](stubs/fixtures/). They use the published router id and SSID only.
 
-## License
+## Copyright
 
-Umbrella MIT. The copied `device.proto` remains under SpaceX's upstream license in the enterprise-api repository. Official Starlink documentation is referenced, not reproduced in full.
+Umbrella content follows the repository [LICENSE](../LICENSE) and [COPYRIGHT](../COPYRIGHT). The copied `device.proto` remains under SpaceX's upstream license in the enterprise-api repository. Official Starlink documentation is referenced, not reproduced in full.

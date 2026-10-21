@@ -2,7 +2,6 @@
 
 Umbrella repository that collects every **public** GitHub project under [octocatsback](https://github.com/octocatsback) into one multi-folder tree (one subdirectory per source repo), plus umbrella-owned [Starlink](Starlink/) API docs and stubs.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Security Policy](https://img.shields.io/badge/Security-Policy-green.svg)](SECURITY.md)
 
 This repository (`octocatsback/super-duper-winner`) is the umbrella itself and is not nested inside its own tree.
@@ -91,8 +90,8 @@ Open the subdirectory for the project you want to work on. Submodule prefixes st
 
 If you believe you have found a security vulnerability, follow [SECURITY.md](SECURITY.md). Do not open a public issue for security reports.
 
-## License
+## Copyright
 
-The umbrella files in this repository (`LICENSE`, `README.md`, `SECURITY.md`, `Starlink/`) are under the [MIT License](LICENSE). Copyright (c) 2026 Gareth Lee Douglas Kirman.
+Umbrella files in this repository (`LICENSE`, `COPYRIGHT`, `README.md`, `SECURITY.md`, `Starlink/`) are proprietary. See [LICENSE](LICENSE) and [COPYRIGHT](COPYRIGHT).
 
 Project subdirectories remain under the licenses shipped with those projects.
